@@ -1,0 +1,56 @@
+﻿<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LocalBib</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: ['class', '[data-theme="dark"]'],
+            theme: {
+                fontFamily: {
+                    serif: ['Newsreader', 'ui-serif', 'Georgia', 'serif'],
+                    sans:  ['Geist', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+                    mono:  ['Geist Mono', 'ui-monospace', 'monospace'],
+                },
+                extend: {
+                    colors: {
+                        bg:        { DEFAULT: '#fafaf7', elev: '#ffffff', soft: '#f3eee4' },
+                        ink:       { DEFAULT: '#1a1a1a', 2: '#3a3833', 3: '#6b6760' },
+                        mute:      { DEFAULT: '#8e8a82', 2: '#a8a49c' },
+                        hairline:  { DEFAULT: '#e7e2d6', 2: '#d8d1be' },
+                        accent:    { DEFAULT: '#c2410c', soft: '#fce9da', ink: '#7a2808' },
+                    },
+                    boxShadow: {
+                        hairline: '0 1px 0 rgba(26,26,26,.04)',
+                        modal:    '0 24px 48px -16px rgba(26,26,26,.22), 0 2px 4px rgba(26,26,26,.06)',
+                    },
+                }
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <!-- CodeMirror 5 (buildless, fuer den LaTeX-Editor â€” ADR-0002 deferred) -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/stex/stex.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.js"></script>
+    <!-- Bump BOTH ?v= stamps together on every static change. app.js and
+         style.css are one unit: the SPA binds `var(--lb-*)` tokens that live in
+         the stylesheet, so a browser holding one version and fetching the other
+         renders a broken page (an unresolved var() paints every chart series
+         black). One stamp, both files, same commit. -->
+    <link rel="stylesheet" href="/static/style.css?v=20260811p">
+</head>
+<body class="bg-bg text-ink font-sans min-h-screen">
+    <div id="app"></div>
+    <script src="/static/app.js?v=20260811p"></script>
+</body>
+</html>

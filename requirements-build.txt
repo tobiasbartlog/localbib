@@ -1,0 +1,3 @@
+# Build-Abhängigkeiten für die Windows-Exe (siehe build_exe.ps1)
+-r requirements.txt
+pyinstaller>=6.11.0

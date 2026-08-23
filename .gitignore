@@ -1,0 +1,25 @@
+/.env
+/ToDO.txt
+
+# Claude Code internal worktrees
+.claude/worktrees/
+
+# Python / pytest
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# JS test infrastructure (vitest, issue #54)
+node_modules/
+
+# PyInstaller build artifacts
+/build/
+/dist/
+/VERSION
+# import-linter graph cache
+.import_linter_cache/
+
+# operator wizards write their captured values next to themselves
+scripts/.env

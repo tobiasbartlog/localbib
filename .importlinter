@@ -1,0 +1,66 @@
+# P3 — "Eine Grenze, ein Vertrag": ein Plugin darf ausschliesslich aus
+# plugin_api importieren, nie aus dem LocalBib-Kern. Ersetzt das (auf diesem
+# Stack nicht anwendbare) `eslint no-restricted-imports` der Architektur
+# (Weg A, discovery.md).
+#
+# Hinweis zum Stack: Der Kern besteht aus flachen Einzeldatei-Modulen
+# (webapp.py, literature_manager.py, ...). grimp kann nur Pakete (Verzeichnis
+# mit __init__.py) als root_packages bauen, daher sind hier nur die Plugin-Pakete
+# und `plugin_api` die Wurzeln; die Kernmodule werden via
+# `include_external_packages` als externe Importziele erfasst und verboten.
+#
+# Die Gegenrichtung (Kern importiert nie aus einem Plugin) ist strukturell
+# garantiert: der Kern laedt Plugins ausschliesslich per importlib-String in
+# registry.py, es gibt keinen statischen Plugin-Import im Kern.
+#
+# Pruefen:  lint-imports
+[importlinter]
+root_packages =
+    plugin_api
+    services
+    routers
+include_external_packages = True
+
+
+# Backend-Modularisierung (#71/#73): Schichtgrenzen fuer das neue Skelett.
+# services/ ist transport-frei — Domaenenlogik, kein HTTP-/Routing-Bezug; es darf
+# daher weder aus routers/ noch aus webapp importieren. Greift trivial, solange
+# die Pakete leer sind, und wird bindend, sobald Logik einzieht.
+[importlinter:contract:services-no-transport]
+name = services importiert nie aus routers oder webapp
+type = forbidden
+source_modules =
+    services
+forbidden_modules =
+    routers
+    webapp
+
+# routers/ buendeln HTTP-Endpunkte; ein Router darf keinen anderen Router
+# importieren (geteilte Logik gehoert nach services/). Als Independence-Contract
+# modelliert (ein Forbidden-Contract mit identischer Quelle/Ziel ist in
+# import-linter nicht zulaessig -> "shared descendants"). Greift trivial, solange
+# das Paket leer ist; jedes neue Router-Submodul (z. B. routers.papers) wird hier
+# eingetragen, damit die Geschwister-Unabhaengigkeit bindend bleibt.
+[importlinter:contract:routers-independent]
+name = Ein Router importiert nie aus einem anderen Router
+type = independence
+modules =
+    routers.stats
+    routers.version
+    routers.banner
+    routers.license
+    routers.appearance
+    routers.settings
+    routers.categories
+    routers.export
+    routers.custom_fields
+    routers.bibtex_import
+    routers.papers
+    routers.validate
+    routers.references
+    routers.research_chat
+    routers.analysis
+    routers.import
+    routers.duplicates
+    routers.maintenance
+    routers.search

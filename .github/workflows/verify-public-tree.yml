@@ -1,0 +1,40 @@
+name: Public tree verification
+
+# The public CI gate (issue #145, ADR-0015). This file ships WITH the export
+# (scripts/export_public.py does not exclude it), so it runs unmodified in
+# both places:
+#
+#   - in THIS (private) repo, scripts/export_public.py is present, so the
+#     step below runs the full export into a temp dir and verifies THAT — a
+#     marker mistake fails CI here, before a release is ever cut;
+#   - in the public repo, scripts/export_public.py was excluded from the
+#     export (maintainer-only tooling, #145), so the step verifies the
+#     checked-out tree directly — that IS the public tree already.
+#
+# Either way the actual check is the same function: scripts/verify_public_tree.py.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify-public-tree:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Export (if private) and verify the public tree
+        shell: bash
+        run: |
+          set -e
+          if [ -f scripts/export_public.py ]; then
+            echo "scripts/export_public.py present -> exporting + verifying the derived public tree"
+            python scripts/export_public.py "${RUNNER_TEMP}/public-export"
+          else
+            echo "scripts/export_public.py absent -> this checkout IS the public tree, verifying directly"
+            python scripts/verify_public_tree.py
+          fi

@@ -1,0 +1,94 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Anti-regrowth guard (issue #95): every tracked .py stays <= 1200 lines
+      # (allowlist in the script for deliberate exceptions).  HARD gate — the
+      # Backend-Modularisierung (PRD #71) that shrank webapp.py 6173 -> ~293 is
+      # finished, so structure regrowth fails CI from day one.  Pure stdlib + git,
+      # so it runs before the dependency install and fails fast.
+      - name: Anti-regrowth line-budget guard (<= 1200 lines/.py)
+        run: python scripts/check_line_budget.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Check plugin boundary (P3)
+        run: lint-imports
+
+      # Coverage baseline: 73 % (measured 2026-06-15 against 541 tests,
+      # --cov=. includes test files which run at 100 %).  Gate fails if total
+      # coverage drops below this number, so test-net shrinkage is caught
+      # immediately during the refactor.
+      - name: Run pytest with coverage (no-drop gate ≥ 73 %)
+        run: pytest -v --cov=. --cov-report=term-missing --cov-fail-under=73
+
+  # SPA smoke tests (issue #54): buildless Vue-3-CDN frontend, vitest + jsdom.
+  js-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run JS smoke tests
+        run: npm test
+
+  # Frozen-build smoke (issue #72): runs PyInstaller analysis + onedir bundle
+  # on every push/PR using localbib.spec so that module moves that would break
+  # the .exe are caught before they reach a release build.  Runs on Linux
+  # (ubuntu-latest) because the Analysis phase — which resolves all transitive
+  # imports — is what matters; the resulting ELF binary is discarded.
+  frozen-build-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Runtime deps only (no dev tools); PyInstaller added on top.
+      - name: Install runtime dependencies + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # --noconfirm  — don't prompt when overwriting dist/
+      # --clean      — wipe PyInstaller cache before build for reproducibility
+      # localbib.spec carries the canonical hiddenimports / excludes / datas
+      # used by the real release; running it here means a missing import caused
+      # by a module move fails Analysis and the job turns red.
+      - name: PyInstaller analysis + bundle (smoke)
+        run: pyinstaller --noconfirm --clean localbib.spec
+
+      # Confirm the bundled entry-point landed where we expect (Linux path).
+      - name: Verify bundle entry-point exists
+        run: test -f dist/LocalBib/LocalBib

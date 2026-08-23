@@ -1,0 +1,6 @@
+# Dev / test dependencies
+pytest>=8.0.0
+pytest-cov>=4.1.0
+httpx>=0.27.0          # FastAPI TestClient transport
+respx>=0.21.0          # httpx mock for OpenAlexClient tests
+import-linter>=2.0     # enforces the P3 plugin boundary (.importlinter)

@@ -1,0 +1,140 @@
+name: Release
+
+# Pushing a version tag produces a DRAFT GitHub Release with the Windows
+# installer attached (issue #146, ADR-0015; drafted per issue #154 — permanent
+# policy, not a one-off). A draft is invisible to the public and skipped by
+# the "latest release" API, so the maintainer verifies the exact artefact and
+# publishes it by hand before any customer can see it.
+#
+# This file ships WITH the export (scripts/export_public.py no longer excludes
+# it), so it exists in both repos — but it only ever *runs* in the public one.
+# ADR-0015: "the installer must never be built from a tree that only exists
+# privately", and the `if: github.repository == …` guard below enforces that
+# mechanically instead of by convention. Tagging the private repo is therefore
+# a no-op; releases are cut by publishing the export first:
+#
+#   python scripts/publish_public.py v0.3.0     # export + verify + squash + tag + push
+#
+# ...which pushes the tag into tobiasbartlog/localbib and triggers this run there.
+#
+# The tag is the single source of the version: it is written into the VERSION
+# file, localbib.spec bundles that file, and routers/version.py reads it at
+# import — so the installed app reports the tag. (This replaces the old regex
+# patch of webapp.py, which rewrote APP_VERSION in place and broke whenever the
+# assignment moved.)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write # create the Release and upload the installer asset
+
+jobs:
+  # The tests run on this same push via test.yml (`on: push` covers tags), so
+  # this workflow stays focused on producing and publishing the artifact.
+  installer:
+    # ADR-0015 guard — see the header. Do not remove.
+    if: github.repository == 'tobiasbartlog/localbib'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime dependencies + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Derive the version from the tag and write VERSION
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          if ($version -notmatch '^\d+\.\d+\.\d+') {
+            throw "Tag '${{ github.ref_name }}' does not carry a numeric version"
+          }
+          # BOM-frei schreiben, genau wie der lokale Zwilling build_exe.ps1:
+          # "-Encoding utf8" heisst in Windows PowerShell 5.1 "mit BOM" und in
+          # pwsh 7 "ohne", und ein BOM ist kein Whitespace, also traegt
+          # routers/version.py es sonst bis in die Versionsnummer. Dass hier
+          # "shell: pwsh" steht, macht die Zeile nur zufaellig sicher; das
+          # Ergebnis soll unabhaengig von der Shell dasselbe sein.
+          # WriteAllText braucht einen absoluten Pfad - das Arbeitsverzeichnis
+          # von .NET ist nicht $PWD.
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "VERSION"), $version, [System.Text.UTF8Encoding]::new($false))
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Building LocalBib $version"
+
+      # localbib.spec is the canonical build (onedir, with the hiddenimports and
+      # excludes the frozen app needs). The ad-hoc single-file invocation the
+      # old workflow used is retired: the installer ships a directory.
+      - name: Build the onedir bundle (localbib.spec)
+        run: pyinstaller --noconfirm --clean localbib.spec
+
+      - name: Verify the bundle entry-point exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/LocalBib/LocalBib.exe")) {
+            throw "Build failed: dist/LocalBib/LocalBib.exe not found"
+          }
+
+      # ─── Code-signing slot — DEFERRED, NOT WIRED UP (ADR-0015) ─────────────
+      # Azure Trusted Signing (~120 $/year) waits until revenue exists. Until
+      # then every release is unsigned and the README explains the SmartScreen
+      # dialog. When the certificate profile is bought, enable two steps: one
+      # here (signs dist/LocalBib/LocalBib.exe BEFORE Inno Setup packs it) and
+      # one after the Inno Setup step (signs the finished installer).
+      #
+      # - name: Sign the application binary
+      #   uses: azure/trusted-signing-action@v0
+      #   with:
+      #     azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      #     azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      #     azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+      #     endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+      #     trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+      #     certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+      #     files-folder: dist/LocalBib
+      #     files-folder-filter: exe
+      # ──────────────────────────────────────────────────────────────────────
+
+      - name: Build the installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            # The windows-latest image ships Inno Setup 6; install it if a
+            # future image drops it rather than failing the release.
+            choco install innosetup --no-progress -y
+          }
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.version }}" "installer\localbib.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+      # The asset name is a contract: #148 resolves it by name for one-click
+      # updates, so a rename here silently breaks in-app updating.
+      - name: Verify the installer asset name
+        shell: pwsh
+        run: |
+          $asset = "dist/installer/LocalBib-Setup-${{ steps.version.outputs.version }}.exe"
+          if (-not (Test-Path $asset)) { throw "Installer not found at $asset" }
+          Write-Host "Installer OK: $((Get-Item $asset).Length) bytes"
+
+      # Draft, not published (issue #154, permanent policy — not a one-off for
+      # the first release): a draft is invisible to the public and the "latest
+      # release" API skips it, so no installed app is ever offered a candidate.
+      # The maintainer downloads the exact CI artefact, walks the paid path,
+      # and publishes the draft by hand once satisfied.
+      - name: Create the GitHub Release and attach the installer
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: dist/installer/LocalBib-Setup-${{ steps.version.outputs.version }}.exe
