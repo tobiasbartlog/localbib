@@ -397,9 +397,16 @@ def test_status_carries_the_price_display_alongside_the_checkout_url(client):
     assert "checkout_url" in body  # still present, unchanged shape
 
 
+@pytest.mark.skipif(
+    not (REPO_ROOT / "CONTEXT.md").exists(),
+    reason="CONTEXT.md is private and never reaches the export; only the dev repo can pin it",
+)
 def test_context_glossary_pins_the_price_to_the_constant():
     """CONTEXT.md is private and never reaches the export, so the price copy
     the constant cannot travel to (the ``Lizenz`` glossary entry) is pinned
-    here instead: editing the constant without editing the glossary fails."""
+    here instead: editing the constant without editing the glossary fails.
+
+    The test itself *does* ship, so it skips where the file it guards cannot
+    exist — the pin still holds in the one repo that owns the glossary."""
     context = (REPO_ROOT / "CONTEXT.md").read_text(encoding="utf-8")
     assert license_state.PRICE_DISPLAY in context
