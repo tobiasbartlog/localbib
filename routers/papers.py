@@ -13,6 +13,7 @@ Serves:
   GET    /api/papers/{paper_id}/download
   GET    /api/papers/{paper_id}/bibtex
   PUT    /api/papers/{paper_id}/cite-key
+  PUT    /api/papers/{paper_id}/notes
 
 Pure move from webapp.py (Backend-Modularisierung #85). No behaviour change.
 HTTP contract (paths / methods / shapes / status codes) is bit-identical to the
@@ -78,6 +79,10 @@ class PaperUpdate(BaseModel):
 
 class CiteKeyUpdate(BaseModel):
     cite_key: str
+
+
+class NotesUpdate(BaseModel):
+    notes: str
 
 
 class BulkDeleteRequest(BaseModel):
@@ -469,3 +474,29 @@ async def update_cite_key(paper_id: int, data: CiteKeyUpdate):
         conn.close()
 
     return {"id": paper_id, "cite_key": key}
+
+
+@router.put("/api/papers/{paper_id}/notes")
+async def update_notes(paper_id: int, data: NotesUpdate):
+    """Speichert die Notizen eines Papers (Markdown, wie geschrieben).
+
+    Bewusst ein eigener Endpunkt statt eines Feldes in PUT /api/papers/{id}:
+    der generische Update benennt bei vorhandenem Titel/Autor/Jahr die
+    PDF-Datei um und macht aus einem leeren String NULL. Beides will man beim
+    Autosave nach jeder Tipppause nicht -- und das Leeren der Notizen muss als
+    leer ankommen, nicht als "nicht gesetzt".
+    """
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+        conn.execute(
+            "UPDATE papers SET notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (data.notes, paper_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"id": paper_id, "notes": data.notes}

@@ -8,6 +8,15 @@ from typing import Optional, Dict, List
 from cite_key_generator import dedupe as dedupe_cite_key, generate as generate_cite_key
 
 
+# Namen, unter denen Leser sich vor #160 ein eigenes Notizfeld angelegt haben.
+# Vergleich case-insensitiv und getrimmt; alles andere (Lesefortschritt,
+# Bewertung, ...) bleibt unangetastet.
+NOTES_FIELD_NAMES = frozenset({"notiz", "notizen", "note", "notes"})
+
+# app_settings-Schluessel, der die Notiz-Migration als erledigt vermerkt.
+NOTES_MIGRATION_KEY = "notes_field_migration_done"
+
+
 # =============================================================================
 # DATENBANK
 # =============================================================================
@@ -61,6 +70,7 @@ class Database:
                 cited_by_count INTEGER DEFAULT 0,
                 openalex_updated_at TEXT DEFAULT '',
                 cite_key TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -130,6 +140,11 @@ class Database:
             # uploads; the SPA derives the import *type* from original_filename
             # and shows this as the source detail on the provenance stamp.
             ("import_source", "TEXT DEFAULT ''"),
+            # Free-form Markdown the reader writes about the paper (#160). A
+            # first-class column, not a user-defined field: it is searched, it
+            # is edited in its own block, and it is written through its own
+            # endpoint so a note never renames the PDF.
+            ("notes", "TEXT DEFAULT ''"),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE papers ADD COLUMN {col} {coldef}")
@@ -189,6 +204,11 @@ class Database:
             );
         """);
 
+        # Selbstgebautes Notizfeld -> papers.notes (#162). Steht hier, weil es
+        # sowohl die notes-Spalte als auch app_settings braucht (dort steht der
+        # Erledigt-Vermerk, der den Lauf wirklich einmalig macht).
+        self._migrate_notes_field(cursor)
+
         # Semantische Suche Phase 1 (#98): ein Vektor pro Paper (Titel+Abstract).
         # paper_id ist Primary Key -> genau ein aktiver Vektor je Paper; model/dim
         # werden mitgespeichert, damit ein Embedding-Modell-Wechsel erkennbar ist
@@ -241,6 +261,115 @@ class Database:
             cursor.execute(
                 "UPDATE papers SET cite_key = ? WHERE id = ?", (key, row["id"])
             )
+
+    @staticmethod
+    def _migrate_notes_field(cursor: sqlite3.Cursor):
+        """Schiebt ein selbstgebautes Notizfeld in papers.notes (#162).
+
+        Genau ein passendes Feld: jeder Wert wandert in die Notizen des
+        jeweiligen Papers, danach verschwinden Felddefinition und Werte.
+        Mehrere Kandidaten: nichts wandert, nichts wird geloescht, die Lage
+        wird gemeldet — das falsche Feld zu loeschen ist der eine Fehler, den
+        diese Migration nicht haben darf. Kein Kandidat: nichts passiert.
+
+        Der Lauf ist **einmalig**, vermerkt in ``app_settings``: ``init_db()``
+        laeuft bei jeder ``Database(...)``-Konstruktion, also pro Request, und
+        ohne Vermerk waere die Namensregel eine Dauerregel — ein Feld, das der
+        Leser sich *nach* dem Upgrade "Notes" nennt, waere beim naechsten
+        Seitenaufruf geloescht. Nur der mehrdeutige Fall bleibt offen, damit die
+        Migration greift, sobald der Leser ihn von Hand aufgeloest hat.
+
+        Kandidat ist nur ein Textfeld: ein Fortschritts- oder Auswahlfeld
+        namens "Notes" ist keine Notizsammlung und wird weder verschoben noch
+        als Mehrdeutigkeit gezaehlt. Ein bereits gefuelltes ``notes`` bleibt
+        erhalten, der alte Text wird angehaengt; leere Altwerte hinterlassen
+        keinen Leerraum.
+        """
+        done = cursor.execute(
+            "SELECT value FROM app_settings WHERE key = ?", (NOTES_MIGRATION_KEY,)
+        ).fetchone()
+        if done and done["value"]:
+            return
+
+        fields = cursor.execute(
+            "SELECT id, name FROM custom_fields WHERE field_type = 'text'"
+        ).fetchall()
+        matches = [
+            f for f in fields
+            if (f["name"] or "").strip().lower() in NOTES_FIELD_NAMES
+        ]
+        if not matches:
+            Database._mark_notes_migration_done(cursor)
+            return
+        if len(matches) > 1:
+            names = ", ".join(f'"{f["name"]}"' for f in matches)
+            logging.warning(
+                "⚠️  Notiz-Migration uebersprungen: mehrere notizartige "
+                f"benutzerdefinierte Felder gefunden ({names}). Es wurde nichts "
+                "verschoben und nichts geloescht — bitte das gewuenschte Feld "
+                "von Hand aufloesen."
+            )
+            return
+
+        field_id = matches[0]["id"]
+        # Der Join laesst Werte ohne Paper aussen vor; sie haetten kein Ziel.
+        rows = cursor.execute(
+            """SELECT v.paper_id AS paper_id, v.value AS value, p.notes AS notes
+               FROM paper_custom_values v
+               JOIN papers p ON p.id = v.paper_id
+               WHERE v.field_id = ?
+               ORDER BY v.paper_id""",
+            (field_id,),
+        ).fetchall()
+
+        # Savepoint, damit ein Abbruch das Feld *und* die Notizen so
+        # zuruecklaesst, wie sie waren — sonst waere ein halb gelaufener
+        # Versuch beim naechsten Start nicht mehr von einem neuen zu
+        # unterscheiden und der Text wuerde doppelt angehaengt.
+        cursor.execute("SAVEPOINT notes_field_migration")
+        copied = []
+        for row in rows:
+            text = (row["value"] or "").strip()
+            if not text:
+                continue
+            existing = (row["notes"] or "").strip()
+            merged = f"{existing}\n\n{text}" if existing else text
+            cursor.execute(
+                "UPDATE papers SET notes = ? WHERE id = ?", (merged, row["paper_id"])
+            )
+            copied.append((row["paper_id"], merged))
+
+        # Erst loeschen, wenn jeder Wert nachweislich angekommen ist: zurueck
+        # lesen und mit dem erwarteten Text vergleichen.
+        for paper_id, merged in copied:
+            stored = cursor.execute(
+                "SELECT notes FROM papers WHERE id = ?", (paper_id,)
+            ).fetchone()
+            if not stored or (stored["notes"] or "") != merged:
+                cursor.execute("ROLLBACK TO notes_field_migration")
+                cursor.execute("RELEASE notes_field_migration")
+                logging.warning(
+                    "⚠️  Notiz-Migration abgebrochen: Text von Paper "
+                    f"{paper_id} konnte nicht uebernommen werden. Das Feld "
+                    f'"{matches[0]["name"]}" bleibt unveraendert bestehen.'
+                )
+                return
+
+        cursor.execute("DELETE FROM paper_custom_values WHERE field_id = ?", (field_id,))
+        cursor.execute("DELETE FROM custom_fields WHERE id = ?", (field_id,))
+        Database._mark_notes_migration_done(cursor)
+        cursor.execute("RELEASE notes_field_migration")
+        logging.info(
+            f'📝 Notiz-Migration: Feld "{matches[0]["name"]}" in die Notizen von '
+            f"{len(copied)} Paper(n) uebernommen und entfernt"
+        )
+
+    @staticmethod
+    def _mark_notes_migration_done(cursor: sqlite3.Cursor):
+        cursor.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, '1')",
+            (NOTES_MIGRATION_KEY,),
+        )
 
     # --- Kategorien ---
 
@@ -453,9 +582,9 @@ class Database:
         conn = self._connect()
         rows = conn.execute("""
             SELECT * FROM papers
-            WHERE title LIKE ? OR authors LIKE ? OR abstract LIKE ?
+            WHERE title LIKE ? OR authors LIKE ? OR abstract LIKE ? OR notes LIKE ?
             ORDER BY year DESC
-        """, (f"%{query}%", f"%{query}%", f"%{query}%")).fetchall()
+        """, (f"%{query}%",) * 4).fetchall()
         conn.close()
         return [dict(r) for r in rows]
 

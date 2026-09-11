@@ -105,6 +105,48 @@ def test_installer_never_deletes_the_users_library() -> None:
     assert "[UninstallDelete]" not in _read(ISS)
 
 
+def test_installer_offers_no_machine_wide_install() -> None:
+    """A machine-wide install turns the one-click update into a UAC prompt.
+
+    Measured on a real build: with ``PrivilegesRequiredOverridesAllowed=dialog``
+    a user could install for all users, and UsePreviousPrivileges (default yes)
+    then made the *silent* update re-launch Setup elevated with /ALLUSERS —
+    "Administrative install mode: Yes" in Setup's own log, ~40 s spent waiting on
+    a rights prompt that appears after the app has already exited. Without the
+    override the escape hatch is closed: even an explicit /ALLUSERS on the
+    command line stays at "Administrative install mode: No".
+    """
+    # Directives only — the comment above them names the override on purpose,
+    # to record why it is absent.
+    directives = [
+        line.strip() for line in _read(ISS).splitlines()
+        if not line.lstrip().startswith(";")
+    ]
+    assert "PrivilegesRequired=lowest" in directives
+    assert not [d for d in directives if d.startswith("PrivilegesRequiredOverridesAllowed")]
+
+
+def test_silent_relaunch_runs_as_the_logged_in_user() -> None:
+    """The updated app must belong to the user, not to an elevated token.
+
+    Without ``runasoriginaluser`` the [Run] entry inherits Setup's token. On a
+    machine where elevation switches accounts that hands the user a LocalBib with
+    a different %USERPROFILE% — another ~\\Literatur, another database, an empty
+    library where theirs used to be.
+    """
+    relaunch = [
+        line for line in _read(ISS).splitlines()
+        if line.startswith("Filename:") and "skipifnotsilent" in line
+    ]
+    assert len(relaunch) == 1, "exactly one silent relaunch entry"
+    assert "runasoriginaluser" in relaunch[0]
+
+
+def test_installer_installs_the_64bit_bundle_in_64bit_mode() -> None:
+    """PyInstaller builds x64; without this it landed in Program Files (x86)."""
+    assert "ArchitecturesInstallIn64BitMode=x64compatible" in _read(ISS)
+
+
 # ---------------------------------------------------------------------------
 # Release workflow — regression guards for the pieces #146 removed
 # ---------------------------------------------------------------------------

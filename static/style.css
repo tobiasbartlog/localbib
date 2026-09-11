@@ -803,8 +803,23 @@ select.lb-tbtn { padding: 0 4px; }
   animation: lb-fade-in .18s ease;
 }
 @keyframes lb-fade-in { from { opacity: 0 } to { opacity: 1 } }
+
+/* Two-panel assembly (#161): docked PDF panel + modal, separated by a gap the
+   backdrop shows through. It starts at the collapsed sidebar's right edge — the
+   sidebar folds itself to that rail while a paper is open — and runs to the
+   window edge. The gap belongs to the assembly, so a click in it is swallowed;
+   only the strip to its left still closes the view. */
+.lb-detail-assembly {
+  display: flex;
+  align-items: stretch;
+  gap: 14px;
+  width: calc(100% - 64px);
+  height: 100vh;
+  min-width: 0;
+}
 .lb-modal {
-  width: min(1120px, 92vw);
+  flex: 1 1 auto;
+  min-width: 0;
   background: var(--lb-bg);
   border-left: 1px solid var(--lb-hairline);
   overflow: hidden;
@@ -813,6 +828,49 @@ select.lb-tbtn { padding: 0 4px; }
   animation: lb-slide-in .22s ease-out;
 }
 @keyframes lb-slide-in { from { transform: translateX(40px); opacity: 0 } to { transform: translateX(0); opacity: 1 } }
+
+/* ── PDF panel ───────────────────────────────────────────── */
+/* Its own frame, so a white PDF page never looks glued onto the backdrop. */
+/* 42% of the assembly is ~780px at the 1920px target width — the spec's default
+   split — and keeps a readable content column all the way down to 1440. */
+.lb-pdf-panel {
+  flex: 0 0 clamp(420px, 42%, 900px);
+  min-width: 0;
+  margin: 14px 0 14px 14px;
+  display: flex; flex-direction: column;
+  background: var(--lb-bg-elev);
+  border: 1px solid var(--lb-hairline);
+  border-radius: 12px;
+  box-shadow: var(--lb-shadow-lg);
+  overflow: hidden;
+  animation: lb-slide-in .22s ease-out;
+}
+/* Nothing to show means nothing to make room for. */
+.lb-pdf-panel.is-empty { flex-basis: 380px; }
+.lb-pdf-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--lb-hairline);
+  background: var(--lb-bg);
+  flex-shrink: 0;
+}
+.lb-pdf-name { font-size: 11.5px; color: var(--lb-mute); min-width: 0; }
+.lb-pdf-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.lb-pdf-body { flex: 1; min-height: 0; overflow: auto; display: flex; }
+.lb-pdf-frame { border: 0; width: 100%; height: 100%; flex: 1; }
+.lb-pdf-drop {
+  flex: 1;
+  margin: 14px;
+  border: 1px dashed var(--lb-hairline-2);
+  border-radius: 10px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 24px; text-align: center;
+}
+.lb-pdf-drop-h {
+  font-family: var(--lb-font-serif); font-size: 17px; color: var(--lb-ink-2); margin: 0;
+}
+.lb-pdf-drop-p { font-size: 12.5px; color: var(--lb-mute); margin: 0; max-width: 34ch; }
+.lb-pdf-drop-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 4px; }
 
 .lb-modal-head {
   display: flex; justify-content: space-between; align-items: center;
@@ -838,19 +896,39 @@ select.lb-tbtn { padding: 0 4px; }
 }
 .lb-modal-close:hover { background: var(--lb-bg-soft); color: var(--lb-ink); }
 
+/* Content and metadata each scroll on their own, so scrolling the reference
+   list never moves the metadata and never pushes the PDF panel around. */
 .lb-modal-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px;
+  grid-template-columns: minmax(0, 1fr) 320px;
   flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.lb-modal-main {
+  padding: 36px 40px 60px;
+  width: 100%;
+  min-width: 0;
   overflow-y: auto;
 }
-.lb-modal-main { padding: 36px 40px 60px; max-width: 720px; width: 100%; }
 .lb-modal-aside {
   border-left: 1px solid var(--lb-hairline);
   padding: 36px 28px;
   background: var(--lb-bg);
   display: flex; flex-direction: column; gap: 28px;
+  min-height: 0;
+  overflow-y: auto;
 }
+/* OCR / validation results sit with the metadata they describe. */
+.lb-aside-banner {
+  position: relative;
+  border: 1px solid var(--lb-hairline);
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 13px;
+}
+/* Only meaningful in the two-column band; the media queries below reveal it. */
+.lb-meta-toggle { display: none; }
 
 .lb-detail-eyebrow {
   font-family: var(--lb-font-mono);
@@ -1140,9 +1218,53 @@ select.lb-tbtn { padding: 0 4px; }
 /* ─────────────────────────────────────────────────────────── */
 /*                  RESPONSIVE TRIMMINGS                      */
 /* ─────────────────────────────────────────────────────────── */
+/* Paper detail (#161). Three columns is the design; the PDF beside the content
+   is the last thing to go. Between 1440 and 1100 the metadata column folds
+   behind a toggle in the modal head; below 1100 everything stacks. */
+@media (max-width: 1439px) {
+  .lb-pdf-panel { flex-basis: clamp(380px, 48%, 700px); }
+  .lb-pdf-panel.is-empty { flex-basis: 320px; }
+  .lb-meta-toggle { display: inline-flex; }
+  .lb-modal-grid { grid-template-columns: minmax(0, 1fr); }
+  .lb-modal-aside { display: none; }
+  .lb-modal-grid.is-meta-open { grid-template-columns: minmax(0, 1fr) 300px; }
+  .lb-modal-grid.is-meta-open .lb-modal-aside { display: flex; }
+  .lb-modal-main { padding: 28px 28px 60px; }
+}
+
+@media (max-width: 1099px) {
+  /* The width stays as it is: the strip beside the assembly is the only
+     click-to-close target left once the panels stack. */
+  .lb-detail-assembly {
+    flex-direction: column;
+    gap: 0;
+    overflow-y: auto;
+  }
+  .lb-pdf-panel {
+    flex: 0 0 auto;
+    height: 60vh;
+    margin: 0;
+    border: 0;
+    border-bottom: 1px solid var(--lb-hairline);
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .lb-pdf-panel.is-empty { height: auto; }
+  .lb-modal { flex: 1 1 auto; overflow: visible; border-left: 0; }
+  .lb-meta-toggle { display: none; }
+  .lb-modal-head { position: static; }
+  .lb-modal-grid,
+  .lb-modal-grid.is-meta-open { grid-template-columns: 1fr; overflow: visible; }
+  .lb-modal-main { overflow: visible; }
+  .lb-modal-aside,
+  .lb-modal-grid.is-meta-open .lb-modal-aside {
+    display: flex;
+    overflow: visible;
+    border-left: 0; border-top: 1px solid var(--lb-hairline);
+  }
+}
+
 @media (max-width: 1024px) {
-  .lb-modal-grid { grid-template-columns: 1fr; }
-  .lb-modal-aside { border-left: 0; border-top: 1px solid var(--lb-hairline); }
   .lb-net-shell { grid-template-columns: 1fr; height: auto; }
   .lb-net-canvas { height: 480px; }
   .lb-import-grid { grid-template-columns: 1fr; }
@@ -1188,8 +1310,6 @@ select.lb-tbtn { padding: 0 4px; }
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-
-.pdf-viewer iframe { border: none; width: 100%; min-height: 80vh; }
 
 .badge-new { animation: badge-pulse 0.3s ease; }
 @keyframes badge-pulse {
@@ -1240,4 +1360,98 @@ select.lb-tbtn { padding: 0 4px; }
   from { opacity: 0; transform: translateY(16px) scale(0.98); }
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
+
+/* ---- Markdown-Ausgabe (Notizen #160, Research-Chat) ----
+   Tailwinds Preflight nimmt Listen ihre Marker und Ueberschriften ihre Groesse
+   zurueck; hier bekommt gerendertes Markdown beides wieder. */
+.lb-md > :first-child { margin-top: 0; }
+.lb-md > :last-child { margin-bottom: 0; }
+.lb-md p { margin: 0 0 10px; }
+.lb-md h1, .lb-md h2, .lb-md h3, .lb-md h4, .lb-md h5, .lb-md h6 {
+  font-family: var(--lb-font-sans);
+  font-weight: 600;
+  color: var(--lb-ink);
+  line-height: 1.3;
+  margin: 18px 0 8px;
+}
+.lb-md h1 { font-size: 19px; }
+.lb-md h2 { font-size: 17px; }
+.lb-md h3 { font-size: 15px; }
+.lb-md h4, .lb-md h5, .lb-md h6 { font-size: 13.5px; }
+.lb-md ul, .lb-md ol { margin: 0 0 10px; padding-left: 22px; }
+.lb-md ul { list-style: disc; }
+.lb-md ol { list-style: decimal; }
+.lb-md li { margin: 3px 0; }
+.lb-md a { color: var(--lb-accent-ink); text-decoration: underline; }
+.lb-md blockquote {
+  margin: 0 0 10px;
+  padding: 2px 0 2px 12px;
+  border-left: 2px solid var(--lb-hairline);
+  color: var(--lb-ink-3);
+  font-style: italic;
+}
+.lb-md code, .lb-md .lb-md-code {
+  font-family: var(--lb-font-mono);
+  font-size: 0.88em;
+  background: var(--lb-bg-soft);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.lb-md pre {
+  background: var(--lb-bg-soft);
+  border: 1px solid var(--lb-hairline);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 0 0 10px;
+  overflow-x: auto;
+}
+.lb-md pre code { background: none; padding: 0; }
+.lb-md hr { border: 0; border-top: 1px solid var(--lb-hairline); margin: 16px 0; }
+
+/* ---- Notiz-Block im Paper-Detail (#160) ---- */
+.lb-notes-rendered {
+  font-family: var(--lb-font-serif);
+  font-size: 15.5px;
+  line-height: 1.65;
+  color: var(--lb-ink-2);
+  cursor: text;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 0 -12px;
+  transition: background .12s, border-color .12s;
+}
+.lb-notes-rendered:hover { background: var(--lb-bg-soft); border-color: var(--lb-hairline); }
+.lb-notes-empty { color: var(--lb-mute); font-style: italic; }
+.lb-notes-status {
+  font-family: var(--lb-font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--lb-mute);
+}
+.lb-notes-status[data-state="error"] { color: var(--lb-accent); }
+/* Der Notiz-Editor waechst mit dem Text, statt wie der Manuskript-Editor die
+   volle Hoehe seiner Spalte einzunehmen. */
+.lb-notes-editor .CodeMirror {
+  height: auto;
+  min-height: 140px;
+  font-family: var(--lb-font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  background: var(--lb-bg-elev);
+  color: var(--lb-ink);
+  border: 1px solid var(--lb-hairline);
+  border-radius: 10px;
+  padding: 8px 4px;
+}
+.lb-notes-editor .CodeMirror-cursor { border-left: 1.5px solid var(--lb-ink); }
+.lb-notes-editor .CodeMirror-selected { background: var(--lb-accent-soft); }
+.lb-notes-editor .cm-header { color: var(--lb-ink); font-weight: 600; }
+.lb-notes-editor .cm-strong { color: var(--lb-ink); font-weight: 600; }
+.lb-notes-editor .cm-em { color: var(--lb-ink-2); font-style: italic; }
+.lb-notes-editor .cm-link { color: var(--lb-accent-ink); }
+.lb-notes-editor .cm-url { color: var(--lb-mute); }
+.lb-notes-editor .cm-quote { color: var(--lb-ink-3); font-style: italic; }
+.lb-notes-editor .cm-variable-2 { color: var(--lb-accent); }   /* Listenmarker */
+.lb-notes-editor .cm-comment { color: var(--lb-mute); }
 

@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LocalBib</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/localbib-32.png">
+    <link rel="icon" type="image/png" sizes="256x256" href="/static/icons/localbib.png">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -36,21 +39,28 @@
     <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
     <script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>
     <script src="https://d3js.org/d3.v7.min.js"></script>
-    <!-- CodeMirror 5 (buildless, fuer den LaTeX-Editor â€” ADR-0002 deferred) -->
+    <!-- CodeMirror 5 (buildless — ADR-0002 deferred): Notiz-Editor (Markdown)
+         und LaTeX-Editor teilen sich eine Instanz der Bibliothek. -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/continuelist.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/stex/stex.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.js"></script>
+    <!-- Markdown-Rendering fuer Notizen und Research-Chat. DOMPurify ist nicht
+         optional, sobald gespeicherter Text als HTML eingesetzt wird. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.4.14/purify.min.js"></script>
     <!-- Bump BOTH ?v= stamps together on every static change. app.js and
          style.css are one unit: the SPA binds `var(--lb-*)` tokens that live in
          the stylesheet, so a browser holding one version and fetching the other
          renders a broken page (an unresolved var() paints every chart series
          black). One stamp, both files, same commit. -->
-    <link rel="stylesheet" href="/static/style.css?v=20260811p">
+    <link rel="stylesheet" href="/static/style.css?v=20260826a">
 </head>
 <body class="bg-bg text-ink font-sans min-h-screen">
     <div id="app"></div>
-    <script src="/static/app.js?v=20260811p"></script>
+    <script src="/static/app.js?v=20260826a"></script>
 </body>
 </html>

@@ -46,6 +46,44 @@ function scholarSearchUrl(ref) {
     return 'https://scholar.google.com/scholar?q=' + encodeURIComponent(parts.filter(Boolean).join(' '));
 }
 
+// Markdown -> HTML fuer v-html (Notizen, Research-Chat). `marked` und
+// `DOMPurify` kommen wie jede andere Bibliothek der Seite vom CDN. Fehlt eine
+// von beiden, greift der Minimal-Renderer: er escaped den Text zuerst und
+// bringt danach nur die drei Inline-Formen zurueck, die er selbst erzeugt hat.
+// In beiden Pfaden kann also nichts, was der Nutzer getippt hat, zu lebendem
+// Markup werden — bei gespeichertem Text ist Sanitizing nicht optional.
+function renderMarkdownSafe(text) {
+    if (!text) return '';
+    if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
+        return DOMPurify.sanitize(marked.parse(String(text), { breaks: true }));
+    }
+    return String(text)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        .replace(/`(.+?)`/g, '<code class="lb-md-code">$1</code>');
+}
+
+// Favicon: dieselben Vorgaben wie im <head> von index.html. Seit das
+// LocalBib-Icon mitgeliefert wird, ist der Tab nie leer — ein eigenes Icon
+// (Einstellungen > Darstellung) ersetzt es, das Entfernen stellt es wieder her.
+// Darum hier ersetzen statt, wie frueher, den Link ersatzlos loeschen.
+const DEFAULT_FAVICONS = [
+    { href: '/static/icons/localbib-32.png', sizes: '32x32' },
+    { href: '/static/icons/localbib.png', sizes: '256x256' },
+];
+
+function setFavicon(href) {
+    document.querySelectorAll("link[rel~='icon']").forEach(el => el.remove());
+    for (const entry of (href ? [{ href }] : DEFAULT_FAVICONS)) {
+        const link = document.createElement('link');
+        link.rel = 'icon';
+        link.href = entry.href;
+        if (entry.sizes) link.sizes = entry.sizes;
+        document.head.appendChild(link);
+    }
+}
+
 // =============================================================================
 // SVG Icons (inline)
 // =============================================================================
@@ -361,14 +399,38 @@ const Sidebar = {
             // Collapsed = icon rail (64px). Persisted so a focus-mode choice
             // (e.g. while working in a wide plugin view) survives reloads.
             collapsed: localStorage.getItem('lbSidebarCollapsed') === '1',
+            // True while the fold was done *for* the reader (focus mode, #161)
+            // rather than *by* them. Only such a fold is undone again.
+            autoCollapsed: false,
         };
     },
     async created() {
         await this.load();
     },
+    mounted() {
+        // Focus mode (#161): the paper detail view asks for the icon rail while
+        // it is open. Folding here never writes lbSidebarCollapsed — a reader
+        // must not find their sidebar permanently folded by opening a paper.
+        this._focusModeHandler = (e) => {
+            if (e.detail && e.detail.on) {
+                this.autoCollapsed = !this.collapsed;
+                this.collapsed = true;
+            } else {
+                if (this.autoCollapsed) this.collapsed = false;
+                this.autoCollapsed = false;
+            }
+        };
+        window.addEventListener('lb-focus-mode', this._focusModeHandler);
+    },
+    unmounted() {
+        if (this._focusModeHandler) window.removeEventListener('lb-focus-mode', this._focusModeHandler);
+    },
     methods: {
         toggleCollapsed() {
             this.collapsed = !this.collapsed;
+            // A deliberate unfold ends the automatism: the choice stands, and
+            // closing the paper restores nothing over it.
+            this.autoCollapsed = false;
             try {
                 localStorage.setItem('lbSidebarCollapsed', this.collapsed ? '1' : '0');
             } catch (e) { /* private mode: the toggle still works, it just won't persist */ }
@@ -389,10 +451,12 @@ const Sidebar = {
                 console.error('Sidebar load error:', e);
             }
             this.loading = false;
-            // Custom Icon laden
+            // Custom Icon laden. Auch der Tab bekommt es hier — sonst zeigte er
+            // nach einem Reload wieder das mitgelieferte LocalBib-Icon.
             try {
                 const iconData = await api('/api/appearance/icon');
                 this.customIcon = iconData.path;
+                if (iconData.path) setFavicon(iconData.path);
             } catch (e) {}
             // Plugin-NavItems + Routen (Phase 0b): aus aktiven Plugins
             try {
@@ -516,7 +580,7 @@ const PaperList = {
                     <div class="lb-search">
                         <span class="lb-search-icon" v-html="icons.search"></span>
                         <input v-model="searchQuery" @input="debouncedSearch"
-                               type="text" placeholder="Suche in Titel, Autor, Abstract..."
+                               type="text" placeholder="Suche in Titel, Autor, Abstract, Notizen..."
                                class="lb-search-input" />
                         <button v-if="searchQuery" @click="clearSearch" class="lb-search-clear" aria-label="Clear">
                             <span v-html="icons.x"></span>
@@ -1502,7 +1566,46 @@ const PaperList = {
 const PaperDetail = {
     template: `
         <div class="lb-modal-overlay" @click.self="close">
-        <div class="lb-modal" @click.stop>
+        <!-- Two-panel assembly (#161). It owns the gap between the panels, so a
+             click there hits the assembly and stops — only the strip left of the
+             PDF panel is still backdrop and still closes the view. -->
+        <div class="lb-detail-assembly" @click.stop data-testid="detail-assembly">
+
+            <!-- ============ PDF PANEL (docked, scrolls on its own) ============ -->
+            <section v-if="paper" class="lb-pdf-panel" :class="{ 'is-empty': !paper.filename }"
+                     data-testid="pdf-panel">
+                <header class="lb-pdf-head">
+                    <span class="lb-mono lb-truncate lb-pdf-name" :title="paper.filename || 'Kein PDF hinterlegt'">
+                        {{ paper.filename || 'Kein PDF hinterlegt' }}
+                    </span>
+                    <!-- Without a file the actions belong to the drop zone below,
+                         not up here twice. -->
+                    <div class="lb-pdf-actions">
+                        <button v-if="paper.filename" class="lb-btn lb-btn-primary" @click="openInApp">PDF oeffnen</button>
+                        <input ref="attachPdfInput" type="file" accept="application/pdf,.pdf" style="display:none" @change="onPdfSelected" />
+                    </div>
+                </header>
+                <div class="lb-pdf-body">
+                    <iframe v-if="paper.filename" class="lb-pdf-frame" data-testid="pdf-frame"
+                            :src="'/api/papers/' + paper.id + '/pdf' + (pdfPage ? '#page=' + pdfPage : '')"
+                            loading="lazy"></iframe>
+                    <div v-else class="lb-pdf-drop" data-testid="pdf-drop-zone">
+                        <p class="lb-pdf-drop-h">Kein PDF hinterlegt</p>
+                        <p class="lb-pdf-drop-p">Datei anhaengen, eine frei zugaengliche Fassung holen oder auf Scholar suchen.</p>
+                        <div class="lb-pdf-drop-actions">
+                            <button class="lb-btn lb-btn-primary" @click="$refs.attachPdfInput.click()" :disabled="attachingPdf">
+                                {{ attachingPdf ? 'Haengt an...' : 'PDF anhaengen' }}
+                            </button>
+                            <button v-if="paper.doi" class="lb-btn lb-btn-ghost" @click="fetchOaPdf" :disabled="fetchingOa">
+                                {{ fetchingOa ? 'Suche OA...' : 'PDF aus Open Access' }}
+                            </button>
+                            <a class="lb-btn lb-btn-ghost" :href="scholarUrl" target="_blank" rel="noopener">Google Scholar</a>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <div class="lb-modal">
             <!-- Sticky header -->
             <header class="lb-modal-head">
                 <button class="lb-modal-back" @click="close">
@@ -1517,15 +1620,12 @@ const PaperDetail = {
                        :href="'https://doi.org/' + paper.doi" target="_blank" rel="noopener">
                         DOI oeffnen
                     </a>
-                    <button v-if="paper.filename" class="lb-btn lb-btn-primary" @click="openInApp">PDF oeffnen</button>
-                    <button v-else class="lb-btn lb-btn-primary" @click="$refs.attachPdfInput.click()" :disabled="attachingPdf">
-                        {{ attachingPdf ? 'Haengt an...' : 'PDF anhaengen' }}
+                    <!-- Only visible in the two-column band (1100-1440px), where the
+                         metadata column is folded away by default. -->
+                    <button class="lb-btn lb-btn-ghost lb-meta-toggle" @click="metaOpen = !metaOpen"
+                            :aria-pressed="String(metaOpen)" data-testid="meta-toggle">
+                        {{ metaOpen ? 'Metadaten ausblenden' : 'Metadaten' }}
                     </button>
-                    <button v-if="!paper.filename && paper.doi" class="lb-btn lb-btn-ghost" @click="fetchOaPdf" :disabled="fetchingOa">
-                        {{ fetchingOa ? 'Suche OA...' : 'PDF aus Open Access' }}
-                    </button>
-                    <a v-if="!paper.filename" class="lb-btn lb-btn-ghost" :href="scholarUrl" target="_blank" rel="noopener">Google Scholar</a>
-                    <input ref="attachPdfInput" type="file" accept="application/pdf,.pdf" style="display:none" @change="onPdfSelected" />
                     <div class="relative">
                         <button @click="actionMenuOpen = !actionMenuOpen"
                                 class="lb-modal-close" aria-label="Mehr"
@@ -1580,9 +1680,9 @@ const PaperDetail = {
             </div>
 
             <template v-else-if="paper">
-            <div class="lb-modal-grid">
-                <!-- ============ MAIN ============ -->
-                <main class="lb-modal-main">
+            <div class="lb-modal-grid" :class="{ 'is-meta-open': metaOpen }">
+                <!-- ============ MAIN (content column, own scroll region) ============ -->
+                <main class="lb-modal-main" data-testid="content-column">
 
                 <!-- Edit Metadata Form (replaces title block) -->
                 <div v-if="editingMeta" class="lb-detail-section">
@@ -1655,34 +1755,6 @@ const PaperDetail = {
                     </div>
                     <h1 class="lb-detail-title">{{ paper.title || 'Kein Titel' }}</h1>
                     <p class="lb-detail-authors" v-if="paper.authors">{{ paper.authors }}</p>
-
-                    <!-- OCR Result Banner -->
-                    <div v-if="ocrResult" class="lb-detail-section p-3 rounded-lg text-sm relative" style="background: var(--lb-bg-soft); border: 1px solid var(--lb-hairline);">
-                        <button @click="ocrResult = null" class="absolute top-2 right-2 opacity-50 hover:opacity-100" style="color: var(--lb-mute);">
-                            <span v-html="icons.x"></span>
-                        </button>
-                        <p class="font-medium mb-1" style="color: var(--lb-ink);">OCR {{ ocrResult._ocr_chars > 0 ? 'abgeschlossen' : 'ohne Ergebnis' }}</p>
-                        <p v-if="ocrResult._ocr_chars > 0" style="color: var(--lb-ink-2);">
-                            {{ ocrResult._ocr_chars }} Zeichen extrahiert
-                            <span v-if="ocrResult._ocr_searchable"> &middot; PDF ist jetzt durchsuchbar</span>
-                            <span v-if="ocrResult._ocr_llm && Object.keys(ocrResult._ocr_llm).length"> &middot; LLM hat Metadaten aktualisiert</span>
-                        </p>
-                        <p v-else style="color: var(--lb-ink-2);">Kein Text erkannt. PDF evtl. zu schlecht gescannt.</p>
-                    </div>
-
-                    <!-- Validate Result Banner -->
-                    <div v-if="validateResult" class="lb-detail-section p-3 rounded-lg text-sm relative" style="background: var(--lb-accent-soft); border: 1px solid var(--lb-hairline);">
-                        <button @click="validateResult = null" class="absolute top-2 right-2 opacity-50 hover:opacity-100" style="color: var(--lb-accent-ink);">
-                            <span v-html="icons.x"></span>
-                        </button>
-                        <p class="font-medium mb-1" style="color: var(--lb-accent-ink);">Validierung abgeschlossen</p>
-                        <p style="color: var(--lb-accent-ink);">
-                            Quelle: {{ validateResult._validate_source }}
-                            <span v-if="validateResult._validate_changes && Object.keys(validateResult._validate_changes).length">
-                                &middot; {{ Object.keys(validateResult._validate_changes).length }} Felder aktualisiert
-                            </span>
-                        </p>
-                    </div>
                 </template>
 
                 <!-- Abstract -->
@@ -1693,6 +1765,26 @@ const PaperDetail = {
                         <span v-else-if="paper.abstract_source === 'pdf'" class="lb-tag" style="font-size: 9.5px;" title="Dieses Abstract wurde per KI aus dem PDF extrahiert">KI-extrahiert</span>
                     </div>
                     <p class="lb-detail-abstract">{{ paper.abstract }}</p>
+                </section>
+
+                <!-- Notizen (#160) -->
+                <section v-if="!editingMeta" class="lb-detail-section" data-testid="paper-notes">
+                    <div class="flex items-center justify-between" style="margin-bottom: 10px;">
+                        <h4 class="lb-detail-h" style="margin: 0;">Notizen</h4>
+                        <div class="flex items-center gap-3">
+                            <span v-if="notesStatus" class="lb-notes-status" :data-state="notesSaveState">{{ notesStatus }}</span>
+                            <button @click="notesEditing ? showNotes() : editNotes()" class="lb-btn-text" style="font-size: 11.5px;">
+                                {{ notesEditing ? 'Ansicht' : 'Bearbeiten' }}
+                            </button>
+                        </div>
+                    </div>
+                    <div v-if="notesEditing" class="lb-notes-editor" data-testid="paper-notes-editor">
+                        <textarea ref="notesInput" v-model="notesDraft" @input="onNotesTyped()"
+                                  rows="6" class="lb-input"
+                                  placeholder="Gedanken zu diesem Paper &mdash; Markdown erlaubt."></textarea>
+                    </div>
+                    <div v-else class="lb-md lb-notes-rendered" data-testid="paper-notes-rendered"
+                         title="Zum Bearbeiten klicken" @click="editNotes()" v-html="notesHtml"></div>
                 </section>
 
                 <!-- Custom Fields -->
@@ -1735,17 +1827,6 @@ const PaperDetail = {
                                 </select>
                             </template>
                         </div>
-                    </div>
-                </section>
-
-                <!-- PDF Vorschau (nur wenn Datei vorhanden) -->
-                <section v-if="!editingMeta && paper.filename" class="lb-detail-section">
-                    <div class="flex items-center justify-between" style="margin-bottom: 10px;">
-                        <h4 class="lb-detail-h" style="margin: 0;">PDF-Vorschau</h4>
-                        <span class="lb-mono" style="font-size: 11px; color: var(--lb-mute);">{{ paper.filename }}</span>
-                    </div>
-                    <div class="pdf-viewer" style="border: 1px solid var(--lb-hairline); border-radius: 10px; overflow: hidden; background: var(--lb-bg-elev);">
-                        <iframe :src="'/api/papers/' + paper.id + '/pdf' + (pdfPage ? '#page=' + pdfPage : '')" loading="lazy"></iframe>
                     </div>
                 </section>
 
@@ -1816,8 +1897,37 @@ const PaperDetail = {
 
                 </main>
 
-                <!-- ============ ASIDE ============ -->
-                <aside class="lb-modal-aside">
+                <!-- ============ ASIDE (metadata column, own scroll region) ============ -->
+                <aside class="lb-modal-aside" data-testid="metadata-column">
+                    <!-- OCR Result Banner — sits with the metadata it describes
+                         instead of pushing the content column down. -->
+                    <div v-if="ocrResult" class="lb-aside-banner" style="background: var(--lb-bg-soft);">
+                        <button @click="ocrResult = null" class="absolute top-2 right-2 opacity-50 hover:opacity-100" style="color: var(--lb-mute);">
+                            <span v-html="icons.x"></span>
+                        </button>
+                        <p class="font-medium mb-1" style="color: var(--lb-ink);">OCR {{ ocrResult._ocr_chars > 0 ? 'abgeschlossen' : 'ohne Ergebnis' }}</p>
+                        <p v-if="ocrResult._ocr_chars > 0" style="color: var(--lb-ink-2);">
+                            {{ ocrResult._ocr_chars }} Zeichen extrahiert
+                            <span v-if="ocrResult._ocr_searchable"> &middot; PDF ist jetzt durchsuchbar</span>
+                            <span v-if="ocrResult._ocr_llm && Object.keys(ocrResult._ocr_llm).length"> &middot; LLM hat Metadaten aktualisiert</span>
+                        </p>
+                        <p v-else style="color: var(--lb-ink-2);">Kein Text erkannt. PDF evtl. zu schlecht gescannt.</p>
+                    </div>
+
+                    <!-- Validate Result Banner -->
+                    <div v-if="validateResult" class="lb-aside-banner" style="background: var(--lb-accent-soft);">
+                        <button @click="validateResult = null" class="absolute top-2 right-2 opacity-50 hover:opacity-100" style="color: var(--lb-accent-ink);">
+                            <span v-html="icons.x"></span>
+                        </button>
+                        <p class="font-medium mb-1" style="color: var(--lb-accent-ink);">Validierung abgeschlossen</p>
+                        <p style="color: var(--lb-accent-ink);">
+                            Quelle: {{ validateResult._validate_source }}
+                            <span v-if="validateResult._validate_changes && Object.keys(validateResult._validate_changes).length">
+                                &middot; {{ Object.keys(validateResult._validate_changes).length }} Felder aktualisiert
+                            </span>
+                        </p>
+                    </div>
+
                     <div class="lb-aside-block">
                         <h5 class="lb-aside-h">Metadaten</h5>
                         <dl class="lb-aside-dl">
@@ -2125,6 +2235,7 @@ const PaperDetail = {
             </template>
         </div>
         </div>
+        </div>
     `,
     data() {
         return {
@@ -2146,10 +2257,17 @@ const PaperDetail = {
             editMeta: {},
             customValues: {},
             savingCustom: false,
+            // Notizen (#160): Ansicht/Bearbeiten + Autosave-Status
+            notesEditing: false,
+            notesDraft: '',
+            notesSaveState: 'idle',   // idle | dirty | saving | saved | error
             extractingRefs: false,
             generatingAbstract: false,
             actionMenuOpen: false,
             bibtexCopied: false,
+            // Metadaten-Spalte im Zwei-Spalten-Band (1100-1440px). Darueber und
+            // darunter entscheidet das Stylesheet, der Schalter ist dort weg.
+            metaOpen: false,
             attachingPdf: false,
             // PDF-Verarbeitungsoptionen (Modal nach Dateiauswahl)
             showAttachModal: false,
@@ -2191,6 +2309,17 @@ const PaperDetail = {
             const q = (this.paper.title || this.paper.doi || '').trim();
             return 'https://scholar.google.com/scholar?q=' + encodeURIComponent(q);
         },
+        notesHtml() {
+            const notes = this.paper && this.paper.notes;
+            return notes ? renderMarkdownSafe(notes)
+                         : '<p class="lb-notes-empty">Noch keine Notizen &mdash; hier klicken.</p>';
+        },
+        notesStatus() {
+            return {
+                dirty: 'ungespeichert…', saving: 'speichert…',
+                saved: 'gespeichert', error: 'Speichern fehlgeschlagen',
+            }[this.notesSaveState] || '';
+        },
         proposalFieldList() {
             if (!this.validateProposal) return [];
             const labels = {
@@ -2217,12 +2346,25 @@ const PaperDetail = {
             this.close();
         };
         window.addEventListener('keydown', this._escHandler);
+        // Focus mode (#161): the sidebar folds to its icon rail while a paper is
+        // open and unfolds again on close. The sidebar owns that decision — and
+        // never writes the stored preference for it.
+        window.dispatchEvent(new CustomEvent('lb-focus-mode', { detail: { on: true } }));
     },
     unmounted() {
         if (this._escHandler) window.removeEventListener('keydown', this._escHandler);
+        this.teardownNotes();
+        window.dispatchEvent(new CustomEvent('lb-focus-mode', { detail: { on: false } }));
     },
     watch: {
-        '$route'() { this.load(); }
+        '$route'() { this.load(); },
+        // Das Metadaten-Formular ersetzt den Notiz-Block im DOM. Vorher die
+        // offene Notiz sichern und den Editor abbauen, nachher wieder in den
+        // Oeffnungszustand gehen.
+        editingMeta(on) {
+            if (on) this.teardownNotes();
+            else this.$nextTick(() => this.openNotes());
+        },
     },
     methods: {
         close() {
@@ -2256,7 +2398,138 @@ const PaperDetail = {
                 this.citeKeySaving = false;
             }
         },
+        // --- Notizen (#160) ------------------------------------------------
+        // Der Editor ist CodeMirror 5 (Markdown-Mode + continuelist-Addon) auf
+        // dem Textarea darunter. Fehlt das CDN, bleibt das Textarea selbst der
+        // Editor — eine Notiz zu schreiben soll an keiner Bibliothek haengen.
+        openNotes() {
+            // Paper ohne Notiz oeffnet direkt im Editor, Paper mit Notiz
+            // gerendert. Schreiben soll keinen zusaetzlichen Klick kosten.
+            if (this.paper && !(this.paper.notes || '').trim()) this.editNotes();
+        },
+        editNotes() {
+            if (this.notesEditing || this.editingMeta) return;
+            // Den Entwurf nur dann am gespeicherten Stand ausrichten, wenn
+            // nichts Ungesichertes darin steht: nach einem fehlgeschlagenen
+            // Save wuerde ein Wechsel Ansicht -> Bearbeiten sonst genau den
+            // Text loeschen, der noch nirgends angekommen ist.
+            if (this.notesSaveState === 'idle' || this.notesSaveState === 'saved') {
+                this.notesDraft = (this.paper && this.paper.notes) || '';
+            }
+            this.notesEditing = true;
+            this.$nextTick(() => this.mountNotesEditor());
+        },
+        showNotes() {
+            this.teardownNotes();
+        },
+        mountNotesEditor() {
+            const textarea = this.$refs.notesInput;
+            if (!textarea) return;
+            if (typeof CodeMirror === 'undefined' || !CodeMirror.fromTextArea) {
+                textarea.focus();
+                return;
+            }
+            this._notesCm = CodeMirror.fromTextArea(textarea, {
+                mode: 'markdown',
+                lineWrapping: true,
+                viewportMargin: Infinity,
+                extraKeys: {
+                    // Aus dem continuelist-Addon: Enter in einer Liste setzt
+                    // die Liste fort, statt den Marker neu tippen zu lassen.
+                    Enter: 'newlineAndIndentContinueMarkdownList',
+                    'Ctrl-B': () => this.wrapNotesSelection('**'),
+                    'Ctrl-I': () => this.wrapNotesSelection('*'),
+                },
+            });
+            this._notesCm.on('change', () => this.onNotesTyped(this._notesCm.getValue()));
+            this._notesCm.focus();
+        },
+        wrapNotesSelection(marker) {
+            const cm = this._notesCm;
+            if (!cm) return;
+            const selected = cm.getSelection();
+            cm.replaceSelection(marker + selected + marker);
+            if (!selected) {
+                // Ohne Auswahl gehoert der Cursor zwischen die Marker, sonst
+                // tippt man hinter das schliessende Sternchen weiter.
+                const at = cm.getCursor();
+                cm.setCursor({ line: at.line, ch: at.ch - marker.length });
+            }
+            cm.focus();
+        },
+        onNotesTyped(value) {
+            if (value !== undefined) this.notesDraft = value;
+            this.notesSaveState = 'dirty';
+            clearTimeout(this._notesTimer);
+            this._notesTimer = setTimeout(() => this.saveNotes(), 800);
+        },
+        saveNotes() {
+            clearTimeout(this._notesTimer);
+            if (!this.paper) return Promise.resolve();
+            return this.persistNotes(this.paper.id, this.notesDraft);
+        },
+        // Schreibt genau diesen Text fuer genau dieses Paper. Laeuft schon ein
+        // Request, wird der neuere Stand vorgemerkt statt verworfen, und er
+        // traegt seine paper_id mit sich: sonst verliert ein Paperwechsel
+        // mitten im Request die zuletzt getippten Zeichen.
+        async persistNotes(paperId, value) {
+            if (this._notesSaving) {
+                this._notesPending = { paperId, value };
+                return;
+            }
+            const stillOpen = () => !!this.paper && this.paper.id === paperId;
+            if (stillOpen() && value === (this.paper.notes || '')) {
+                if (this.notesSaveState === 'dirty') this.markNotesSaved();
+                return;
+            }
+            if (stillOpen()) this.notesSaveState = 'saving';
+            this._notesSaving = true;
+            try {
+                const res = await api(`/api/papers/${paperId}/notes`, {
+                    method: 'PUT',
+                    body: JSON.stringify({ notes: value }),
+                });
+                if (stillOpen()) {
+                    this.paper.notes = res.notes;
+                    // Waehrend des Requests weitergetippt? Dann ist es noch
+                    // nicht gesichert, und der Nachlauf unten holt es nach.
+                    if (this.notesDraft === res.notes) this.markNotesSaved();
+                    else this.notesSaveState = 'dirty';
+                }
+            } catch (e) {
+                console.error('Notizen speichern fehlgeschlagen:', e);
+                if (stillOpen()) this.notesSaveState = 'error';
+            } finally {
+                this._notesSaving = false;
+            }
+            const pending = this._notesPending;
+            this._notesPending = null;
+            if (pending) return this.persistNotes(pending.paperId, pending.value);
+            if (stillOpen() && this.notesSaveState === 'dirty') {
+                return this.persistNotes(paperId, this.notesDraft);
+            }
+        },
+        markNotesSaved() {
+            // Die Bestaetigung ist ein Signal, kein Dauerzustand: nach ein
+            // paar Sekunden verschwindet sie wieder.
+            this.notesSaveState = 'saved';
+            clearTimeout(this._notesSavedTimer);
+            this._notesSavedTimer = setTimeout(() => {
+                if (this.notesSaveState === 'saved') this.notesSaveState = 'idle';
+            }, 2500);
+        },
+        teardownNotes() {
+            // Offene Aenderung sichern (fire-and-forget), dann den Editor loesen.
+            clearTimeout(this._notesSavedTimer);
+            if (this.notesEditing) this.saveNotes();
+            if (this._notesCm) {
+                this._notesCm.toTextArea();
+                this._notesCm = null;
+            }
+            this.notesEditing = false;
+        },
         async load() {
+            this.teardownNotes();
             this.loading = true;
             this.validateResult = null;
             this.validateProposal = null;
@@ -2277,6 +2550,9 @@ const PaperDetail = {
                         this.customValues[cf.field_id] = cf.value || (cf.field_type === 'progress' ? 0 : '');
                     }
                 }
+                this.notesDraft = paper.notes || '';
+                this.notesSaveState = 'idle';
+                this.$nextTick(() => this.openNotes());
             } catch (e) {
                 console.error('Load paper error:', e);
             }
@@ -4848,13 +5124,7 @@ const SettingsPage = {
                 }
                 const data = await resp.json();
                 this.customIconPath = data.path;
-                let link = document.querySelector("link[rel~='icon']");
-                if (!link) {
-                    link = document.createElement('link');
-                    link.rel = 'icon';
-                    document.head.appendChild(link);
-                }
-                link.href = data.path;
+                setFavicon(data.path);
                 window.dispatchEvent(new CustomEvent('refresh-sidebar'));
             } catch (e) {
                 alert('Upload fehlgeschlagen: ' + e.message);
@@ -4864,8 +5134,7 @@ const SettingsPage = {
             try {
                 await api('/api/appearance/icon', { method: 'DELETE' });
                 this.customIconPath = null;
-                const link = document.querySelector("link[rel~='icon']");
-                if (link) link.remove();
+                setFavicon(null);
                 window.dispatchEvent(new CustomEvent('refresh-sidebar'));
             } catch (e) {
                 alert('Fehler: ' + e.message);
@@ -6571,11 +6840,11 @@ const AnalysePage = {
                                 </div>
                                 <div v-for="(msg, i) in chatMessages" :key="i" style="padding:14px 18px;border-bottom:1px solid var(--lb-hairline)">
                                     <div class="lb-section-label" style="padding:0;margin-bottom:6px" :style="{color: msg.role === 'user' ? 'var(--lb-accent)' : 'var(--lb-mute)'}">{{ msg.role === 'user' ? 'Du' : 'Assistent' }}</div>
-                                    <div :style="{fontFamily: msg.role === 'user' ? 'var(--lb-font-sans)' : 'var(--lb-font-serif)', fontSize: msg.role === 'user' ? '13.5px' : '15px'}" style="line-height:1.6;color:var(--lb-ink-2);white-space:pre-wrap" v-html="renderMarkdown(msg.content)"></div>
+                                    <div :style="{fontFamily: msg.role === 'user' ? 'var(--lb-font-sans)' : 'var(--lb-font-serif)', fontSize: msg.role === 'user' ? '13.5px' : '15px'}" class="lb-md" style="line-height:1.6;color:var(--lb-ink-2)" v-html="renderMarkdown(msg.content)"></div>
                                 </div>
                                 <div v-if="chatStreaming" style="padding:14px 18px">
                                     <div class="lb-section-label" style="padding:0;margin-bottom:6px;color:var(--lb-mute)">Assistent</div>
-                                    <div style="font-family:var(--lb-font-serif);font-size:15px;line-height:1.6;color:var(--lb-ink-2);white-space:pre-wrap" v-html="renderMarkdown(chatStreamContent || 'Denke nach...')"></div>
+                                    <div style="font-family:var(--lb-font-serif);font-size:15px;line-height:1.6;color:var(--lb-ink-2)" class="lb-md" v-html="renderMarkdown(chatStreamContent || 'Denke nach...')"></div>
                                 </div>
                             </div>
 
@@ -7561,13 +7830,7 @@ const AnalysePage = {
             this.chatStreamContent = '';
         },
         renderMarkdown(text) {
-            if (!text) return '';
-            let html = text
-                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-                .replace(/\*(.+?)\*/g, '<em>$1</em>')
-                .replace(/`(.+?)`/g, '<code class="bg-gray-200 px-1 py-0.5 rounded text-xs font-mono">$1</code>');
-            return html;
+            return renderMarkdownSafe(text);
         },
         async sendChatMessage() {
             const question = this.chatInput.trim();

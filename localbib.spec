@@ -66,7 +66,10 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    # Das Icon wird beim Bauen in die .exe einkompiliert und ist damit die
+    # Quelle fuer Desktop-Verknuepfung, Taskleiste und Explorer. Dieselbe .ico
+    # liegt unter static/ und wird ueber datas ohnehin mitgebundelt (Favicon).
+    icon="static/icons/localbib.ico",
 )
 
 coll = COLLECT(

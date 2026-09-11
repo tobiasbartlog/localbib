@@ -81,7 +81,7 @@ SCRIPT_DIR = _SCRIPT_DIR
 ENV_PATH = _ENV_PATH
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
@@ -240,6 +240,16 @@ app.include_router(_search_router)
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Serve the app icon at the well-known path.
+
+    index.html links the PNG variants explicitly, but browsers still request
+    /favicon.ico on their own — pinning the app to the Windows taskbar is the
+    case that actually needs it."""
+    return FileResponse(SCRIPT_DIR / "static" / "icons" / "localbib.ico")
 
 
 # =============================================================================

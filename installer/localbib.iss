@@ -42,11 +42,23 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}/issues
 AppUpdatesURL={#MyAppURL}/releases
 VersionInfoVersion={#MyAppVersion}
-; Per-user install by default: an unsigned installer that also demands UAC is
-; two scary dialogs instead of one. Users who want a machine-wide install can
-; still elevate from the wizard.
+; Per-user install, with no way up: PrivilegesRequiredOverridesAllowed is
+; deliberately NOT set. An unsigned installer that also demands UAC would be two
+; scary dialogs instead of one — but the deciding reason is #148, and it was
+; measured rather than assumed. Allowing `dialog` let a user install
+; machine-wide; UsePreviousPrivileges (default yes) then made the silent
+; one-click update detect that install and re-launch itself elevated, appending
+; /ALLUSERS to its own command line. Setup's log said "Administrative install
+; mode: Yes" and the run took ~40 s instead of 1 s — the time a UAC prompt sat
+; there waiting. The app has already exited by then (routers/version.py leaves
+; one second after starting us), so the user's window vanishes and a rights
+; prompt appears out of nowhere for an update advertised as one click. A
+; per-user install never elevates, so that path cannot arise.
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; The bundle is 64-bit, so it belongs in Program Files and the native registry
+; view — without this, a machine-wide install landed in Program Files (x86) and
+; HKLM\...\WOW6432Node. Needs Inno Setup 6.3+ for the `x64compatible` value.
+ArchitecturesInstallIn64BitMode=x64compatible
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
@@ -55,6 +67,10 @@ OutputDir=..\dist\installer
 OutputBaseFilename=LocalBib-Setup-{#MyAppVersion}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 UninstallDisplayIcon={app}\{#MyAppExeName}
+; Icon of the setup .exe itself. The shortcuts and the taskbar entry take
+; theirs from LocalBib.exe, into which PyInstaller compiles the same .ico
+; (see localbib.spec) — this line only covers the downloaded installer.
+SetupIconFile=..\static\icons\localbib.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -91,7 +107,15 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 ; optional: without this line the user's window simply disappears. `skipifsilent`
 ; above and `skipifnotsilent` here are mutually exclusive, so exactly one of the
 ; two entries ever fires.
-Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifnotsilent
+;
+; `runasoriginaluser` is the belt to the braces above: should Setup ever run
+; elevated anyway (someone right-clicks "run as administrator"), the relaunched
+; app must still belong to the logged-in user. Without the flag the [Run] entry
+; inherits Setup's elevated token — measured on a machine where elevation
+; switches to a separate admin account, and LocalBib would come back with a
+; different %USERPROFILE%: another ~\Literatur, another .env, another database,
+; i.e. an empty library where the user's own one used to be.
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifnotsilent runasoriginaluser
 
 ; There is deliberately no uninstall-delete section: the user's library lives
 ; outside {app} (LITERATUR_BASE_DIR, default ~\Literatur) and an uninstall must
