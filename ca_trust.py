@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import tempfile
 from typing import Optional
 
@@ -47,9 +48,17 @@ _configured_extra: Optional[str] = None
 _merged_path: Optional[str] = None
 
 
+# ``%VAR%`` von Hand: ``os.path.expandvars`` kennt diese Schreibweise nur auf
+# Windows, auf POSIX bleibt sie unangetastet stehen. Dieselbe ``.env`` soll aber
+# auf jedem Rechner dasselbe bedeuten - also loesen wir beide Formen ueberall auf.
+_WIN_VAR_RE = re.compile(r"%([^%]+)%")
+
+
 def _expand(raw: str) -> str:
-    """``~`` und ``%VARS%`` aufloesen; Anfuehrungszeichen aus der .env abstreifen."""
-    return os.path.expanduser(os.path.expandvars(raw.strip().strip('"').strip("'")))
+    """``~``, ``$VAR`` und ``%VAR%`` aufloesen; Anfuehrungszeichen aus der .env abstreifen."""
+    path = raw.strip().strip('"').strip("'")
+    path = _WIN_VAR_RE.sub(lambda m: os.environ.get(m.group(1), m.group(0)), path)
+    return os.path.expanduser(os.path.expandvars(path))
 
 
 def configured_extra_ca() -> Optional[str]:

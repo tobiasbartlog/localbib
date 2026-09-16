@@ -112,11 +112,19 @@ def test_missing_file_falls_back_to_certifi(monkeypatch, tmp_path):
     assert ca_trust.EXTRA_CA_ENV not in os.environ
 
 
-def test_tilde_and_env_vars_are_expanded(monkeypatch, tmp_path):
+@pytest.mark.parametrize("spelling", ["%MY_CA_DIR%/haus.pem", "$MY_CA_DIR/haus.pem"])
+def test_tilde_and_env_vars_are_expanded(monkeypatch, tmp_path, spelling):
+    """Both spellings, on every platform.
+
+    ``os.path.expandvars`` resolves ``%VAR%`` only on Windows; on the Linux CI
+    runner it stayed literal, the file was "not there", and the release gate
+    went red on a test that was green on the maintainer's machine. A shared
+    ``.env`` must mean the same thing wherever it is read.
+    """
     monkeypatch.setenv("MY_CA_DIR", str(tmp_path))
     p = tmp_path / "haus.pem"
     p.write_bytes(FAKE_INTERMEDIATE)
-    monkeypatch.setenv(ca_trust.EXTRA_CA_ENV, "%MY_CA_DIR%/haus.pem")
+    monkeypatch.setenv(ca_trust.EXTRA_CA_ENV, spelling)
 
     resolved = ca_trust.configured_extra_ca()
     assert resolved is not None
