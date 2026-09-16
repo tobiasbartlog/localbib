@@ -1950,7 +1950,7 @@ const PaperDetail = {
                                     <button @click="saveCiteKey" :disabled="citeKeySaving" class="lb-tag" style="cursor:pointer;">{{ citeKeySaving ? '...' : 'OK' }}</button>
                                     <button @click="editingCiteKey = false" class="lb-tag" style="cursor:pointer;">Abbrechen</button>
                                 </div>
-                                <p v-if="citeKeyError" class="text-xs mt-1" style="color: #dc2626;">{{ citeKeyError }}</p>
+                                <p v-if="citeKeyError" class="text-xs mt-1" style="color: var(--lb-danger);">{{ citeKeyError }}</p>
                             </dd>
                         </dl>
                     </div>
@@ -4371,7 +4371,7 @@ const SettingsPage = {
                         <button @click="toggleUnlockPdfs"
                                 class="relative w-14 h-7 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2"
                                 :class="unlockPdfs ? 'bg-accent' : 'bg-gray-300'">
-                            <span class="absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
+                            <span class="lb-knob absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
                                   :class="unlockPdfs ? 'translate-x-7' : 'translate-x-0'">
                                 <svg v-if="unlockPdfs" xmlns="http://www.w3.org/2000/svg" class="text-accent" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
                                 <svg v-else xmlns="http://www.w3.org/2000/svg" class="text-gray-400" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
@@ -4426,6 +4426,12 @@ const SettingsPage = {
                                    class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm
                                           focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
                             <p class="text-xs text-gray-400 mt-1">{{ field.help }}</p>
+                            <!-- Leeres Dropdown ohne Begruendung ist eine Sackgasse: der Grund
+                                 steht sonst nur im Log, das im gebauten .exe niemand sieht. -->
+                            <p v-if="field.key === 'LLM_MODEL' && !availableModels.length && modelsError"
+                               class="text-xs text-red-500 mt-1 leading-relaxed">
+                                Modell-Liste nicht abrufbar — bitte oben eintippen.<br>{{ modelsError }}
+                            </p>
                             <div v-if="field.key === 'LLM_MODEL_FAST'" class="mt-2">
                                 <button @click="suggestModels" :disabled="suggestingModels"
                                         class="text-xs px-3 py-1.5 rounded-lg border border-accent text-accent
@@ -4467,7 +4473,7 @@ const SettingsPage = {
                         <button @click="toggleDarkMode"
                                 class="relative w-14 h-7 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2"
                                 :class="darkMode ? 'bg-accent' : 'bg-gray-300'">
-                            <span class="absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
+                            <span class="lb-knob absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
                                   :class="darkMode ? 'translate-x-7' : 'translate-x-0'">
                                 <svg v-if="darkMode" xmlns="http://www.w3.org/2000/svg" class="text-accent" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
                                 <svg v-else xmlns="http://www.w3.org/2000/svg" class="text-accent" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
@@ -4486,7 +4492,7 @@ const SettingsPage = {
                         <button @click="toggleThesisMode"
                                 class="relative w-14 h-7 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2"
                                 :class="thesisMode ? 'bg-accent' : 'bg-gray-300'">
-                            <span class="absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
+                            <span class="lb-knob absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
                                   :class="thesisMode ? 'translate-x-7' : 'translate-x-0'">
                                 <svg v-if="thesisMode" xmlns="http://www.w3.org/2000/svg" class="text-accent" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
                                 <svg v-else xmlns="http://www.w3.org/2000/svg" class="text-gray-400" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
@@ -4865,6 +4871,7 @@ const SettingsPage = {
             licenseTrial: null,
             licenseLegacyNote: '',
             availableModels: [],
+            modelsError: '',
             availableEmbedModels: [],
             availableProviders: [],
             suggestingModels: false,
@@ -4919,8 +4926,10 @@ const SettingsPage = {
             try {
                 const data = await api('/api/llm/models');
                 this.availableModels = data.models || [];
+                this.modelsError = data.error || '';
             } catch (e) {
                 console.error('Models load error:', e);
+                this.modelsError = 'Modell-Liste nicht abrufbar (Server nicht erreichbar).';
             }
         },
         async loadProviders() {
@@ -5325,9 +5334,13 @@ const App = {
                         <span class="text-sm font-medium" data-testid="banner-message">
                             {{ bannerMessage }}
                         </span>
+                        <!-- Das Pill sitzt auf dem Akzentband, nicht auf dem Karton:
+                             weiss bleibt weiss, und die Schrift darauf bleibt der
+                             *helle* Accent-Ink. Das Dark-Token (#ffb084) ist Tinte
+                             fuer dunkle Flaechen und waere auf Weiss unlesbar. -->
                         <a v-if="bannerUrl" :href="bannerUrl" target="_blank" rel="noopener"
                            class="text-xs font-semibold px-3 py-1 rounded-full transition-colors"
-                           style="background:#fff;color:var(--lb-accent-ink);">
+                           style="background:#fff;color:#7a2808;">
                             Jetzt kaufen
                         </a>
                     </div>
@@ -6571,6 +6584,39 @@ const ThesisPage = {
 // AnalysePage Component
 // =============================================================================
 
+// ── Wissensnetz: Farben der D3-Ebene ─────────────────────────────────────────
+// SVG-Attribute nehmen keine CSS-Klasse, also liest der Graph die Tokens zur
+// Zeichenzeit aus dem Dokument. Feste Hexwerte waren hier ein Dark-Mode-Loch:
+// der Trennring der Fremdknoten ist die *Seitenfarbe* (hell #fafaf7 — im Dark
+// Mode ein weisser Leuchtring um jeden Knoten), und die Auswahl zeichnete
+// Schwarz auf Schwarz. Der Cache haelt den Wert pro Theme/Palette fest, damit
+// nicht jeder Knoten ein getComputedStyle ausloest.
+let _lbTokenCache = { key: null, vals: {} };
+function lbToken(name, fallback) {
+    const root = document.documentElement;
+    const key = (root.getAttribute('data-theme') || '') + '|' + (root.getAttribute('data-palette') || '');
+    if (_lbTokenCache.key !== key) _lbTokenCache = { key, vals: {} };
+    if (!(name in _lbTokenCache.vals)) {
+        const v = getComputedStyle(root).getPropertyValue(name).trim();
+        _lbTokenCache.vals[name] = v || fallback;
+    }
+    return _lbTokenCache.vals[name];
+}
+// Knotenring: Auswahl > eigenes Paper > Brueckenknoten > Trennring gegen den Grund.
+function netNodeStroke(d, bridgeNodes, highlighted) {
+    if (highlighted) return lbToken('--lb-ink', '#1a1a1a');
+    if (d.type === 'own') return lbToken('--lb-accent-ink', '#7a2808');
+    if (bridgeNodes.has(d.id)) return lbToken('--lb-accent', '#c2410c');
+    return lbToken('--lb-bg', '#fafaf7');
+}
+// Kantenfarbe: Auswahl > Bruecke > aus dem PDF gelesene Referenz > normale Kante.
+function netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, highlighted) {
+    if (highlighted) return lbToken('--lb-ink', '#1a1a1a');
+    if (bridgeEdgeSet.has(i)) return lbToken('--lb-accent', '#c2410c');
+    if (pdfRefEdgeSet.has(i)) return lbToken('--lb-mute-2', '#a8a49c');
+    return lbToken('--lb-hairline', '#e7e2d6');
+}
+
 const AnalysePage = {
     template: `
         <div class="lb-view lb-analyse">
@@ -7344,10 +7390,7 @@ const AnalysePage = {
             }
 
             // Editorial color scheme — read live tokens so dark-mode works
-            const cssVar = (name, fallback) => {
-                const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-                return v || fallback;
-            };
+            const cssVar = lbToken;
             const editorialInk      = cssVar('--lb-ink', '#1a1a1a');
             const editorialInk3     = cssVar('--lb-ink-3', '#6b6760');
             const editorialMute     = cssVar('--lb-mute', '#8e8a82');
@@ -7510,7 +7553,7 @@ const AnalysePage = {
                 .selectAll('line')
                 .data(edges)
                 .join('line')
-                .attr('stroke', (d, i) => bridgeEdgeSet.has(i) ? '#c2410c' : pdfRefEdgeSet.has(i) ? '#a8a49c' : '#e7e2d6')
+                .attr('stroke', (d, i) => netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, false))
                 .attr('stroke-width', (d, i) => bridgeEdgeSet.has(i) ? 2.5 : pdfRefEdgeSet.has(i) ? 1.5 : 1)
                 .attr('stroke-opacity', (d, i) => bridgeEdgeSet.has(i) ? 0.7 : pdfRefEdgeSet.has(i) ? 0.5 : 0.3)
                 .attr('marker-end', (d, i) => pdfRefEdgeSet.has(i) ? 'url(#arrowhead-pdfref)' : (bridgeEdgeSet.has(i) ? 'url(#arrowhead-bridge)' : 'url(#arrowhead)'));
@@ -7527,9 +7570,9 @@ const AnalysePage = {
                     if (vm.mode === 'years' && d.year) return yearInterp(yearScale(d.year));
                     // Color bridge nodes (reachable from >=2 own papers within depth) as accent
                     if (bridgeNodes.has(d.id)) return colorMap.missing;
-                    return colorMap[d.type] || '#a8a49c';
+                    return colorMap[d.type] || editorialMute2;
                 })
-                .attr('stroke', d => d.type === 'own' ? '#7a2808' : (bridgeNodes.has(d.id) ? '#c2410c' : '#fafaf7'))
+                .attr('stroke', d => netNodeStroke(d, bridgeNodes, false))
                 .attr('stroke-width', d => d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1))
                 .style('cursor', 'pointer')
                 .on('mouseenter', (event, d) => { vm.hoverNode = d; })
@@ -7570,7 +7613,7 @@ const AnalysePage = {
                     return t.length > 30 ? t.substring(0, 28) + '...' : t;
                 })
                 .attr('font-size', '9px')
-                .attr('fill', '#3a3833')
+                .attr('fill', lbToken('--lb-ink-2', '#3a3833'))
                 .attr('font-weight', '500')
                 .attr('dx', d => sizeScale(d.cited_by_count || 0) + 4)
                 .attr('dy', 3)
@@ -7583,7 +7626,7 @@ const AnalysePage = {
                 .join('text')
                 .text(d => d.cited_by_count >= 1000 ? (d.cited_by_count / 1000).toFixed(1) + 'k' : d.cited_by_count)
                 .attr('font-size', '8px')
-                .attr('fill', '#7a2808')
+                .attr('fill', lbToken('--lb-accent-ink', '#7a2808'))
                 .attr('font-weight', '600')
                 .attr('text-anchor', 'middle')
                 .attr('dy', -2)
@@ -7644,8 +7687,17 @@ const AnalysePage = {
             this._applyVisibilityFilters();
         },
         graphNodeColor(type) {
-            const m = { own: '#1a1a1a', missing: '#c2410c', own_ref: '#fce9da', external: '#6b6760', depth2: '#8e8a82', depth3: '#a8a49c', depth4: '#d8d1be', depth5: '#e7e2d6' };
-            return m[type] || '#cbd5e1';
+            const m = {
+                own: lbToken('--lb-ink', '#1a1a1a'),
+                missing: lbToken('--lb-accent', '#c2410c'),
+                own_ref: lbToken('--lb-accent-soft', '#fce9da'),
+                external: lbToken('--lb-ink-3', '#6b6760'),
+                depth2: lbToken('--lb-mute', '#8e8a82'),
+                depth3: lbToken('--lb-mute-2', '#a8a49c'),
+                depth4: lbToken('--lb-hairline-2', '#d8d1be'),
+                depth5: lbToken('--lb-hairline', '#e7e2d6'),
+            };
+            return m[type] || lbToken('--lb-mute-2', '#a8a49c');
         },
         navigateToNode(n) {
             this.graphSearchOpen = false;
@@ -7678,12 +7730,12 @@ const AnalysePage = {
             if (!nodeId) {
                 // Reset all to defaults
                 node.attr('opacity', 1)
-                    .attr('fill', d => colorMap[d.type] || '#cbd5e1')
-                    .attr('stroke', d => d.type === 'own' ? '#7a2808' : (bridgeNodes.has(d.id) ? '#c2410c' : '#fafaf7'))
+                    .attr('fill', d => colorMap[d.type] || lbToken('--lb-mute-2', '#a8a49c'))
+                    .attr('stroke', d => netNodeStroke(d, bridgeNodes, false))
                     .attr('stroke-width', d => d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1));
                 link.attr('stroke-opacity', (d, i) => bridgeEdgeSet.has(i) ? 0.7 : pdfRefEdgeSet.has(i) ? 0.5 : 0.3)
                     .attr('stroke-width', (d, i) => bridgeEdgeSet.has(i) ? 2.5 : pdfRefEdgeSet.has(i) ? 1.5 : 1)
-                    .attr('stroke', (d, i) => bridgeEdgeSet.has(i) ? '#c2410c' : pdfRefEdgeSet.has(i) ? '#a8a49c' : '#e7e2d6');
+                    .attr('stroke', (d, i) => netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, false));
                 label.attr('opacity', 1);
                 citLabel.attr('opacity', 1);
                 return;
@@ -7691,7 +7743,7 @@ const AnalysePage = {
             const neighbors = adj.get(nodeId) || new Set();
             // Dim all, highlight selected + neighbors
             node.attr('opacity', d => d.id === nodeId || neighbors.has(d.id) ? 1 : 0.12)
-                .attr('stroke', d => d.id === nodeId ? '#1a1a1a' : (d.type === 'own' ? '#7a2808' : (bridgeNodes.has(d.id) ? '#c2410c' : '#fafaf7')))
+                .attr('stroke', d => netNodeStroke(d, bridgeNodes, d.id === nodeId))
                 .attr('stroke-width', d => d.id === nodeId ? 4 : (d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1)));
             link.attr('stroke-opacity', (d) => {
                 const s = typeof d.source === 'object' ? d.source.id : d.source;
@@ -7704,8 +7756,7 @@ const AnalysePage = {
             }).attr('stroke', (d, i) => {
                 const s = typeof d.source === 'object' ? d.source.id : d.source;
                 const t = typeof d.target === 'object' ? d.target.id : d.target;
-                if (s === nodeId || t === nodeId) return '#1a1a1a';
-                return bridgeEdgeSet.has(i) ? '#c2410c' : pdfRefEdgeSet.has(i) ? '#a8a49c' : '#e7e2d6';
+                return netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, s === nodeId || t === nodeId);
             });
             label.attr('opacity', d => d.id === nodeId || neighbors.has(d.id) ? 1 : 0.1);
             citLabel.attr('opacity', d => d.id === nodeId || neighbors.has(d.id) ? 1 : 0.1);
@@ -7717,12 +7768,12 @@ const AnalysePage = {
             if (!catId) {
                 // Reset - show everything
                 node.attr('opacity', 1)
-                    .attr('fill', d => colorMap[d.type] || '#cbd5e1')
-                    .attr('stroke', d => d.type === 'own' ? '#7a2808' : (bridgeNodes.has(d.id) ? '#c2410c' : '#fafaf7'))
+                    .attr('fill', d => colorMap[d.type] || lbToken('--lb-mute-2', '#a8a49c'))
+                    .attr('stroke', d => netNodeStroke(d, bridgeNodes, false))
                     .attr('stroke-width', d => d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1));
                 link.attr('stroke-opacity', (d, i) => bridgeEdgeSet.has(i) ? 0.7 : pdfRefEdgeSet.has(i) ? 0.5 : 0.3)
                     .attr('stroke-width', (d, i) => bridgeEdgeSet.has(i) ? 2.5 : pdfRefEdgeSet.has(i) ? 1.5 : 1)
-                    .attr('stroke', (d, i) => bridgeEdgeSet.has(i) ? '#c2410c' : pdfRefEdgeSet.has(i) ? '#a8a49c' : '#e7e2d6');
+                    .attr('stroke', (d, i) => netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, false));
                 label.attr('opacity', 1);
                 citLabel.attr('opacity', 1);
                 return;
@@ -7743,8 +7794,8 @@ const AnalysePage = {
             });
             // Dim non-relevant nodes
             node.attr('opacity', d => relevantIds.has(d.id) ? 1 : 0.08)
-                .attr('fill', d => colorMap[d.type] || '#cbd5e1')
-                .attr('stroke', d => matchIds.has(d.id) ? '#1a1a1a' : (d.type === 'own' ? '#7a2808' : (bridgeNodes.has(d.id) ? '#c2410c' : '#fafaf7')))
+                .attr('fill', d => colorMap[d.type] || lbToken('--lb-mute-2', '#a8a49c'))
+                .attr('stroke', d => netNodeStroke(d, bridgeNodes, matchIds.has(d.id)))
                 .attr('stroke-width', d => matchIds.has(d.id) ? 4 : (d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1)));
             link.attr('stroke-opacity', d => {
                 const s = typeof d.source === 'object' ? d.source.id : d.source;
@@ -7757,8 +7808,7 @@ const AnalysePage = {
             }).attr('stroke', (d, i) => {
                 const s = typeof d.source === 'object' ? d.source.id : d.source;
                 const t = typeof d.target === 'object' ? d.target.id : d.target;
-                if (matchIds.has(s) || matchIds.has(t)) return '#1a1a1a';
-                return bridgeEdgeSet.has(i) ? '#c2410c' : pdfRefEdgeSet.has(i) ? '#a8a49c' : '#e7e2d6';
+                return netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, matchIds.has(s) || matchIds.has(t));
             });
             label.attr('opacity', d => relevantIds.has(d.id) ? 1 : 0.05);
             citLabel.attr('opacity', d => relevantIds.has(d.id) ? 1 : 0.05);
@@ -8015,13 +8065,13 @@ const AnalysePage = {
             // Update node colors and strokes
             node.attr('fill', d => {
                 if (bridgeNodes.has(d.id)) return colorMap.missing;
-                return colorMap[d.type] || '#cbd5e1';
+                return colorMap[d.type] || lbToken('--lb-mute-2', '#a8a49c');
             })
-            .attr('stroke', d => d.type === 'own' ? '#7a2808' : (bridgeNodes.has(d.id) ? '#c2410c' : '#fafaf7'))
+            .attr('stroke', d => netNodeStroke(d, bridgeNodes, false))
             .attr('stroke-width', d => d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1));
 
             // Update edge colors
-            link.attr('stroke', (d, i) => bridgeEdgeSet.has(i) ? '#c2410c' : pdfRefEdgeSet.has(i) ? '#a8a49c' : '#e7e2d6')
+            link.attr('stroke', (d, i) => netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, false))
                 .attr('stroke-width', (d, i) => bridgeEdgeSet.has(i) ? 2.5 : pdfRefEdgeSet.has(i) ? 1.5 : 1)
                 .attr('stroke-opacity', (d, i) => bridgeEdgeSet.has(i) ? 0.7 : pdfRefEdgeSet.has(i) ? 0.5 : 0.3)
                 .attr('marker-end', (d, i) => pdfRefEdgeSet.has(i) ? 'url(#arrowhead-pdfref)' : (bridgeEdgeSet.has(i) ? 'url(#arrowhead-bridge)' : 'url(#arrowhead)'));

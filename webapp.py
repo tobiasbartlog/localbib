@@ -50,22 +50,9 @@ _SCRIPT_DIR = _BUNDLE_DIR
 load_dotenv(_ENV_PATH)
 
 
-def _normalize_ca_bundle_env() -> None:
-    """REQUESTS_CA_BUNDLE portabel machen: requests liest die Variable roh
-    (ohne ~/%VARS%-Expansion) und bei verify=None gewinnt sie sogar gegen den
-    expliziten Parameter. Daher hier expandieren und entfernen, wenn die Datei
-    auf diesem Rechner nicht existiert -> certifi-Fallback ueberall."""
-    raw = os.environ.get("REQUESTS_CA_BUNDLE")
-    if not raw:
-        return
-    path = os.path.expanduser(os.path.expandvars(raw))
-    if os.path.isfile(path):
-        os.environ["REQUESTS_CA_BUNDLE"] = path
-    else:
-        del os.environ["REQUESTS_CA_BUNDLE"]
+import ca_trust
 
-
-_normalize_ca_bundle_env()
+ca_trust.install()
 
 import requests as http_requests
 
@@ -103,14 +90,11 @@ Config.init_paths(BASE_DIR)
 
 
 def ca_bundle() -> Optional[str]:
-    """CA-Bundle aus REQUESTS_CA_BUNDLE: ~/%VARS% expandiert, aber nur wenn die
-    Datei existiert. Sonst None -> requests faellt auf certifi zurueck. So bleibt
-    dieselbe .env portabel ueber Rechner (Bundle nur dort aktiv, wo es liegt)."""
-    raw = os.getenv("REQUESTS_CA_BUNDLE")
-    if not raw:
-        return None
-    path = os.path.expanduser(os.path.expandvars(raw))
-    return path if os.path.isfile(path) else None
+    """Trust-Store fuer ausgehende Aufrufe — siehe ``ca_trust.ca_bundle``.
+
+    Bleibt als Name erhalten, weil Tests ``webapp.ca_bundle`` patchen; die
+    Logik (certifi + Haus-Bundle zusammenfuehren) liegt in ``ca_trust``."""
+    return ca_trust.ca_bundle()
 
 
 # Env-Settings + LLM-Endpunkte neu laden (die .env von oben ist jetzt aktiv)

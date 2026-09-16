@@ -21,16 +21,21 @@
                     mono:  ['Geist Mono', 'ui-monospace', 'monospace'],
                 },
                 extend: {
+                    // Die Tokens zeigen auf die CSS-Variablen aus style.css statt
+                    // auf feste Hexwerte: Tailwind-Klassen kennen `data-theme`
+                    // nicht, ein hier eingefrorenes #ffffff bleibt im Dark Mode
+                    // weiss. Im Light Mode sind die Variablenwerte exakt die
+                    // alten Hexwerte -- das Licht-Rendering bleibt identisch.
                     colors: {
-                        bg:        { DEFAULT: '#fafaf7', elev: '#ffffff', soft: '#f3eee4' },
-                        ink:       { DEFAULT: '#1a1a1a', 2: '#3a3833', 3: '#6b6760' },
-                        mute:      { DEFAULT: '#8e8a82', 2: '#a8a49c' },
-                        hairline:  { DEFAULT: '#e7e2d6', 2: '#d8d1be' },
-                        accent:    { DEFAULT: '#c2410c', soft: '#fce9da', ink: '#7a2808' },
+                        bg:        { DEFAULT: 'var(--lb-bg)', elev: 'var(--lb-bg-elev)', soft: 'var(--lb-bg-soft)' },
+                        ink:       { DEFAULT: 'var(--lb-ink)', 2: 'var(--lb-ink-2)', 3: 'var(--lb-ink-3)' },
+                        mute:      { DEFAULT: 'var(--lb-mute)', 2: 'var(--lb-mute-2)' },
+                        hairline:  { DEFAULT: 'var(--lb-hairline)', 2: 'var(--lb-hairline-2)' },
+                        accent:    { DEFAULT: 'var(--lb-accent)', soft: 'var(--lb-accent-soft)', ink: 'var(--lb-accent-ink)' },
                     },
                     boxShadow: {
-                        hairline: '0 1px 0 rgba(26,26,26,.04)',
-                        modal:    '0 24px 48px -16px rgba(26,26,26,.22), 0 2px 4px rgba(26,26,26,.06)',
+                        hairline: 'var(--lb-shadow)',
+                        modal:    'var(--lb-shadow-lg)',
                     },
                 }
             }
@@ -57,10 +62,10 @@
          the stylesheet, so a browser holding one version and fetching the other
          renders a broken page (an unresolved var() paints every chart series
          black). One stamp, both files, same commit. -->
-    <link rel="stylesheet" href="/static/style.css?v=20260826a">
+    <link rel="stylesheet" href="/static/style.css?v=20260916a">
 </head>
 <body class="bg-bg text-ink font-sans min-h-screen">
     <div id="app"></div>
-    <script src="/static/app.js?v=20260826a"></script>
+    <script src="/static/app.js?v=20260916a"></script>
 </body>
 </html>

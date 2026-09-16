@@ -30,20 +30,39 @@ on:
 
 permissions:
   contents: write # create the Release and upload the installer asset
+  # The called test workflow declares `contents: read` for itself, so this
+  # broader token does not reach it.
 
 jobs:
-  # The tests run on this same push via test.yml (`on: push` covers tags), so
-  # this workflow stays focused on producing and publishing the artifact.
+  # The full suite — pytest + coverage gate, line budget, import boundaries, SPA
+  # smoke, frozen-build smoke — as a reusable workflow, so `needs:` below can
+  # gate on it. It used to run merely alongside this one on the same tag push,
+  # which meant a red suite did not stop anything: a tag would still produce a
+  # finished installer. That is not theoretical — an export missing a module the
+  # app imports at startup would have shipped as a setup .exe that dies on
+  # launch, while the test job went red beside it, unread.
+  tests:
+    # Same ADR-0015 guard as below: tagging the private repo builds nothing, so
+    # it should not spend runner time on the suite either.
+    if: github.repository == 'tobiasbartlog/localbib'
+    uses: ./.github/workflows/test.yml
+
   installer:
     # ADR-0015 guard — see the header. Do not remove.
     if: github.repository == 'tobiasbartlog/localbib'
+    # No green suite, no artifact. A draft release is reviewed by a human, but
+    # that review is for the paid path and the installed app — not a substitute
+    # for the tests.
+    needs: tests
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned together with test.yml — see the note there. A release built on a
+      # different interpreter than the one the suite ran on is untested.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: pip
 
       - name: Install runtime dependencies + PyInstaller

@@ -1,8 +1,21 @@
 name: Tests
 
 on:
+  # Branches only, deliberately not tags: a version tag reaches this file through
+  # release.yml's `uses:` instead, so the installer job can *depend* on the
+  # result. Left as a bare `push:` the two would merely race, and a red suite
+  # would not stop the release.
   push:
+    branches: ["**"]
   pull_request:
+  # Callable as a reusable workflow — that is how release.yml gates on it.
+  workflow_call:
+
+# Checkout is all these jobs need. Declared explicitly because a reusable
+# workflow inherits the caller's token otherwise, and release.yml holds
+# `contents: write` to publish a release — rights the test suite must not get.
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -10,10 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to the version the release installer is built with (release.yml).
+      # They must not drift: the two differing was how a TLS regression stayed
+      # invisible — the source tree verified certificates with Python 3.14's
+      # defaults while the shipped .exe used 3.11's stricter ones.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: pip
 
       # Anti-regrowth guard (issue #95): every tracked .py stays <= 1200 lines
@@ -68,10 +85,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Same pin as the release build — this job only means anything if it
+      # analyses the interpreter the installer actually ships.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
           cache: pip
 
       # Runtime deps only (no dev tools); PyInstaller added on top.

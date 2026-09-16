@@ -8,6 +8,7 @@ from typing import Iterator
 
 import requests
 
+import ca_trust
 from config import Config
 
 
@@ -153,7 +154,8 @@ def _embed_request(url: str, headers: dict, model: str, chunk: list[str]) -> lis
     gedeckeltem 429/5xx-Backoff und Vollstaendigkeits-Pruefung der Antwort."""
     resp = _send_with_retry(
         lambda: requests.post(
-            url, headers=headers, json={"model": model, "input": chunk}, timeout=60
+            url, headers=headers, json={"model": model, "input": chunk}, timeout=60,
+            verify=ca_trust.ca_bundle(),
         )
     )
     if resp.status_code == 200:
@@ -315,7 +317,8 @@ class LLMClient:
         for _ in range(2):
             resp = _send_with_retry(
                 lambda: requests.post(
-                    self._url, headers=self._headers(), json=payload, timeout=timeout
+                    self._url, headers=self._headers(), json=payload, timeout=timeout,
+                    verify=ca_trust.ca_bundle(),
                 )
             )
             if resp.status_code == 200:
@@ -337,7 +340,8 @@ class LLMClient:
     def stream(self, messages: list[dict], timeout: int = 120) -> Iterator[str]:
         payload = {"model": self._model, "messages": messages, "stream": True}
         resp = requests.post(
-            self._url, headers=self._headers(), json=payload, timeout=timeout, stream=True
+            self._url, headers=self._headers(), json=payload, timeout=timeout, stream=True,
+            verify=ca_trust.ca_bundle(),
         )
         if resp.status_code != 200:
             raise LLMClientError(f"HTTP {resp.status_code}")

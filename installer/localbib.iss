@@ -89,6 +89,24 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+[InstallDelete]
+; Wipe the old bundle before writing the new one. `ignoreversion` below only
+; overwrites files the new build also has — a file the new build dropped just
+; stays. That is how one install ended up carrying two interpreters at once:
+; python311.dll from an older build next to python314.dll from a newer one,
+; with the bootloader picking 3.11. The version that answers an HTTPS request
+; then decided whether certificate checking used the same defaults as the
+; source tree (VERIFY_X509_PARTIAL_CHAIN is only on from 3.13), and the app
+; failed against TLS endpoints the source ran against fine. An upgrade must
+; leave exactly the files the new build produced, so remove the whole bundle
+; directory first — everything in it is reinstalled from dist\LocalBib on the
+; next lines, and the user's library lives outside {app}.
+Type: filesandordirs; Name: "{app}\_internal"
+; Older onedir layouts put the interpreter next to the .exe rather than under
+; _internal\ — clear those out too, or they linger forever.
+Type: files; Name: "{app}\*.dll"
+Type: files; Name: "{app}\*.pyd"
+
 [Files]
 ; The whole onedir bundle. `recursesubdirs` matters: PyInstaller puts the
 ; interpreter, the bundled static/ and templates/ trees and the VERSION file

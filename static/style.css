@@ -20,6 +20,9 @@
   --lb-accent:    #c2410c;
   --lb-accent-soft:#fce9da;
   --lb-accent-ink:#7a2808;
+  /* Fehlerrot. Als Token, weil die Ansage im Dark Mode sonst im Karton
+     versinkt: #dc2626 auf #1f1e1a schafft keine 4.5:1. */
+  --lb-danger:    #dc2626;
   --lb-shadow:    0 1px 0 rgba(26,26,26,.04);
   --lb-shadow-lg: 0 24px 48px -16px rgba(26,26,26,.22), 0 2px 4px rgba(26,26,26,.06);
 
@@ -81,6 +84,7 @@
   --lb-accent:    #e07a45;
   --lb-accent-soft:#3a1d0e;
   --lb-accent-ink:#ffb084;
+  --lb-danger:    #f28b82;
   color-scheme: dark;
 
   /* Chart series on the dark card (validated against --lb-bg-elev #1f1e1a,
@@ -1455,3 +1459,127 @@ select.lb-tbtn { padding: 0 4px; }
 .lb-notes-editor .cm-variable-2 { color: var(--lb-accent); }   /* Listenmarker */
 .lb-notes-editor .cm-comment { color: var(--lb-mute); }
 
+
+/* ─────────────────────────────────────────────────────────── */
+/*        Tailwind-Standardpalette -> Tokens (nur Dark)        */
+/* ─────────────────────────────────────────────────────────── */
+/* Grosse Teile der SPA (Einstellungen, Dialoge, Import, Lizenz)
+   sind gegen Tailwinds *statische* Palette geschrieben — `bg-white`,
+   `text-gray-500`, `border-gray-200`. Diese Klassen kennen `data-theme`
+   nicht: sie bleiben im Dark Mode hell und erzeugen die weissen Fenster.
+   Die LocalBib-eigenen Tokens (bg/ink/mute/hairline/accent) zeigen seit
+   dem Theme-Fix in `index.html` auf die `--lb-*`-Variablen; was bleibt,
+   ist Tailwinds mitgelieferte Grau-/Signalpalette, die hier — und nur
+   unter `[data-theme="dark"]` — auf dieselben Tokens umgebogen wird.
+   Light Mode bleibt damit byte-genau wie vorher.
+
+   Spezifitaet ist Absicht, kein Zufall: das CDN haengt sein <style>
+   nach unserem <link> in den <head>, bei gleicher Spezifitaet gewinnt
+   also Tailwind. `:root[data-theme="dark"]` davor genuegt, `!important`
+   braucht es nicht.
+
+   Neues Markup verwendet bitte die Token-Utilities (`bg-bg-elev`,
+   `text-ink-3`, `border-hairline`) statt der Grauwerte — dann ist hier
+   nichts nachzutragen. */
+
+/* ── Flaechen ─────────────────────────────────────────────── */
+:root[data-theme="dark"] .bg-white,
+:root[data-theme="dark"] .focus\:bg-white:focus { background-color: var(--lb-bg-elev); }
+:root[data-theme="dark"] .bg-gray-50,
+:root[data-theme="dark"] .hover\:bg-gray-50:hover,
+:root[data-theme="dark"] .disabled\:bg-gray-50:disabled { background-color: var(--lb-bg-soft); }
+:root[data-theme="dark"] .bg-gray-100,
+:root[data-theme="dark"] .hover\:bg-gray-100:hover { background-color: var(--lb-hairline); }
+:root[data-theme="dark"] .bg-gray-200,
+:root[data-theme="dark"] .hover\:bg-gray-200:hover { background-color: var(--lb-hairline-2); }
+:root[data-theme="dark"] .bg-gray-300 { background-color: #4a463c; }
+:root[data-theme="dark"] .bg-gray-400 { background-color: var(--lb-mute); }
+
+/* ── Text ─────────────────────────────────────────────────── */
+:root[data-theme="dark"] .text-gray-900,
+:root[data-theme="dark"] .text-gray-800,
+:root[data-theme="dark"] .group:hover .group-hover\:text-gray-900,
+:root[data-theme="dark"] .hover\:text-gray-800:hover { color: var(--lb-ink); }
+:root[data-theme="dark"] .text-gray-700,
+:root[data-theme="dark"] .text-gray-600,
+:root[data-theme="dark"] .hover\:text-gray-700:hover,
+:root[data-theme="dark"] .hover\:text-gray-600:hover { color: var(--lb-ink-2); }
+:root[data-theme="dark"] .text-gray-500,
+:root[data-theme="dark"] .text-slate-600 { color: var(--lb-ink-3); }
+:root[data-theme="dark"] .text-gray-400,
+:root[data-theme="dark"] .disabled\:text-gray-400:disabled { color: var(--lb-mute); }
+:root[data-theme="dark"] .text-gray-300 { color: var(--lb-mute-2); }
+
+/* ── Linien ───────────────────────────────────────────────── */
+:root[data-theme="dark"] .border-gray-100,
+:root[data-theme="dark"] .border-gray-200,
+:root[data-theme="dark"] .divide-gray-100 > :not([hidden]) ~ :not([hidden]) { border-color: var(--lb-hairline); }
+:root[data-theme="dark"] .border-gray-300,
+:root[data-theme="dark"] .hover\:border-gray-300:hover { border-color: var(--lb-hairline-2); }
+:root[data-theme="dark"] .border-gray-400,
+:root[data-theme="dark"] .hover\:border-gray-400:hover { border-color: var(--lb-mute-2); }
+
+/* ── Signalfarben ─────────────────────────────────────────────
+   Die 50/100er-Toene sind auf Weiss gerechnete Pastelltints; auf dem
+   dunklen Karton leuchten sie wie ein Scheinwerfer. Ersetzt werden sie
+   durch gleich *leise* dunkle Tints derselben Hues, die Schriftfarben
+   entsprechend aufgehellt (die 600er–900er verschwinden sonst). */
+:root[data-theme="dark"] .bg-red-50,
+:root[data-theme="dark"] .hover\:bg-red-50:hover { background-color: #2e1a18; }
+:root[data-theme="dark"] .bg-red-100 { background-color: #3a1f1c; }
+:root[data-theme="dark"] .border-red-100 { border-color: #40241f; }
+:root[data-theme="dark"] .border-red-300 { border-color: #5c3029; }
+:root[data-theme="dark"] .text-red-500,
+:root[data-theme="dark"] .text-red-600,
+:root[data-theme="dark"] .hover\:text-red-600:hover { color: #f28b82; }
+:root[data-theme="dark"] .text-red-700,
+:root[data-theme="dark"] .text-red-800,
+:root[data-theme="dark"] .hover\:text-red-700:hover { color: #f4a49c; }
+
+:root[data-theme="dark"] .bg-amber-50 { background-color: #2d2313; }
+:root[data-theme="dark"] .bg-amber-100 { background-color: #3a2c17; }
+:root[data-theme="dark"] .border-amber-200 { border-color: #4a3a1c; }
+:root[data-theme="dark"] .text-amber-600,
+:root[data-theme="dark"] .text-amber-700 { color: #f2b23c; }
+:root[data-theme="dark"] .text-amber-800,
+:root[data-theme="dark"] .text-amber-900,
+:root[data-theme="dark"] .hover\:text-amber-900:hover { color: #f5c976; }
+
+:root[data-theme="dark"] .bg-emerald-50 { background-color: #10281f; }
+:root[data-theme="dark"] .bg-emerald-100 { background-color: #14332a; }
+:root[data-theme="dark"] .text-emerald-600,
+:root[data-theme="dark"] .text-emerald-700 { color: #2ecc71; }
+:root[data-theme="dark"] .text-emerald-800 { color: #6fdd9b; }
+
+:root[data-theme="dark"] .bg-blue-100 { background-color: #16263a; }
+:root[data-theme="dark"] .text-blue-700,
+:root[data-theme="dark"] .text-blue-800 { color: #7fb0f5; }
+
+:root[data-theme="dark"] .bg-sky-50 { background-color: #12242f; }
+:root[data-theme="dark"] .bg-sky-100 { background-color: #172d3a; }
+:root[data-theme="dark"] .text-sky-700,
+:root[data-theme="dark"] .text-sky-800 { color: #74c0e8; }
+
+:root[data-theme="dark"] .bg-purple-100 { background-color: #291d3a; }
+:root[data-theme="dark"] .text-purple-800 { color: #b79bf0; }
+
+:root[data-theme="dark"] .bg-slate-100 { background-color: #23272e; }
+
+/* ── Akzent-Hover ─────────────────────────────────────────────
+   `hover:bg-accent-ink` ist appweit der Hover eines Akzent-Buttons mit
+   weisser Schrift. Seit das Token statt eines festen #7a2808 gilt, ist
+   Accent-Ink im Dark Mode ein helles Pfirsich (#ffb084) — als Tinte auf
+   dunklem Grund gedacht, als Buttonflaeche wuerde es die weisse Schrift
+   verschlucken. Im Dark Mode hebt der Hover darum den Akzent an, statt
+   ihn zu vertiefen (dieselbe Entscheidung wie in der Plugin-Bruecke). */
+:root[data-theme="dark"] .hover\:bg-accent-ink:hover {
+  background-color: color-mix(in srgb, var(--lb-accent) 82%, #ffffff);
+}
+
+/* ── Schalter-Knopf ───────────────────────────────────────────
+   Der Knopf eines Toggles ist kein Karton, sondern ein helles Plaettchen
+   auf farbiger Schiene — `bg-white` meint hier etwas anderes als bei
+   einer Karte. Auf die Kartonfarbe umgebogen waere er im Dark Mode ein
+   dunkler Knopf auf dunkler Schiene, der Schalter saehe leer aus. Er
+   bekommt darum die Tinte als Flaeche, spiegelbildlich zum Light Mode. */
+:root[data-theme="dark"] .lb-knob { background-color: var(--lb-ink); }

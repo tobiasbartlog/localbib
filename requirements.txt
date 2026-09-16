@@ -6,6 +6,7 @@ PyMuPDF>=1.24.0       # PDF-Verarbeitung + OCR (mit Tesseract)
 watchdog>=4.0.0        # Ordner-Überwachung
 requests>=2.31.0       # HTTP (CrossRef API, LLM-Provider)
 httpx>=0.27.0          # HTTP (OpenAlex API)
+certifi>=2024.2.2      # Wurzelzertifikate; ca_trust führt sie mit einem Haus-Bundle zusammen
 rapidfuzz>=3.6.0       # Fuzzy String Matching (Referenz-Duplikaterkennung)
 bibtexparser>=1.4,<2   # BibTeX-Import (.bib parsen; v2 ist ein inkompatibler Rewrite)
 

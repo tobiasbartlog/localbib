@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+import ca_trust
 import services.model_recommender as _recommender
 from context import registry, PLUGIN_MODULES, plugin_enabled
 from literature_manager import Config
@@ -93,29 +94,10 @@ def set_reconcile_hook(fn: Callable[[], None]) -> None:
 # Helpers (copied verbatim from webapp.py; pure functions, no shared state)
 # ---------------------------------------------------------------------------
 
-def _normalize_ca_bundle_env() -> None:
-    """REQUESTS_CA_BUNDLE portabel machen: requests liest die Variable roh
-    (ohne ~/%VARS%-Expansion) und bei verify=None gewinnt sie sogar gegen den
-    expliziten Parameter. Daher hier expandieren und entfernen, wenn die Datei
-    auf diesem Rechner nicht existiert -> certifi-Fallback ueberall."""
-    raw = os.environ.get("REQUESTS_CA_BUNDLE")
-    if not raw:
-        return
-    path = os.path.expanduser(os.path.expandvars(raw))
-    if os.path.isfile(path):
-        os.environ["REQUESTS_CA_BUNDLE"] = path
-    else:
-        del os.environ["REQUESTS_CA_BUNDLE"]
-
-
-def _ca_bundle() -> Optional[str]:
-    """CA-Bundle aus REQUESTS_CA_BUNDLE: ~/%VARS% expandiert, aber nur wenn die
-    Datei existiert. Sonst None -> requests faellt auf certifi zurueck."""
-    raw = os.getenv("REQUESTS_CA_BUNDLE")
-    if not raw:
-        return None
-    path = os.path.expanduser(os.path.expandvars(raw))
-    return path if os.path.isfile(path) else None
+# Trust-Store: certifi + optionales Haus-Bundle. Die Logik liegt in ca_trust,
+# damit Start (webapp) und .env-Reload (PUT /api/settings) dieselbe benutzen.
+_normalize_ca_bundle_env = ca_trust.install
+_ca_bundle = ca_trust.ca_bundle
 
 
 # ---------------------------------------------------------------------------
@@ -186,14 +168,52 @@ async def get_llm_providers():
     return {"providers": providers, "current": Config.LLM_PROVIDER}
 
 
+# Warum die Modell-Liste zuletzt leer blieb. Ohne das degradiert jeder Fehler
+# zu einem leeren Dropdown, dessen Ursache nur im Log steht — und das Log sieht
+# im gebauten .exe niemand.
+_last_models_error: Optional[str] = None
+
+
+def _describe_fetch_error(exc: Exception) -> str:
+    """Fehlermeldung, die dem Nutzer sagt, was zu tun ist.
+
+    Zertifikatsfehler bekommen einen eigenen Text: sie entstehen praktisch
+    immer am konfigurierten Haus-Bundle, und ohne diesen Hinweis ist die
+    Ursache von der Oberflaeche aus nicht zu erraten.
+    """
+    text = str(exc)
+    if "CERTIFICATE_VERIFY_FAILED" in text or isinstance(exc, http_requests.exceptions.SSLError):
+        extra = ca_trust.configured_extra_ca()
+        if extra:
+            return (
+                "Zertifikatspruefung fehlgeschlagen. Geprueft wird gegen certifi "
+                f"plus das konfigurierte CA-Bundle ({extra}). Stimmt dieses Bundle "
+                "noch? Zum Testen REQUESTS_CA_BUNDLE in der .env entfernen."
+            )
+        return (
+            "Zertifikatspruefung fehlgeschlagen. Laeuft der Zugriff ueber einen "
+            "Firmen-Proxy, gehoert dessen Wurzelzertifikat als REQUESTS_CA_BUNDLE "
+            "in die .env."
+        )
+    if isinstance(exc, http_requests.exceptions.Timeout):
+        return "Zeitueberschreitung beim Abruf der Modell-Liste."
+    if isinstance(exc, http_requests.exceptions.ConnectionError):
+        return "Keine Verbindung zum Anbieter. Netzwerk und Endpunkt-URL pruefen."
+    return f"Abruf der Modell-Liste fehlgeschlagen: {text[:200]}"
+
+
 def _ensure_available_models() -> list:
     """Return the active provider's model list, fetching live if the cache is empty."""
+    global _last_models_error
     if Config.AVAILABLE_MODELS:
         return Config.AVAILABLE_MODELS
     api_key = Config.LLM_API_KEY
     models_url = Config.LLM_MODELS_URL
     if not api_key or not models_url:
         logging.warning("/api/llm/models: kein API-Key oder Endpunkt fuer Provider '%s'", Config.LLM_PROVIDER)
+        _last_models_error = (
+            f"Kein API-Key oder Endpunkt fuer Provider '{Config.LLM_PROVIDER}' hinterlegt."
+        )
         return []
     ca = _ca_bundle()
     try:
@@ -206,10 +226,16 @@ def _ensure_available_models() -> list:
         logging.info("/api/llm/models fetch: HTTP %s from %s", resp.status_code, models_url)
         if resp.status_code == 200:
             Config.AVAILABLE_MODELS = [m["id"] for m in resp.json().get("data", [])]
+            _last_models_error = None
         else:
             logging.warning("/api/llm/models fetch fehlgeschlagen: %s", resp.text[:200])
+            _last_models_error = (
+                f"Anbieter antwortete mit HTTP {resp.status_code}. "
+                "API-Key und Endpunkt-URL pruefen."
+            )
     except Exception as exc:
         logging.warning("/api/llm/models fetch error: %s", exc)
+        _last_models_error = _describe_fetch_error(exc)
     return Config.AVAILABLE_MODELS
 
 
@@ -217,7 +243,13 @@ def _ensure_available_models() -> list:
 async def get_llm_models():
     """Return available models from the active LLM provider. Fetches live if cache empty."""
     models = _ensure_available_models()
-    return {"models": models, "current": Config.LLM_MODEL, "current_fast": Config.LLM_MODEL_FAST}
+    return {
+        "models": models,
+        "current": Config.LLM_MODEL,
+        "current_fast": Config.LLM_MODEL_FAST,
+        # Nur gesetzt, wenn die Liste leer *und* der Grund bekannt ist.
+        "error": None if models else _last_models_error,
+    }
 
 
 def _embed_models_url(embed_url: str) -> str:
