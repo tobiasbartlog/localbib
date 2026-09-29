@@ -46,19 +46,8 @@ def safe_pdf_path(filename: str) -> str:
     return filepath
 
 
-# Plugin-Registry (Phase 0b). Single source of truth for the whole app; the
+# Plugin-Registry (Phase 0b). Single source of truth for the whole app: it holds
+# what the loaded Add-on Bundles registered (``plugin_loader`` activates them); the
 # concrete host-service adapters ("llm"/"library") live in webapp.py and are
 # injected via ``registry.register_services(...)`` after they are constructed.
 registry = PluginRegistry()
-
-# Plugin table: module name -> the env var that toggles it (Decision #17).
-# The host (webapp startup/shutdown + PUT /api/settings) iterates this instead
-# of hard-wiring each plugin. Lives here — the neutral resource module — so
-# ``routers/settings.py`` can read it without importing ``webapp`` (circular).
-PLUGIN_MODULES: dict[str, str] = {
-}
-
-
-def plugin_enabled(env_var: str) -> bool:
-    """True iff the given toggle env var is set to 'true' (case-insensitive)."""
-    return os.getenv(env_var, "false").strip().lower() == "true"

@@ -385,7 +385,7 @@ def test_one_click_is_refused_on_a_source_install(monkeypatch, fake_installer) -
     resp, calls = _install(monkeypatch, frozen=False, download=lambda url: fake_installer)
 
     assert resp.status_code == 400
-    assert "git pull" in resp.json()["detail"]
+    assert resp.json()["detail"] == "error.update_only_when_installed"
     assert calls["launched"] == []
     assert calls["exited"] == 0
 
@@ -394,11 +394,11 @@ def test_release_without_installer_refuses_and_names_the_manual_way(monkeypatch)
     resp, calls = _install(monkeypatch, release=_release(assets=[]))
 
     assert resp.status_code == 400
-    assert "Release-Seite" in resp.json()["detail"]
+    assert resp.json()["detail"] == "error.release_without_installer"
     assert calls["exited"] == 0
 
 
-def test_download_error_surfaces_in_german_and_keeps_the_app_alive(monkeypatch) -> None:
+def test_download_error_surfaces_as_a_code_and_keeps_the_app_alive(monkeypatch) -> None:
     """A failed download degrades to the manual link, not to a dead app."""
 
     def _boom(url):
@@ -408,8 +408,8 @@ def test_download_error_surfaces_in_german_and_keeps_the_app_alive(monkeypatch) 
 
     assert resp.status_code == 502
     detail = resp.json()["detail"]
-    assert "Installer konnte nicht geladen werden" in detail
-    assert "Release-Seite" in detail
+    assert detail["code"] == "error.installer_download_failed"
+    assert detail["params"] == {"message": "Verbindung abgebrochen"}
     assert calls["launched"] == []
     assert calls["exited"] == 0
 
@@ -422,7 +422,7 @@ def test_a_corrupt_download_is_never_executed(monkeypatch, tmp_path) -> None:
     resp, calls = _install(monkeypatch, download=lambda url: junk)
 
     assert resp.status_code == 502
-    assert "Release-Seite" in resp.json()["detail"]
+    assert resp.json()["detail"] == "error.installer_corrupt"
     assert calls["launched"] == []
     assert calls["exited"] == 0
 

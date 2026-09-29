@@ -4,8 +4,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { bootSettings, typeInto, flush } from './helpers.js';
 
 const LIMIT_ERROR =
-    'Dieser Lizenzschlüssel ist bereits auf zwei Geräten aktiviert. ' +
-    'Gib in deinem Polar-Konto ein Gerät frei und versuche es erneut.';
+    'license.err.limit';
 
 describe('Lizenz-Aktivierung (Fehlerfall)', () => {
     it('zeigt die deutsche Fehlermeldung des Servers', async () => {
@@ -31,7 +30,7 @@ describe('Lizenz-Aktivierung (Fehlerfall)', () => {
             if (!el) throw new Error('Fehlermeldung nicht gerendert');
             return el;
         });
-        expect(message.textContent).toContain('zwei Geräten');
+        expect(message.textContent).toContain('two devices');
         expect(document.querySelector('[data-testid="license-activated"]')).toBeNull();
         expect(document.querySelector('[data-testid="license-key-input"]')).not.toBeNull();
     });

@@ -21,7 +21,7 @@ import importlib
 import logging
 from typing import Any, Optional
 
-from plugin_api import NavItem
+from plugin_api import API_VERSION, NavItem
 
 logger = logging.getLogger(__name__)
 
@@ -59,13 +59,17 @@ class _PluginApi:
     ``webapp.py``. Missing services surface as ``None`` and plugins degrade.
     """
 
-    api_version = 1
+    api_version = API_VERSION
 
     def __init__(self, registrations: _Registrations, services: dict[str, Any]) -> None:
         self.ui = registrations
         self.routes = registrations
         self.llm = services.get("llm")
         self.library = services.get("library")
+        # Contract-2 members; the core wires them with the Bundle loader (#186).
+        self.files = services.get("files")
+        self.storage = services.get("storage")
+        self.settings = services.get("settings")
 
 
 class PluginRegistry:
@@ -87,7 +91,13 @@ class PluginRegistry:
         self._services.update(services)
 
     # --- lifecycle ----------------------------------------------------------
-    async def activate(self, module_name: str) -> None:
+    async def activate(self, module_name: str, services: Optional[dict[str, Any]] = None) -> None:
+        """Import ``module_name`` and call its plugin's ``activate()``.
+
+        ``services`` replaces the host services for this one plugin — the Bundle
+        loader passes only what the Manifest's Berechtigungen unlock, plus the
+        plugin's own ``SettingsApi``. ``None`` hands over every host service
+        (a bare registry, as in its own tests)."""
         if module_name in self._plugins:
             return
         module = importlib.import_module(module_name)
@@ -97,7 +107,13 @@ class PluginRegistry:
                 f"Plugin-Modul '{module_name}' hat kein 'plugin'-Attribut."
             )
         registrations = _Registrations()
-        await plugin.activate(_PluginApi(registrations, self._services))
+        try:
+            await plugin.activate(
+                _PluginApi(registrations, self._services if services is None else services)
+            )
+        except BaseException:
+            registrations.clear()
+            raise
         self._plugins[module_name] = (plugin, registrations)
         logger.info("Plugin '%s' aktiviert.", module_name)
 
@@ -114,13 +130,6 @@ class PluginRegistry:
             registrations.clear()
         logger.info("Plugin '%s' deaktiviert.", module_name)
 
-    async def sync(self, module_name: str, enabled: bool) -> None:
-        """Bring the plugin's state in line with the toggle (idempotent)."""
-        if enabled:
-            await self.activate(module_name)
-        else:
-            await self.deactivate(module_name)
-
     # --- queries ------------------------------------------------------------
     def nav_items(self) -> list[NavItem]:
         items: list[NavItem] = []
@@ -136,3 +145,12 @@ class PluginRegistry:
 
     def is_active(self, module_name: str) -> bool:
         return module_name in self._plugins
+
+    def routers_of(self, module_name: str) -> list[Any]:
+        """The routers one active plugin registered (empty when inactive)."""
+        entry = self._plugins.get(module_name)
+        return list(entry[1].routers) if entry else []
+
+    def host_services(self) -> dict[str, Any]:
+        """The injected host services, for a caller that gates them per plugin."""
+        return dict(self._services)

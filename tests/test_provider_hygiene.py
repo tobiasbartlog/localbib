@@ -13,16 +13,18 @@ import httpx
 import pytest
 import respx
 
+import llm_config
 from literature_manager import Config
 from openalex_client import OpenAlexClient
 
 
 @pytest.fixture
-def clean_env(monkeypatch):
+def clean_env(monkeypatch, tmp_path):
     """Config as a fresh install sees it: no .env, no env vars set."""
-    for key in ("CROSSREF_MAILTO", "LLM_PROVIDER", "LLM_MODEL", "LLM_API_KEY",
-                "KICONNECT_API_KEY", "LLM_BASE_URL", "OPENALEX_API_KEY"):
+    for key in ("CROSSREF_MAILTO", "OPENALEX_API_KEY", "LLM_CONFIG_PATH") + llm_config.LEGACY_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    # No llm.json either (a fresh install has none) — never the developer's.
+    monkeypatch.setenv("LLM_CONFIG_PATH", str(tmp_path / "llm.json"))
     Config.reload_from_env()
     yield Config
     # Restore the suite-wide env (conftest sets these before importing webapp).
@@ -42,10 +44,11 @@ def test_no_kiconnect_default_provider(clean_env):
     shipping it as the default (provider, endpoint and the ``gpt-5.5`` model
     id) would hand every other customer a broken configuration.
     """
-    assert clean_env.LLM_PROVIDER == ""
-    assert clean_env.LLM_MODEL == ""
-    assert clean_env.LLM_CHAT_URL == ""
-    assert "kiconnect" not in clean_env.KICONNECT_API_URL
+    assert clean_env.llm_status() == {
+        "reasoning": False, "fast": False, "embedding": False, "connections": 0,
+    }
+    assert clean_env.reasoning_model() == ""
+    assert clean_env.llm_endpoint("reasoning") is None
 
 
 class TestPoliteMailto:

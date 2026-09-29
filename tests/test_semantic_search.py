@@ -15,6 +15,7 @@ import pytest
 import services.semantic_search as semantic_search
 from embedding_index import pack_vector
 from literature_manager import Config
+from tests.llm_helpers import configure_llm, llm_off
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +133,7 @@ def _seed_chunk_embedding(db, chunk_id, model, vector):
 
 class TestSemanticSearchEndpoint:
     def test_semantic_mode_with_mocked_embed(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         second = _seed_second_paper(db)
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         _seed_embedding(db, second, "test-embed-model", [0.0, 1.0])
@@ -154,7 +155,7 @@ class TestSemanticSearchEndpoint:
         assert mock_embed.call_args.kwargs.get("mode") == "query"
 
     def test_post_variant_matches_get(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         with patch("routers.search.embed_texts", return_value=[[1.0, 0.0]]):
             resp = client.post("/api/search/semantic", json={"q": "test query", "top_k": 5})
@@ -162,7 +163,7 @@ class TestSemanticSearchEndpoint:
         assert resp.json()["mode"] == "semantic"
 
     def test_no_embed_model_configured_falls_back_to_bm25(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         with patch("routers.search.embed_texts") as mock_embed:
             resp = client.get("/api/search/semantic", params={"q": "Test Paper Title"})
         assert resp.status_code == 200
@@ -171,7 +172,7 @@ class TestSemanticSearchEndpoint:
         mock_embed.assert_not_called()
 
     def test_bm25_fallback_finds_lexical_match(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         resp = client.get("/api/search/semantic", params={"q": "Test Paper Title"})
         body = resp.json()
         assert body["mode"] == "bm25"
@@ -181,7 +182,7 @@ class TestSemanticSearchEndpoint:
         """Index was built with model 'qwen3', config now points elsewhere --
         must never silently compare across embedding spaces (PRD Entscheidung 7)."""
         _seed_embedding(db, seed_paper, "qwen3", [1.0, 0.0])
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "some-other-model")
+        configure_llm(monkeypatch, embedding="some-other-model")
 
         with patch("routers.search.embed_texts") as mock_embed:
             resp = client.get("/api/search/semantic", params={"q": "Test Paper Title"})
@@ -193,7 +194,7 @@ class TestSemanticSearchEndpoint:
         mock_embed.assert_not_called()
 
     def test_embed_http_failure_degrades_to_bm25(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         with patch("routers.search.embed_texts", side_effect=RuntimeError("gateway down")):
             resp = client.get("/api/search/semantic", params={"q": "Test Paper Title"})
@@ -203,13 +204,13 @@ class TestSemanticSearchEndpoint:
         assert body.get("note")
 
     def test_empty_query_returns_empty_results_no_error(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         resp = client.get("/api/search/semantic", params={"q": ""})
         assert resp.status_code == 200
         assert resp.json() == {"mode": "bm25", "results": []}
 
     def test_top_k_limits_results(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         second = _seed_second_paper(db)
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         _seed_embedding(db, second, "test-embed-model", [0.9, 0.1])
@@ -226,7 +227,7 @@ class TestSemanticSearchEndpoint:
 
 class TestHybridSearch:
     def test_hybrid_mode_when_bm25_and_cosine_both_contribute(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         second = _seed_second_paper(db)
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         _seed_embedding(db, second, "test-embed-model", [0.0, 1.0])
@@ -247,7 +248,7 @@ class TestHybridSearch:
     def test_papers_without_chunks_still_appear_in_hybrid_results(self, client, db, seed_paper, monkeypatch):
         """Acceptance #100: a paper with no paper_chunks stays visible via its
         cosine contribution alone, even once BM25 contributes for another paper."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         second = _seed_second_paper(db)
         # seed_paper has real chunks matching the query lexically -> BM25 contributes.
         _seed_embedding(db, seed_paper, "test-embed-model", [0.0, 1.0])
@@ -275,7 +276,7 @@ class TestHybridSearch:
         purely through the (mocked) embedding, while a lexically-matching
         distractor paper (no embedding, only chunks) pulls the response into
         `hybrid` mode without out-ranking the semantically relevant target."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         distractor = _seed_second_paper(db, cite_key="distractor2023", title="Distractor Paper")
         # Target: embedding only, no chunks, title has zero lexical overlap
         # with the German query -- unreachable by any BM25 path.
@@ -397,7 +398,7 @@ class TestTwoStageRankingPerformance:
 
 class TestPassageSearchEndpoint:
     def test_semantic_mode_returns_page_start(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         chunk_id = _seed_chunk(db, seed_paper, "unrelated filler text about nothing", page_start=7)
         _seed_chunk_embedding(db, chunk_id, "test-embed-model", [1.0, 0.0])
@@ -418,7 +419,7 @@ class TestPassageSearchEndpoint:
         assert mock_embed.call_args.kwargs.get("mode") == "query"
 
     def test_post_variant_matches_get(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         chunk_id = _seed_chunk(db, seed_paper, "filler text", page_start=1)
         _seed_chunk_embedding(db, chunk_id, "test-embed-model", [1.0, 0.0])
@@ -428,7 +429,7 @@ class TestPassageSearchEndpoint:
         assert resp.json()["mode"] == "semantic"
 
     def test_hybrid_mode_when_bm25_and_cosine_both_contribute(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         chunk_id = _seed_chunk(
             db, seed_paper, "adhesive bonding strength between printed clay layers", page_start=2,
@@ -452,7 +453,7 @@ class TestPassageSearchEndpoint:
         top-N cut."""
         import routers.search as search_router
 
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         monkeypatch.setattr(search_router, "PASSAGE_TOP_N_PAPERS", 1)
 
         second = _seed_second_paper(db)
@@ -476,7 +477,7 @@ class TestPassageSearchEndpoint:
         assert second not in result_paper_ids
 
     def test_no_embed_model_configured_falls_back_to_bm25(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         _seed_chunk(db, seed_paper, "Test Paper Title appears verbatim here")
         with patch("routers.search.embed_texts") as mock_embed:
             resp = client.get("/api/search/passages", params={"q": "Test Paper Title"})
@@ -487,7 +488,7 @@ class TestPassageSearchEndpoint:
         assert any(r["paper_id"] == seed_paper for r in body["results"])
 
     def test_no_chunk_embeddings_falls_back_to_bm25(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         _seed_chunk(db, seed_paper, "some chunk text, never embedded")
         with patch("routers.search.embed_texts") as mock_embed:
@@ -499,7 +500,7 @@ class TestPassageSearchEndpoint:
         mock_embed.assert_not_called()
 
     def test_embed_http_failure_degrades_to_bm25(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         chunk_id = _seed_chunk(db, seed_paper, "some chunk text")
         _seed_chunk_embedding(db, chunk_id, "test-embed-model", [1.0, 0.0])
@@ -511,13 +512,13 @@ class TestPassageSearchEndpoint:
         assert body.get("note")
 
     def test_empty_query_returns_empty_results_no_error(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         resp = client.get("/api/search/passages", params={"q": ""})
         assert resp.status_code == 200
         assert resp.json() == {"mode": "bm25", "results": []}
 
     def test_top_k_limits_results(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_embedding(db, seed_paper, "test-embed-model", [1.0, 0.0])
         c1 = _seed_chunk(db, seed_paper, "chunk one filler", chunk_index=0, page_start=1)
         c2 = _seed_chunk(db, seed_paper, "chunk two filler", chunk_index=1, page_start=2)

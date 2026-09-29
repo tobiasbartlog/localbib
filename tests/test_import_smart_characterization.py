@@ -105,7 +105,7 @@ class TestUploadClassic:
             files={"file": ("notes.txt", b"hello", "text/plain")},
         )
         assert resp.status_code == 400
-        assert "PDF" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.only_pdf_accepted"
 
     def test_rejects_empty_filename(self, client, db):
         # Quirk: an upload with empty filename bypasses the endpoint's own 400
@@ -213,8 +213,9 @@ class TestUploadSmart:
         expected_keys = {
             "paper_id", "filename", "title", "authors", "year",
             "doi", "isbn", "abstract", "abstract_source",
-            "journal", "publisher", "categories",
+            "journal", "publisher", "categories", "llm_failures",
         }
+        assert complete["llm_failures"] == []
         assert expected_keys.issubset(complete.keys()), (
             f"Missing keys: {expected_keys - complete.keys()}"
         )
@@ -277,7 +278,7 @@ class TestUploadSmart:
         events2 = _parse_sse(r2)
         err = _event_by_type(events2, "error")
         assert err is not None, f"Expected SSE error event; events={events2}"
-        assert "Duplikat" in err["message"]
+        assert err["message"] == "import.step.duplicateFile"
         assert "duplicate_paper_id" in err
 
     def test_content_title_dedup_emits_sse_error(self, client, db):
@@ -304,7 +305,7 @@ class TestUploadSmart:
         events = _parse_sse(resp)
         err = _event_by_type(events, "error")
         assert err is not None, f"Expected SSE error for title dup; events={events}"
-        assert "vorhanden" in err["message"]
+        assert err["message"] == "import.step.duplicateItem"
         assert "duplicate_paper_id" in err
 
     def test_crossref_plausible_doi_stored_in_db(self, client, db):
@@ -384,7 +385,10 @@ class TestProcessSmartFromInput:
     def test_404_detail_mentions_filename(self, client, db):
         resp = client.post("/api/import/process-smart/missing_paper.pdf")
         assert resp.status_code == 404
-        assert "missing_paper.pdf" in resp.json()["detail"]
+        assert resp.json()["detail"] == {
+        "code": "error.file_not_in_input_folder",
+        "params": {"name": "missing_paper.pdf"},
+    }
 
     def test_happy_path_processes_file_from_input_dir(self, client, db):
         """A PDF placed in INPUT_DIR is processed and emits a 'complete' event."""
@@ -449,7 +453,7 @@ class TestProcessSmartFromInput:
         events2 = _parse_sse(r2)
         err = _event_by_type(events2, "error")
         assert err is not None, f"Expected SSE error event; events={events2}"
-        assert "Duplikat" in err["message"]
+        assert err["message"] == "import.step.duplicateFile"
         assert "duplicate_paper_id" in err
 
     def test_path_traversal_neutralized_to_404(self, client, db):
@@ -457,3 +461,80 @@ class TestProcessSmartFromInput:
         os.path.basename — the traversed path won't exist in INPUT_DIR → 404."""
         resp = client.post("/api/import/process-smart/../../../etc/passwd")
         assert resp.status_code == 404
+
+
+# ===========================================================================
+# LLM failures are reported, not swallowed
+# ===========================================================================
+
+def _rate_limited_response():
+    from unittest.mock import MagicMock
+    resp = MagicMock()
+    resp.status_code = 429
+    resp.headers = {}
+    resp.text = '{"error":{"code":429,"message":"free model is temporarily rate-limited upstream"}}'
+    return resp
+
+
+class TestSmartImportLlmFailures:
+    """The provider answering 429 on every LLM call (a free-tier model
+    rate-limited upstream) must not leave the user with silently empty
+    categories/abstract: each AI step reports a coded message and the
+    ``complete`` event lists the failures for the result card."""
+
+    _AI_ON = "?do_doi=false&do_categories=true&do_abstract=true&do_validate=true"
+
+    def test_complete_lists_every_failed_ai_step(self, client, db, monkeypatch):
+        monkeypatch.setattr("llm_client.time.sleep", lambda _s: None)
+        with _patch_text("Rate Limited Paper Title\nSome body text long enough to matter."), \
+             _patch_no_doi(), _patch_no_chunks(), _patch_no_symlinks(), \
+             patch("llm_client.requests.post", return_value=_rate_limited_response()) as mock_post:
+            resp = client.post(
+                f"/api/import/upload-smart{self._AI_ON}",
+                files={"file": ("limited.pdf", FAKE_PDF, "application/pdf")},
+            )
+        assert resp.status_code == 200
+        events = _parse_sse(resp)
+        complete = _event_by_type(events, "complete")
+        assert complete is not None, f"No 'complete' event; events={events}"
+
+        failures = complete["llm_failures"]
+        assert [f["step"] for f in failures] == ["validate", "categories", "abstract"]
+        assert {f["kind"] for f in failures} == {"rate_limited"}
+        assert {f["status"] for f in failures} == {429}
+        assert all(f["model"] for f in failures)
+        assert complete["categories"] == []
+        assert complete["abstract"] == ""
+
+        # Every failed step told the progress list WHY, with the same code.
+        coded = [
+            (e["step"], e["message"]["code"])
+            for e in events
+            if e.get("type") == "progress" and isinstance(e.get("message"), dict)
+            and str(e["message"].get("code", "")).startswith("import.step.llmFailed.")
+        ]
+        assert coded == [
+            ("validate", "import.step.llmFailed.rate_limited"),
+            ("categories", "import.step.llmFailed.rate_limited"),
+            ("abstract", "import.step.llmFailed.rate_limited"),
+        ]
+
+        # The abstract step did not fire its second call (generate) into the
+        # same limit: 3 attempts x 3 calls (validate, categorize, find abstract).
+        assert mock_post.call_count == 9
+        assert not any(e.get("message") == "import.step.abstractGenerate" for e in events)
+
+    def test_import_still_persists_the_item(self, client, db, monkeypatch):
+        monkeypatch.setattr("llm_client.time.sleep", lambda _s: None)
+        with _patch_text("Persisted Despite Limit\nbody"), \
+             _patch_no_doi(), _patch_no_chunks(), _patch_no_symlinks(), \
+             patch("llm_client.requests.post", return_value=_rate_limited_response()):
+            resp = client.post(
+                f"/api/import/upload-smart{self._AI_ON}",
+                files={"file": ("persist.pdf", FAKE_PDF, "application/pdf")},
+            )
+        complete = _event_by_type(_parse_sse(resp), "complete")
+        conn = db._connect()
+        row = conn.execute("SELECT title FROM papers WHERE id = ?", (complete["paper_id"],)).fetchone()
+        conn.close()
+        assert row is not None

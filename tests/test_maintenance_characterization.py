@@ -434,7 +434,7 @@ class TestFullRefresh:
 
     Step 2 auto-applies ONLY high-confidence proposals (confidence == 'high').
     Step 3 saves CrossRef abstracts if found; skips LLM if pdf_text is empty.
-    Step 4 runs only if Config.KICONNECT_API_KEY is set (= 'test-key' in conftest).
+    Step 4 runs only if the fast role is bound (it is, via conftest).
     Step 5 updates openalex_id + cited_by_count for papers with DOIs.
     Step 6 increments stats.chunks only if chunk_paper_to_db returns > 0.
     """
@@ -687,6 +687,52 @@ class TestFullRefresh:
         assert done["stats"]["abstracts"] == 0  # skipped because already has one
         # CrossRef must NOT have been called for a paper that already has an abstract
         crossref_mock.assert_not_called()
+
+    def test_step4_category_assigned_via_llm_refresh(self, client, db):
+        """Step 4: categorize_with_llm must be called with keyword args matching
+        its real signature (title/abstract/text_snippet/category_tree/
+        categories_json), and each returned assignment is written to
+        paper_categories with assigned_by='llm_refresh'."""
+        pid = _seed_paper(db, filename="fr_cat_llm.pdf", with_file=True)
+        cid = _insert_category(db, "FrCatLlmCat")
+        llm_mock = MagicMock(return_value=[{"category_id": cid, "confidence": 0.77}])
+        doc = _mock_fitz_doc()
+        with patch("fitz.open", return_value=doc), \
+             patch.object(validation_policy, "validate_propose", new_callable=AsyncMock,
+                          return_value={"confidence": "low", "changes": {}, "category_suggestions": []}), \
+             patch.object(validation_policy, "validate_apply", new_callable=AsyncMock,
+                          return_value={"status": "ok"}), \
+             patch.object(routers.maintenance, "fetch_crossref_metadata", return_value=None), \
+             patch.object(routers.maintenance, "extract_text_from_pdf", return_value="some pdf text"), \
+             patch.object(routers.maintenance, "categorize_with_llm", llm_mock), \
+             patch.object(routers.maintenance, "OpenAlexClient", return_value=MagicMock(
+                 fetch_works_by_doi=MagicMock(return_value=[]))), \
+             patch.object(routers.maintenance, "chunk_paper_to_db", return_value=0):
+            resp = client.post("/api/maintenance/full-refresh")
+        assert resp.status_code == 200
+        done = _event_by_type(_parse_sse(resp), "done")
+        assert done is not None
+        assert done["stats"]["categorized"] == 1
+        assert done["stats"]["errors"] == 0
+
+        llm_mock.assert_called_once()
+        _, kwargs = llm_mock.call_args
+        assert kwargs["title"] == "Maintenance Test Paper"
+        assert kwargs["text_snippet"] == "some pdf text"
+        assert "categories_json" in kwargs
+        assert "category_tree" in kwargs
+
+        conn = db._connect()
+        try:
+            row = conn.execute(
+                "SELECT confidence, assigned_by FROM paper_categories WHERE paper_id=? AND category_id=?",
+                (pid, cid),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row["assigned_by"] == "llm_refresh"
+        assert abs(row["confidence"] - 0.77) < 1e-6
 
     def test_step5_openalex_updates_cited_by_count_and_id(self, client, db):
         """Step 5: a Work returned from OpenAlex is written to DB (openalex_id,

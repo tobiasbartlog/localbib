@@ -245,7 +245,7 @@ async def full_refresh():
                     if cr and cr.get("abstract", "").strip():
                         abstract = cr["abstract"].strip()[:5000]
                 # Versuch 2: LLM aus PDF-Text
-                if not abstract and Config.KICONNECT_API_KEY:
+                if not abstract and Config.llm_ready("fast"):
                     filepath = os.path.join(Config.ALL_DIR, os.path.basename(p["filename"]))
                     pdf_text = ""
                     if os.path.exists(filepath):
@@ -282,7 +282,7 @@ async def full_refresh():
 
         # ── SCHRITT 4: Fehlende Kategorien ───────────────────────────────────
         yield sse("Schritt 4/6: Fehlende Kategorien zuweisen...", 0, "categories")
-        if Config.KICONNECT_API_KEY:
+        if Config.llm_ready("fast"):
             conn = _get_conn()
             try:
                 uncategorized_ids = [
@@ -310,10 +310,16 @@ async def full_refresh():
                     pdf_text = ""
                     if os.path.exists(filepath):
                         pdf_text = extract_text_from_pdf(filepath, max_pages=5)
-                    assignments = categorize_with_llm(paper, pdf_text, categories_json, category_tree)
+                    assignments = categorize_with_llm(
+                        title=paper["title"],
+                        abstract=paper["abstract"],
+                        text_snippet=pdf_text[:2000],
+                        category_tree=category_tree,
+                        categories_json=categories_json,
+                    )
                     if assignments:
-                        for cat_id, confidence in assignments:
-                            db.assign_category(pid, cat_id, confidence, "llm_refresh")
+                        for a in assignments:
+                            db.assign_category(pid, a["category_id"], a["confidence"], "llm_refresh")
                         stats["categorized"] += 1
                 except Exception as e:
                     logging.warning(f"Kategorisierungs-Refresh fehlgeschlagen für Paper {pid}: {e}")
@@ -391,7 +397,7 @@ async def get_embedding_status():
     """n von m Papern UND n von m Chunks indexiert (#102), aktuell
     konfiguriertes Modell + Dimension.
 
-    Funktioniert auch ohne konfiguriertes ``LLM_EMBED_MODEL`` (n=0, model="") —
+    Funktioniert auch ohne gebundene Embedding-Rolle (n=0, model="") —
     kein 500er, die semantische Suche ist dann optional ausgeblendet (PRD
     Entscheidung 5)."""
     return embedding_status()

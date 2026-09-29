@@ -35,7 +35,7 @@ describe('Update-Hinweis mit Ein-Klick-Weg', () => {
             if (!el) throw new Error('Update-Knopf nicht gerendert');
             return el;
         });
-        expect(button.textContent).toContain('Jetzt aktualisieren');
+        expect(button.textContent).toContain('Update now');
         // Der manuelle Weg bleibt daneben stehen, auch wenn alles gut geht.
         expect(document.querySelector('[data-testid="update-manual-link"]').getAttribute('href'))
             .toBe(INSTALLER);

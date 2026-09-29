@@ -1,0 +1,5 @@
+/* hello — fixture Add-on stylesheet. Every class carries the "hello-" prefix. */
+.hello-view { padding: var(--space-4, 16px); }
+.hello-title { margin: 0 0 8px; }
+.hello-intro { color: var(--text-muted, inherit); }
+.hello-aside { font-size: 0.9em; }

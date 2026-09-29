@@ -1,19 +1,17 @@
-# P3 — "Eine Grenze, ein Vertrag": ein Plugin darf ausschliesslich aus
-# plugin_api importieren, nie aus dem LocalBib-Kern. Ersetzt das (auf diesem
-# Stack nicht anwendbare) `eslint no-restricted-imports` der Architektur
-# (Weg A, discovery.md).
+# Schichtgrenzen des Kerns. Pruefen:  lint-imports
 #
 # Hinweis zum Stack: Der Kern besteht aus flachen Einzeldatei-Modulen
 # (webapp.py, literature_manager.py, ...). grimp kann nur Pakete (Verzeichnis
-# mit __init__.py) als root_packages bauen, daher sind hier nur die Plugin-Pakete
-# und `plugin_api` die Wurzeln; die Kernmodule werden via
-# `include_external_packages` als externe Importziele erfasst und verboten.
+# mit __init__.py) als root_packages bauen, daher sind hier nur `plugin_api`,
+# `services` und `routers` die Wurzeln; die Kernmodule werden via
+# `include_external_packages` als externe Importziele erfasst.
 #
-# Die Gegenrichtung (Kern importiert nie aus einem Plugin) ist strukturell
-# garantiert: der Kern laedt Plugins ausschliesslich per importlib-String in
-# registry.py, es gibt keinen statischen Plugin-Import im Kern.
-#
-# Pruefen:  lint-imports
+# P3 — "Eine Grenze, ein Vertrag" (ein Add-on importiert ausschliesslich aus
+# plugin_api, nie aus dem Kern): jedes Add-on-Bundle bringt diesen Vertrag als
+# eigene `.importlinter` in seinem Bundle-Ordner mit und wird dort geprueft
+# (ADR-0021). Die Gegenrichtung (Kern importiert nie aus einem Add-on) ist
+# strukturell garantiert: der Kern laedt Add-ons ausschliesslich per
+# importlib-String in plugin_loader.py/registry.py.
 [importlinter]
 root_packages =
     plugin_api
@@ -55,6 +53,7 @@ modules =
     routers.export
     routers.custom_fields
     routers.bibtex_import
+    routers.paper_by_doi
     routers.papers
     routers.validate
     routers.references
@@ -64,3 +63,7 @@ modules =
     routers.duplicates
     routers.maintenance
     routers.search
+    routers.llm
+    routers.migration
+    routers.plugins
+    routers.marketplace

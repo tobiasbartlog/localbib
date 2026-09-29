@@ -1,0 +1,18 @@
+{
+  "hello.nav.label": "Hallo",
+  "hello.view.title": "Hallo",
+  "hello.view.intro": "Ein minimales Add-on, das deine Eintraege begruesst.",
+  "hello.aside.label": "Gruss fuer",
+  "hello.settings.salutation": "Anrede",
+  "hello.view.open": "Einen Gruss oeffnen",
+  "hello.greeting.title": "Gruss Nr. {id}",
+  "hello.greeting.back": "Zurueck",
+  "hello.settings.api_key": "Schluessel des Grussdienstes",
+  "hello.settings.greetings_folder": "Gruss-Ordner",
+  "hello.settings.shout": "In Grossbuchstaben gruessen",
+  "hello.filter.label": "Gruss",
+  "hello.filter.all": "Alle Eintraege",
+  "hello.filter.greeted": "Gegruesste Eintraege",
+  "hello.chat.label": "Gruesse einbeziehen",
+  "hello.chat.block": "Gruesse, die der Nutzer bisher verschickt hat."
+}

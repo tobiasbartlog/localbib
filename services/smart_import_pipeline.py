@@ -26,7 +26,7 @@ imported at module level so tests can patch them on this module.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator
 
 from literature_manager import (
@@ -63,6 +63,12 @@ class ImportResult:
         lookup itself stays in the router, keeping this service pure.
     doi_signal:
         The proposed DOI used as the other content-dedup signal.
+    llm_failures:
+        Transport/HTTP failures of the LLM steps this pipeline ran (today only
+        ``validate``), in the shape of :meth:`llm_client.LLMClientError.as_failure`.
+        The router appends its own steps (categories, abstract) and ships the
+        list in the ``complete`` event, so the UI can say why an AI step
+        produced nothing instead of silently showing empty fields.
     """
 
     text: str
@@ -70,6 +76,18 @@ class ImportResult:
     crossref_plausible: bool = False
     title_signal: str = ""
     doi_signal: str = ""
+    llm_failures: list[dict] = field(default_factory=list)
+
+
+def llm_failure_message(failure: dict) -> dict:
+    """The progress message for a recorded LLM failure: one code per kind
+    (``import.step.llmFailed.rate_limited`` / ``.auth`` / ``.unavailable``),
+    the model as parameter. Shared with the router so every AI step reports a
+    failure the same way."""
+    return {
+        "code": f"import.step.llmFailed.{failure['kind']}",
+        "params": {"model": failure.get("model") or "?"},
+    }
 
 
 def _sse(data: dict) -> dict:
@@ -158,7 +176,8 @@ def run_pipeline(
         metadata["title"] = lines[0][:200] if lines else original_filename.replace(".pdf", "")
 
     # -- LLM Metadaten-Validierung --
-    if do_validate and Config.KICONNECT_API_KEY:
+    llm_failures: list[dict] = []
+    if do_validate and Config.llm_ready("fast"):
         yield _sse({"type": "progress", "step": "validate", "message": "KI validiert Metadaten...", "percent": 40})
         _llm = llm_for("metadata_extract")
         llm_data = llm_extract_metadata(
@@ -179,6 +198,14 @@ def run_pipeline(
                 metadata["isbn"] = llm_data["isbn"]
             yield _sse({"type": "progress", "step": "validate",
                         "message": f"KI: Titel = {metadata['title'][:60]}...", "percent": 50})
+        elif getattr(_llm, "last_error", None) is not None:
+            # complete_json() swallowed a transport/HTTP failure (429 from a
+            # rate-limited free-tier model, wrong key, unreachable host) --
+            # report it instead of pretending the model merely had no answer.
+            failure = _llm.last_error.as_failure("validate")
+            llm_failures.append(failure)
+            yield _sse({"type": "progress", "step": "validate",
+                        "message": llm_failure_message(failure), "percent": 50})
         else:
             yield _sse({"type": "progress", "step": "validate", "message": "KI-Validierung ohne Ergebnis", "percent": 50})
     else:
@@ -190,4 +217,5 @@ def run_pipeline(
         crossref_plausible=crossref_plausible,
         title_signal=metadata.get("title", ""),
         doi_signal=metadata.get("doi", ""),
+        llm_failures=llm_failures,
     )

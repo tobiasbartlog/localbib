@@ -1,0 +1,21 @@
+{
+  "id": "localegap",
+  "name": "Locale Gap",
+  "version": "0.1.0",
+  "author": "LocalBib",
+  "license": "MIT",
+  "tagline": "Fixture: a locale file missing a key another language has.",
+  "languages": ["en", "de"],
+  "default_language": "en",
+  "api_version": 2,
+  "min_core": "0.8.0",
+  "python": "any",
+  "permissions": [],
+  "frontend": {
+    "script": "frontend/localegap.js",
+    "locales": {
+      "en": "frontend/locales/en.json",
+      "de": "frontend/locales/de.json"
+    }
+  }
+}

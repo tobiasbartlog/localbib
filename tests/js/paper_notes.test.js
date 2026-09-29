@@ -74,8 +74,8 @@ describe('paper notes block', () => {
             .map((s) => ((s.querySelector('.lb-detail-h') || {}).textContent || '').trim());
         const at = (label) => headings.findIndex((h) => h.startsWith(label));
         expect(at('Abstract')).toBeGreaterThanOrEqual(0);
-        expect(at('Notizen')).toBe(at('Abstract') + 1);
-        expect(at('Benutzerdefinierte Felder')).toBe(at('Notizen') + 1);
+        expect(at('Notes')).toBe(at('Abstract') + 1);
+        expect(at('Custom fields')).toBe(at('Notes') + 1);
     });
 
     it('switches to editing when the rendered notes are clicked', async () => {
@@ -110,7 +110,7 @@ describe('paper notes block', () => {
         expect(put.body).toEqual({ notes: 'Frisch getippt' });
 
         await vi.waitFor(() => {
-            if (!findByText('.lb-notes-status', 'gespeichert')) throw new Error('Keine Bestaetigung');
+            if (!findByText('.lb-notes-status', 'saved')) throw new Error('no save confirmation');
         });
     });
 });

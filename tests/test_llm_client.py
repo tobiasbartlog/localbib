@@ -5,8 +5,9 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from config import Config
+from config import Config  # noqa: F401 — kept for tests that patch Config attributes
 from llm_client import EMBED_REQUEST_CHUNK_SIZE, LLMClient, LLMClientError, embed_texts
+from tests.llm_helpers import configure_llm
 
 URL = "https://api.example.com/chat"
 MODEL = "test-model"
@@ -157,6 +158,69 @@ class TestComplete:
         assert result == ""
 
 
+class TestLastError:
+    """``LLMClient.last_error`` lets a caller that degrades (complete_json
+    returned its default) find out afterwards WHY: rate limit vs. key vs.
+    host. The import surfaces it in the UI instead of leaving fields empty."""
+
+    def test_fresh_client_has_no_error(self):
+        assert _client().last_error is None
+
+    def test_persistent_429_records_rate_limit(self, sleeps):
+        c = _client()
+        with patch("llm_client.requests.post", return_value=_error_response(429)):
+            with pytest.raises(LLMClientError):
+                c.complete([])
+        assert c.last_error is not None
+        assert c.last_error.status == 429
+        assert c.last_error.kind == "rate_limited"
+        assert c.last_error.model == MODEL
+
+    def test_auth_rejection_is_kind_auth(self):
+        c = _client()
+        with patch("llm_client.requests.post", return_value=_error_response(401)):
+            with pytest.raises(LLMClientError):
+                c.complete([])
+        assert c.last_error.kind == "auth"
+
+    def test_network_error_has_no_status_and_is_unavailable(self, sleeps):
+        c = _client()
+        with patch("llm_client.requests.post", side_effect=ConnectionError("boom")):
+            with pytest.raises(LLMClientError):
+                c.complete([])
+        assert c.last_error.status is None
+        assert c.last_error.kind == "unavailable"
+        assert c.last_error.model == MODEL
+
+    def test_success_clears_previous_error(self, sleeps):
+        c = _client()
+        with patch("llm_client.requests.post", return_value=_error_response(429)):
+            with pytest.raises(LLMClientError):
+                c.complete([])
+        with patch("llm_client.requests.post", return_value=_ok_response("ok")):
+            assert c.complete([]) == "ok"
+        assert c.last_error is None
+
+    def test_complete_json_leaves_error_readable(self, sleeps):
+        c = _client()
+        with patch("llm_client.requests.post", return_value=_error_response(429)):
+            assert c.complete_json([], expect=dict, default={}) == {}
+        assert c.last_error is not None and c.last_error.kind == "rate_limited"
+
+    def test_unparseable_answer_is_not_a_transport_failure(self):
+        c = _client()
+        with patch("llm_client.requests.post", return_value=_ok_response("no json here")):
+            assert c.complete_json([], expect=dict, default={}) == {}
+        assert c.last_error is None
+
+    def test_as_failure_wire_shape(self):
+        err = LLMClientError("HTTP 429: limited", status=429, model="m")
+        assert err.as_failure("abstract") == {
+            "step": "abstract", "kind": "rate_limited", "status": 429,
+            "model": "m", "detail": "HTTP 429: limited",
+        }
+
+
 class TestStream:
     def _sse_lines(self, tokens: list[str], done: bool = True) -> list[bytes]:
         lines: list[bytes] = []
@@ -261,12 +325,8 @@ def _embed_response(vectors: list[list[float]]) -> MagicMock:
 class TestEmbedTexts:
     @pytest.fixture(autouse=True)
     def _embed_config(self, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
-        monkeypatch.setattr(Config, "LLM_EMBED_URL", "")
-        monkeypatch.setattr(
-            Config, "KICONNECT_API_URL", "https://api.example.com/chat/completions"
-        )
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", KEY)
+        configure_llm(monkeypatch, embedding="test-embed-model",
+                      base_url="https://api.example.com", api_key=KEY)
 
     def test_returns_one_vector_per_text(self):
         with patch(
@@ -344,16 +404,20 @@ class TestEmbedTexts:
         assert mock_post.call_count == 3
         assert sleeps == [2.0, 2.0]
 
-    def test_embed_url_override_used_instead_of_derived(self, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_URL", "http://localhost:11434/v1/embeddings")
+    def test_embedding_role_on_its_own_connection(self, monkeypatch):
+        """The embedding role may live on another connection than the chat
+        roles — with its own URL and its own (here: no) key."""
+        configure_llm(monkeypatch, embedding="test-embed-model",
+                      embed_base_url="http://localhost:11434/v1", embed_api_key="")
         with patch(
             "llm_client.requests.post", return_value=_embed_response([[0.1]])
         ) as mock_post:
             embed_texts(["a"])
         assert mock_post.call_args.args[0] == "http://localhost:11434/v1/embeddings"
+        assert "Authorization" not in mock_post.call_args.kwargs["headers"]
 
-    def test_unconfigured_model_raises_not_implemented(self, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+    def test_unbound_role_raises_not_implemented(self, monkeypatch):
+        configure_llm(monkeypatch, embedding="")
         with pytest.raises(NotImplementedError):
             embed_texts(["a"])
 

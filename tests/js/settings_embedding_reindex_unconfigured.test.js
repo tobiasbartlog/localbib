@@ -15,9 +15,9 @@ describe('settings: semantischer Index ohne Modell', () => {
             },
         ]);
 
-        expect(findByText('p', 'Kein Embedding-Modell konfiguriert')).toBeTruthy();
+        expect(findByText('p', 'No embedding model configured')).toBeTruthy();
         // Die Buttons bleiben sichtbar — der Lauf degradiert serverseitig und
         // meldet das zurueck, statt hier weggeblendet zu werden.
-        expect(findByText('button', 'Textstellen indexieren')).toBeTruthy();
+        expect(findByText('button', 'Index passages')).toBeTruthy();
     });
 });

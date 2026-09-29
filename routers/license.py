@@ -37,38 +37,28 @@ router = APIRouter()
 # Kunden ist die Berechtigung.
 ACTIVATE_PATH = "/v1/customer-portal/license-keys/activate"
 
-# Fehlertexte. Jede Ursache bekommt einen eigenen Satz, weil der naechste
-# Schritt des Kunden ein anderer ist: nachtippen, Geraet freigeben, spaeter
-# erneut versuchen, oder Support kontaktieren.
-ERR_EMPTY = "Bitte gib deinen Lizenzschlüssel ein."
-ERR_INVALID = (
-    "Dieser Lizenzschlüssel ist ungültig. Bitte prüfe die Eingabe — "
-    "meistens ist beim Kopieren ein Zeichen verloren gegangen."
-)
-ERR_LIMIT = (
-    "Dieser Lizenzschlüssel ist bereits auf zwei Geräten aktiviert. "
-    "Gib in deinem Polar-Konto ein Gerät frei und versuche es erneut."
-)
-ERR_NETWORK = (
-    "Der Lizenzserver ist nicht erreichbar. Prüfe deine Internetverbindung "
-    "und versuche es später erneut — deine Bibliothek bleibt nutzbar."
-)
+# Fehlercodes. Jede Ursache bekommt einen eigenen, weil der naechste Schritt
+# des Kunden ein anderer ist: nachtippen, Geraet freigeben, spaeter erneut
+# versuchen, oder Support kontaktieren. Den Satz dazu formuliert die SPA
+# (ADR-0018, Entscheidung 3).
+ERR_EMPTY = "license.err.empty"
+ERR_INVALID = "license.err.invalid"
+ERR_LIMIT = "license.err.limit"
+ERR_NETWORK = "license.err.network"
 
 # App-Setting, in dem der Erststart steht — der Anker der 14-Tage-Testphase.
 # Gestempelt wird er beim Start (webapp.py); hier wird er nur gelesen.
 FIRST_RUN_SETTING = "license_first_run_at"
 
 
-def _err_unexpected(status: int) -> str:
+def _err_unexpected(status: int) -> dict:
     """Antwort, die laut Polars API-Vertrag nicht vorkommen kann.
 
     Sie dem Kunden als "dein Schlüssel ist falsch" zu verkaufen waere gelogen
     und schickt ihn auf die falsche Faehrte — also sagen, was ist, samt Code
-    fuer den Support."""
-    return (
-        f"Die Aktivierung ist unerwartet fehlgeschlagen (Fehler {status}). "
-        "Bitte versuche es erneut und melde dich beim Support, wenn es bleibt."
-    )
+    fuer den Support. Der Status reist als Parameter mit, damit die SPA ihn in
+    ihren Satz einsetzen kann."""
+    return {"code": "license.err.unexpected", "params": {"status": status}}
 
 
 class LicenseKeyRequest(BaseModel):
@@ -96,7 +86,7 @@ def _mask(key: str) -> str:
     return "••••" + key[-4:]
 
 
-def _error_for(resp: httpx.Response) -> str:
+def _error_for(resp: httpx.Response) -> str | dict:
     """Polar-Status -> der Satz, den der Kunde lesen soll.
 
     Die Zuordnung folgt Polars dokumentiertem Vertrag fuer diesen Endpunkt
@@ -155,7 +145,10 @@ def _status_payload(db: Database) -> dict:
         "key": _mask(db.get_app_setting("license_key")),
         "activated_at": db.get_app_setting("license_activated_at"),
         "checkout_url": Config.POLAR_CHECKOUT_URL,
-        "price_display": license_state.PRICE_DISPLAY,
+        # Zahl und Waehrung, nicht fertiger Text: formatiert wird in der
+        # SPA, wo die Locale lebt (ADR-0018).
+        "price_amount": license_state.PRICE_AMOUNT,
+        "price_currency": license_state.PRICE_CURRENCY,
         **state.as_dict(),
     }
 

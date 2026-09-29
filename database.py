@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SQLite-Datenbank für Paper und Kategorien."""
 
+import json
 import sqlite3
 import logging
 from typing import Optional, Dict, List
@@ -15,6 +16,38 @@ NOTES_FIELD_NAMES = frozenset({"notiz", "notizen", "note", "notes"})
 
 # app_settings-Schluessel, der die Notiz-Migration als erledigt vermerkt.
 NOTES_MIGRATION_KEY = "notes_field_migration_done"
+
+
+def normalize_tags(value) -> str:
+    """Tags (Liste, JSON-Text oder nichts) -> JSON-Array-Text fuer papers.tags.
+
+    Genau eine Form liegt in der Spalte, damit jeder Leser sie ohne Fallunter-
+    scheidung parsen kann. Unlesbarer Text wird als *ein* Tag gelesen statt
+    verworfen — die Eingabe kam aus einer fremden Bibliothek, nicht aus einem
+    Formular.
+    """
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (list, tuple)):
+        tags = [str(t).strip() for t in value]
+    elif isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            tags = [str(t).strip() for t in parsed]
+        else:
+            tags = [text]
+    else:
+        tags = [str(value).strip()]
+
+    unique: List[str] = []
+    for tag in tags:
+        if tag and tag not in unique:
+            unique.append(tag)
+    return json.dumps(unique, ensure_ascii=False) if unique else ""
 
 
 # =============================================================================
@@ -145,6 +178,14 @@ class Database:
             # is edited in its own block, and it is written through its own
             # endpoint so a note never renames the PDF.
             ("notes", "TEXT DEFAULT ''"),
+            # Migration (PRD #173): a library switched over from Zotero,
+            # Mendeley or Citavi brings two things the schema had no home for.
+            # ``tags`` is a JSON array — the reader's own vocabulary, flat and
+            # unranked, next to (not instead of) the category tree.
+            ("tags", "TEXT DEFAULT ''"),
+            # When the entry entered the *old* library. ``created_at`` stays the
+            # row time, so "imported yesterday, collected in 2014" is sayable.
+            ("date_added", "TEXT DEFAULT ''"),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE papers ADD COLUMN {col} {coldef}")
@@ -203,6 +244,32 @@ class Database:
                 value TEXT DEFAULT ''
             );
         """);
+
+        # Migration-Laeufe (PRD #173): das Buchhaltungsminimum fuer "Undo".
+        # Ein Lauf merkt sich NUR die Paper, die er selbst angelegt hat — ein
+        # gematchtes Paper gehoerte schon vorher der Bibliothek und darf beim
+        # Zuruecknehmen nicht verschwinden. Kein FK auf papers: die Zeile soll
+        # den Lauf auch dann noch beschreiben, wenn einzelne Paper von Hand
+        # geloescht wurden.
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS migration_runs (
+                run_id TEXT PRIMARY KEY,
+                source TEXT DEFAULT '',
+                source_path TEXT DEFAULT '',
+                created_paper_ids TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """);
+
+        # Der PDF-Ordner-Abgleich (Mendeley-Pfad, #176) legt keine Paper an — er
+        # haengt Dateien an vorhandene. Sein Undo ist daher kein Loeschen,
+        # sondern ein Abhaengen, und dafuer braucht der Lauf eine zweite Liste:
+        # JSON-Objekte {paper_id, filename} der frisch angehaengten Dateien.
+        try:
+            cursor.execute(
+                "ALTER TABLE migration_runs ADD COLUMN attached_paper_ids TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # Spalte existiert bereits
 
         # Selbstgebautes Notizfeld -> papers.notes (#162). Steht hier, weil es
         # sowohl die notes-Spalte als auch app_settings braucht (dort steht der
@@ -396,6 +463,36 @@ class Database:
         finally:
             conn.close()
 
+    def get_or_create_category_path(self, path: List[str]) -> Optional[int]:
+        """Kategorie-Pfad ``["A", "B"]`` -> ID der Blattkategorie.
+
+        Der Weg zu einer importierten Sammlung (PRD #173): jede Stufe wird
+        angelegt, falls sie unter ihrem Elternteil noch fehlt, bestehende
+        Stufen werden wiederverwendet. Gleiche Namen unter verschiedenen Eltern
+        bleiben verschiedene Kategorien — "Methoden" unter "Diss" ist nicht
+        "Methoden" unter "Lehre". Leerer Pfad -> ``None``.
+        """
+        parent_id: Optional[int] = None
+        leaf_id: Optional[int] = None
+        for segment in path or []:
+            name = (segment or "").strip()
+            if not name:
+                continue
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT id FROM categories WHERE name = ? AND parent_id IS ?",
+                    (name, parent_id),
+                ).fetchone()
+            finally:
+                conn.close()
+            cat_id = row["id"] if row else self.add_category(name, parent_id)
+            if cat_id is None or cat_id < 0:
+                return leaf_id
+            parent_id = cat_id
+            leaf_id = cat_id
+        return leaf_id
+
     def get_categories(self) -> List[Dict]:
         """Gibt alle Kategorien als hierarchische Struktur zurück."""
         conn = self._connect()
@@ -491,7 +588,13 @@ class Database:
             conn.close()
 
     def add_paper(self, paper_data: Dict) -> int:
-        """Fügt Paper hinzu (inkl. automatisch vergebenem Cite Key). Gibt ID zurück."""
+        """Fügt Paper hinzu (inkl. automatisch vergebenem Cite Key). Gibt ID zurück.
+
+        ``tags`` darf als Liste oder als fertiger JSON-Text kommen — gespeichert
+        wird immer ein JSON-Array, damit Leser der Spalte nie raten muessen
+        (PRD #173). ``notes`` und ``date_added`` sind optional und leer, wenn
+        die Quelle nichts mitbringt.
+        """
         conn = self._connect()
         existing_keys = {
             r[0] for r in conn.execute(
@@ -501,6 +604,9 @@ class Database:
         paper_data = dict(paper_data)
         paper_data.setdefault("page_count", 0)
         paper_data.setdefault("import_source", "")
+        paper_data.setdefault("notes", "")
+        paper_data.setdefault("date_added", "")
+        paper_data["tags"] = normalize_tags(paper_data.get("tags"))
         # Caller-supplied key (e.g. BibTeX import keeps the .bib entry key,
         # "Bestand gewinnt" / ADR-0003) — de-duplicated, never overwriting.
         desired_key = (paper_data.get("cite_key") or "").strip()
@@ -513,10 +619,10 @@ class Database:
         cursor = conn.execute("""
             INSERT INTO papers (file_hash, filename, original_filename, title, authors,
                                 year, doi, isbn, abstract, journal, publisher, raw_metadata, ocr_text, page_count,
-                                cite_key, import_source)
+                                cite_key, import_source, notes, tags, date_added)
             VALUES (:file_hash, :filename, :original_filename, :title, :authors,
                     :year, :doi, :isbn, :abstract, :journal, :publisher, :raw_metadata, :ocr_text,
-                    :page_count, :cite_key, :import_source)
+                    :page_count, :cite_key, :import_source, :notes, :tags, :date_added)
         """, paper_data)
         conn.commit()
         paper_id = cursor.lastrowid

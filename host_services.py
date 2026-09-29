@@ -21,6 +21,7 @@ from typing import Optional
 
 import bibtex_builder
 import embedding_index
+import paper_ingest
 from cite_key_generator import base_key as _legacy_cite_key_base
 from context import get_conn
 from literature_manager import Config, Database, extract_text_from_pdf
@@ -61,7 +62,7 @@ class _CoreLlmApi:
         # Name des konfigurierten Embedding-Modells, damit Plugins ihren
         # Vektor-Cache modell-scharf schluesseln koennen (Modellwechsel
         # ⇒ Re-Embed). Leer, wenn kein Endpoint konfiguriert ist.
-        return (Config.LLM_EMBED_MODEL or "").strip()
+        return Config.embed_model()
 
 
 def _cite_key(paper: dict) -> str:
@@ -77,7 +78,8 @@ def _cite_key(paper: dict) -> str:
 
 
 class _CoreLibraryApi:
-    """plugin_api.LibraryApi: Lesezugriff auf die Bibliothek per Citekey.
+    """plugin_api.LibraryApi: Lesezugriff auf die Bibliothek per Citekey,
+    plus die eine Schreibmethode ``create_by_doi`` (``library.write``).
 
     Citekeys sind gespeicherte, eindeutige Paper-Eigenschaften (Spalte
     cite_key, backfilled in Database.init_db); _cite_key() faellt nur fuer
@@ -176,6 +178,38 @@ class _CoreLibraryApi:
             return projects
         finally:
             conn.close()
+
+    def create_by_doi(
+        self,
+        doi: str,
+        *,
+        title: str = "",
+        authors=None,
+        year: Optional[int] = None,
+        journal: str = "",
+        abstract: str = "",
+        source: str = paper_ingest.DOI_SOURCE,
+    ) -> dict:
+        """The DOI intake (ADR-0016) for an Add-on's Python.
+
+        Why a host adapter may write here: ADR-0006 puts the write point at the
+        transport boundary — for HTTP that is the router handler, for an
+        in-process Add-on it is this adapter, the one place the contract call
+        enters the core (as ``plugin_loader.AddonSettings.set`` is for
+        ``plugins.json``). It decides nothing itself: it calls the very flow the
+        REST handler calls, ``paper_ingest.intake_by_doi``, so there is no
+        second ingest. The gate is not here either — ``plugin_loader`` wraps
+        this object per Add-on, refuses the call without ``library.write`` and
+        pins ``source`` to the Add-on id.
+        """
+        result = paper_ingest.intake_by_doi([{
+            "doi": doi, "title": title, "authors": authors, "year": year,
+            "journal": journal, "abstract": abstract, "source": source,
+        }])[0]
+        error = result.pop("error", None)
+        if error:
+            raise ValueError(error)
+        return result
 
     def on_change(self, callback):
         # Kein Change-Feed im Kern — bewusster No-op-Unsubscriber.

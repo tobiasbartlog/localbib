@@ -71,7 +71,7 @@ def _llm_suggest_category(name: str, existing_categories: list) -> dict:
 
     Thin wrapper: delegates to services.metadata_extraction.llm_suggest_category (#86).
     """
-    if not Config.KICONNECT_API_KEY:
+    if not Config.llm_ready("fast"):
         return {}
     return _service_llm_suggest_category(llm_for("category_suggest"), name, existing_categories)
 
@@ -143,7 +143,7 @@ async def update_category(category_id: int, data: CategoryUpdate):
     try:
         existing = conn.execute("SELECT id FROM categories WHERE id = ?", (category_id,)).fetchone()
         if not existing:
-            raise HTTPException(status_code=404, detail="Kategorie nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.category_not_found")
 
         updates = []
         values = []
@@ -157,7 +157,7 @@ async def update_category(category_id: int, data: CategoryUpdate):
         if data.parent_id != -1:
             # Prevent circular: cannot set parent to self or a descendant
             if data.parent_id == category_id:
-                raise HTTPException(status_code=400, detail="Kategorie kann nicht eigene Oberkategorie sein")
+                raise HTTPException(status_code=400, detail="error.category_own_parent")
             if data.parent_id is not None:
                 # Check descendant loop
                 check_id = data.parent_id
@@ -166,7 +166,7 @@ async def update_category(category_id: int, data: CategoryUpdate):
                     if not row:
                         break
                     if row["parent_id"] == category_id:
-                        raise HTTPException(status_code=400, detail="Zirkulaere Verschachtelung nicht erlaubt")
+                        raise HTTPException(status_code=400, detail="error.category_cycle")
                     check_id = row["parent_id"]
             updates.append("parent_id = ?")
             values.append(data.parent_id)
@@ -192,7 +192,7 @@ async def delete_category(category_id: int):
     try:
         existing = conn.execute("SELECT id FROM categories WHERE id = ?", (category_id,)).fetchone()
         if not existing:
-            raise HTTPException(status_code=404, detail="Kategorie nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.category_not_found")
 
         # Kinder-Kategorien auch loeschen
         children = conn.execute(

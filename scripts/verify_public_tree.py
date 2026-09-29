@@ -81,8 +81,8 @@ REQUIRED_FILES: tuple[str, ...] = (
 # Distributions that exist only for the plugins (issue #143 requirements split).
 # Hand-listed rather than read from ``requirements-plugins.txt``: that file is
 # private and never reaches a tree this module has to check. Same reason
-# FORBIDDEN_IDENTIFIERS does not derive the plugin names from
-# ``context.PLUGIN_MODULES`` — in a public tree that table is empty by design.
+# FORBIDDEN_IDENTIFIERS does not derive the plugin names from the Bundles
+# under ``plugins/`` — a public tree has none by design.
 PLUGIN_ONLY_PACKAGES: tuple[str, ...] = (
     "PyYAML",
     "tenacity",

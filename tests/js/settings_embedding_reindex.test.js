@@ -31,12 +31,12 @@ describe('settings: semantischer Index', () => {
         expect(status).toBeTruthy();
         expect(status.textContent).toContain('13585/15160');
 
-        const button = findByText('button', 'Textstellen indexieren');
+        const button = findByText('button', 'Index passages');
         expect(button).toBeTruthy();
         button.click();
 
         await vi.waitFor(() => {
-            if (!findByText('span', '1575 Textstellen indexiert')) {
+            if (!findByText('span', '1575 passages indexed')) {
                 throw new Error('Ergebnis nicht gerendert');
             }
         });
@@ -52,6 +52,6 @@ describe('settings: semantischer Index', () => {
         expect(statusCalls.length).toBeGreaterThanOrEqual(2);
 
         // Die Paper-Ebene hat ihren eigenen Lauf daneben.
-        expect(findByText('button', 'Paper indexieren')).toBeTruthy();
+        expect(findByText('button', 'Index items')).toBeTruthy();
     });
 });

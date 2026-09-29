@@ -17,7 +17,7 @@ BM25 fallback (``services.research_rag.bm25_search``, over pseudo-chunks
 built from paper title+abstract -- works even for papers that were never
 PDF-chunked) whenever semantic search cannot run at all:
 
-  * no ``LLM_EMBED_MODEL`` configured (PRD Entscheidung 5 -- degradation is a
+  * no embedding role bound (PRD Entscheidung 5 -- degradation is a
     product requirement, not just an error path: the app must stay fully
     usable without an embedding model),
   * no indexed vectors exist for the CURRENTLY configured model -- this also
@@ -177,7 +177,7 @@ def _search(q: str, top_k: int) -> dict:
     try:
         papers = _load_papers(conn)
 
-        model = (Config.LLM_EMBED_MODEL or "").strip()
+        model = Config.embed_model()
         if not model:
             return _bm25_fallback(q, top_k, papers)
 
@@ -311,7 +311,7 @@ def _passage_search(q: str, top_k: int) -> dict:
         by_paper = {p["id"]: p for p in papers}
         all_chunks = _load_all_chunks_meta(conn)
 
-        model = (Config.LLM_EMBED_MODEL or "").strip()
+        model = Config.embed_model()
         if not model:
             return _passage_bm25_fallback(q, top_k, all_chunks, by_paper)
 
@@ -444,7 +444,7 @@ async def get_reference(citekey: str):
     try:
         p = _find_paper_by_citekey(conn, citekey)
         if not p:
-            raise HTTPException(status_code=404, detail=f"Unbekannter Citekey: {citekey}")
+            raise HTTPException(status_code=404, detail={"code": "error.unknown_citekey", "params": {"citekey": citekey}})
         return {
             "citekey": _cite_key(p),
             "title": p.get("title") or "",
@@ -471,7 +471,7 @@ async def get_reference_chunks(
     try:
         p = _find_paper_by_citekey(conn, citekey)
         if not p:
-            raise HTTPException(status_code=404, detail=f"Unbekannter Citekey: {citekey}")
+            raise HTTPException(status_code=404, detail={"code": "error.unknown_citekey", "params": {"citekey": citekey}})
         total = conn.execute(
             "SELECT COUNT(*) AS n FROM paper_chunks WHERE paper_id = ?", (p["id"],)
         ).fetchone()["n"]

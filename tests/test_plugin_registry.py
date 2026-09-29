@@ -68,18 +68,6 @@ def test_activate_is_idempotent():
     assert len(reg.nav_items()) == 1
 
 
-def test_sync_toggles_plugin():
-    reg = PluginRegistry()
-    _make_dummy_module("dummy_plugin_c")
-    asyncio.run(reg.sync("dummy_plugin_c", True))
-    assert reg.is_active("dummy_plugin_c")
-    asyncio.run(reg.sync("dummy_plugin_c", False))
-    assert not reg.is_active("dummy_plugin_c")
-    assert reg.nav_items() == []
-
-
-
-
 def test_plugins_nav_endpoint_empty_by_default(client):
     """With every plugin disabled (default), the endpoint reports no nav items."""
     resp = client.get("/api/plugins/nav")

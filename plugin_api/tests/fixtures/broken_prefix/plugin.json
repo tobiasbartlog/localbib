@@ -1,0 +1,20 @@
+{
+  "id": "badprefix",
+  "name": "Bad Prefix",
+  "version": "0.1.0",
+  "author": "LocalBib",
+  "license": "MIT",
+  "tagline": "Fixture: locale keys without the '<id>.' namespace prefix.",
+  "languages": ["en"],
+  "default_language": "en",
+  "api_version": 2,
+  "min_core": "0.8.0",
+  "python": "any",
+  "permissions": [],
+  "frontend": {
+    "script": "frontend/badprefix.js",
+    "locales": {
+      "en": "frontend/locales/en.json"
+    }
+  }
+}

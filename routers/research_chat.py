@@ -91,22 +91,25 @@ def _research_chat_llm(
     werden NACH dem Paper-Kontext in den User-Turn eingefuegt.  Wird kein
     extra_context uebergeben, bleibt das Verhalten unveraendert.
     """
-    if not Config.KICONNECT_API_KEY:
-        return "Fehler: Kein LLM-API-Key konfiguriert. Bitte in den Einstellungen einen KI Connect API Key hinterlegen."
+    if not Config.llm_ready("reasoning"):
+        return "error.no_llm_key"
 
-    system_prompt = """Du bist ein wissenschaftlicher Assistent, der Fragen zu Forschungspapieren beantwortet.
-Du erhaeltst Textausschnitte aus wissenschaftlichen Papieren als Kontext.
+    # Die Antwortsprache folgt der Oberflaeche (ADR-0018). Die Quellenmarke
+    # bleibt bewusst `[Quelle X]`: die SPA parst genau diese Form, um die
+    # Badges zu setzen - ein uebersetzter Marker wuerde die Belege zerreissen.
+    system_prompt = f"""You are a research assistant answering questions about academic items.
+You receive text passages from academic items as context.
 
-REGELN:
-- Beantworte die Frage NUR basierend auf dem gegebenen Kontext
-- Zitiere JEDE Information mit [Quelle X] direkt im Text, wobei X die Quellennummer ist
-- WICHTIG: Verwende ALLE relevanten Quellen! Wenn Information aus Quelle 1, 2 und 3 stammt, schreibe z.B. "... [Quelle 1] [Quelle 3]" oder "Laut [Quelle 2] ..."
-- Jeder Absatz und jede Aussage MUSS mindestens eine [Quelle X] Markierung enthalten
-- Wenn du die Frage nicht aus dem Kontext beantworten kannst, sage das ehrlich
-- Antworte auf Deutsch, es sei denn die Frage ist auf Englisch
-- Sei praezise und wissenschaftlich korrekt
-- Fasse relevante Informationen aus mehreren Quellen zusammen wenn moeglich
-- Strukturiere die Antwort uebersichtlich mit Absaetzen"""
+RULES:
+- Answer the question ONLY from the given context
+- Cite EVERY piece of information with [Quelle X] inline, where X is the source number
+- IMPORTANT: use ALL relevant sources. If information comes from sources 1, 2 and 3, write e.g. "... [Quelle 1] [Quelle 3]" or "According to [Quelle 2] ..."
+- Every paragraph and every statement MUST carry at least one [Quelle X] marker
+- If you cannot answer from the context, say so honestly
+- Answer in {Config.ui_language_name()}, unless the question is in a different language
+- Be precise and scientifically accurate
+- Combine relevant information from several sources where possible
+- Structure the answer clearly, in paragraphs"""
 
     messages = [{"role": "system", "content": system_prompt}]
 
@@ -165,7 +168,7 @@ def _hybrid_top_chunks(conn, question: str, chunks: list, top_k: int = CHAT_TOP_
     (cosine only -- no chunk matched lexically) or ``"hybrid"`` (both
     contributed), mirroring ``routers/search.py``'s convention.
     """
-    model = (Config.LLM_EMBED_MODEL or "").strip()
+    model = Config.embed_model()
     if not model or not chunks:
         return _rag.bm25_search(question, chunks, top_k=top_k), "bm25"
 
@@ -227,9 +230,9 @@ def _hybrid_top_chunks(conn, question: str, chunks: list, top_k: int = CHAT_TOP_
 async def research_chat_ask(req: ChatRequest):
     """Beantwortet eine Frage basierend auf den angegebenen Papieren (RAG)."""
     if not req.paper_ids:
-        raise HTTPException(status_code=400, detail="Keine Paper ausgewaehlt")
+        raise HTTPException(status_code=400, detail="error.no_items_selected")
     if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Keine Frage gestellt")
+        raise HTTPException(status_code=400, detail="error.no_question")
 
     conn = _get_conn()
     try:
@@ -242,7 +245,7 @@ async def research_chat_ask(req: ChatRequest):
         paper_info = {p["id"]: dict(p) for p in papers}
 
         if not paper_info:
-            raise HTTPException(status_code=404, detail="Keine der angegebenen Paper gefunden")
+            raise HTTPException(status_code=404, detail="error.none_of_the_items_found")
 
         # Chunks laden
         chunks = conn.execute(
@@ -367,7 +370,7 @@ async def chunk_status(paper_ids: str = Query(...)):
     try:
         ids = [int(x.strip()) for x in paper_ids.split(",") if x.strip()]
     except ValueError:
-        raise HTTPException(status_code=400, detail="Ungueltige Paper-IDs")
+        raise HTTPException(status_code=400, detail="error.invalid_item_ids")
 
     if not ids:
         return {"papers": [], "all_chunked": True}

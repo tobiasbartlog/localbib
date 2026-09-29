@@ -30,7 +30,7 @@ describe('Update-Hinweis ohne Ein-Klick-Weg', () => {
             return el;
         });
         expect(link.getAttribute('href')).toBe(RELEASE_PAGE);
-        expect(link.textContent).toContain('Release-Seite');
+        expect(link.textContent).toContain('release page');
         expect(document.querySelector('[data-testid="update-now"]')).toBeNull();
     });
 });

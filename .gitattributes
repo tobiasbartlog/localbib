@@ -1,0 +1,5 @@
+# Fixture PDFs are byte-exact. They are small and hand-written, so they contain
+# no NUL byte and git's heuristic would call them text and rewrite their line
+# endings on checkout — which moves every xref offset and changes the SHA256 the
+# migration tests assert. Never convert them.
+tests/fixtures/**/*.pdf -text

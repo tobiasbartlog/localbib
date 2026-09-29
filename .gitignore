@@ -1,4 +1,6 @@
 /.env
+/llm.json
+/plugins.json
 /ToDO.txt
 
 # Claude Code internal worktrees

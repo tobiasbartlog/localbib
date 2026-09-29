@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://localbib.app/schemas/plugin-manifest/2.json",
+  "title": "LocalBib Add-on Manifest (Add-on Contract 2)",
+  "description": "The plugin.json at the root of an Add-on Bundle. Validated by plugin_api.validate_manifest (stdlib subset interpreter) and, optionally, by any JSON Schema validator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "version",
+    "author",
+    "license",
+    "tagline",
+    "languages",
+    "default_language",
+    "api_version",
+    "min_core",
+    "python",
+    "permissions",
+    "frontend"
+  ],
+  "properties": {
+    "$schema": {"type": "string"},
+    "id": {
+      "description": "Add-on id: Python package name, route segment, and the namespace prefix of view keys, slots, locale keys and CSS classes.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{1,39}$"
+    },
+    "name": {"type": "string", "minLength": 1, "maxLength": 60},
+    "version": {"$ref": "#/$defs/semver"},
+    "author": {"type": "string", "minLength": 1},
+    "license": {
+      "description": "SPDX license expression.",
+      "type": "string",
+      "minLength": 1
+    },
+    "homepage": {"type": "string", "pattern": "^https?://"},
+    "tagline": {"type": "string", "minLength": 1, "maxLength": 80},
+    "description": {"description": "Markdown.", "type": "string"},
+    "languages": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/language"}
+    },
+    "default_language": {"$ref": "#/$defs/language"},
+    "api_version": {
+      "description": "Add-on Contract version the Add-on is built against (plugin_api.API_VERSION).",
+      "type": "integer",
+      "minimum": 2
+    },
+    "min_core": {"$ref": "#/$defs/semver"},
+    "python": {
+      "description": "'any' for a pure Bundle, otherwise the exact Python build tag, e.g. cp313-win_amd64.",
+      "type": "string",
+      "pattern": "^(any|cp[0-9]{2,3}-[a-z0-9_]+)$"
+    },
+    "permissions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "library.read",
+          "library.write",
+          "llm",
+          "settings.core",
+          "network",
+          "files",
+          "storage"
+        ]
+      }
+    },
+    "settings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["key", "type", "label"],
+        "properties": {
+          "key": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+          "type": {"enum": ["string", "secret", "path", "bool"]},
+          "label": {"description": "Locale key of the field label.", "type": "string", "minLength": 1},
+          "default": {"type": ["string", "boolean", "null"]}
+        }
+      }
+    },
+    "frontend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["script"],
+      "properties": {
+        "script": {"$ref": "#/$defs/frontend_path"},
+        "stylesheet": {"$ref": "#/$defs/frontend_path"},
+        "assets": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/frontend_path"}},
+        "locales": {
+          "description": "Language code -> locale file, relative to the Bundle root.",
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/frontend_path"}
+        }
+      }
+    },
+    "nav": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "route", "view"],
+      "properties": {
+        "label": {"description": "Locale key of the sidebar label.", "type": "string", "minLength": 1},
+        "icon": {"description": "Inline SVG markup.", "type": "string"},
+        "route": {"type": "string", "pattern": "^/[a-z][a-z0-9_]*(/.*)?$"},
+        "view": {"type": "string", "minLength": 1}
+      }
+    },
+    "slots": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "item-list-filter",
+          "item-detail-aside",
+          "research-chat-context",
+          "settings"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "language": {"type": "string", "pattern": "^[a-z]{2}$"},
+    "frontend_path": {
+      "description": "A relative POSIX path inside the Bundle's frontend/ folder.",
+      "type": "string",
+      "pattern": "^frontend/(?!.*\\.\\.)[^\\\\:]+$"
+    }
+  }
+}

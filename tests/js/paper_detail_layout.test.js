@@ -60,24 +60,24 @@ describe('paper detail layout', () => {
         expect(panel.parentElement).toBe(assembly);
         expect(content.contains(panel)).toBe(false);
 
-        // Viewer, and the filename plus "PDF oeffnen" live in the panel header.
+        // Viewer, and the filename plus "Open PDF" live in the panel header.
         const frame = q('pdf-frame');
         expect(frame).toBeTruthy();
         expect(frame.getAttribute('src')).toContain('/api/papers/71/pdf');
         expect(panel.textContent).toContain('ritter-2026.pdf');
 
-        const openBtn = findByText('button', 'PDF oeffnen');
+        const openBtn = findByText('button', 'Open PDF');
         expect(openBtn).toBeTruthy();
         expect(panel.contains(openBtn)).toBe(true);
         expect(document.querySelector('.lb-modal-head').contains(openBtn)).toBe(false);
 
         // The metadata edit form stays in the content column: opening it must
         // not move it into the narrow sidebar.
-        document.querySelector('button[aria-label="Mehr"]').click();
+        document.querySelector('button[aria-label="More"]').click();
         await flush();
-        findByText('button', 'Bearbeiten').click();
+        findByText('button', 'Edit').click();
         await flush();
-        const form = findByText('h4', 'Metadaten bearbeiten');
+        const form = findByText('h4', 'Edit metadata');
         expect(form).toBeTruthy();
         expect(content.contains(form)).toBe(true);
     });
@@ -96,12 +96,12 @@ describe('paper detail layout', () => {
         const drop = q('pdf-drop-zone');
         expect(drop).toBeTruthy();
         const dropButtons = [...drop.querySelectorAll('button')].map((b) => b.textContent.trim());
-        expect(dropButtons).toContain('PDF anhaengen');
-        expect(dropButtons).toContain('PDF aus Open Access');
+        expect(dropButtons).toContain('Attach PDF');
+        expect(dropButtons).toContain('PDF from Open Access');
         const scholar = [...drop.querySelectorAll('a')]
             .find((a) => (a.getAttribute('href') || '').includes('scholar.google.com'));
         expect(scholar).toBeTruthy();
-        expect(panel.querySelector('.lb-pdf-head').textContent).not.toContain('PDF anhaengen');
+        expect(panel.querySelector('.lb-pdf-head').textContent).not.toContain('Attach PDF');
     });
 
     it('swallows a click in the gap and still closes on the backdrop beside it', async () => {

@@ -1,0 +1,18 @@
+{
+  "hello.nav.label": "Hello",
+  "hello.view.title": "Hello",
+  "hello.view.intro": "A minimal Add-on that greets your Items.",
+  "hello.aside.label": "Greeting for",
+  "hello.settings.salutation": "Salutation",
+  "hello.view.open": "Open a greeting",
+  "hello.greeting.title": "Greeting no. {id}",
+  "hello.greeting.back": "Back",
+  "hello.settings.api_key": "Greeting service key",
+  "hello.settings.greetings_folder": "Greetings folder",
+  "hello.settings.shout": "Greet in capitals",
+  "hello.filter.label": "Greeting",
+  "hello.filter.all": "All Items",
+  "hello.filter.greeted": "Greeted Items",
+  "hello.chat.label": "Include greetings",
+  "hello.chat.block": "Greetings the user has sent so far."
+}

@@ -14,6 +14,7 @@ import pytest
 import embedding_index
 import import_indexing
 from literature_manager import Config
+from tests.llm_helpers import configure_llm, llm_off
 
 
 # ---------------------------------------------------------------------------
@@ -115,19 +116,19 @@ class TestDocumentText:
 
 class TestEmbedPaperToDb:
     def test_no_model_configured_returns_false_without_http(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         with patch.object(embedding_index, "embed_texts") as mock_embed:
             assert embedding_index.embed_paper_to_db(seed_paper) is False
         mock_embed.assert_not_called()
 
     def test_unknown_paper_returns_false(self, db, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts") as mock_embed:
             assert embedding_index.embed_paper_to_db(999999) is False
         mock_embed.assert_not_called()
 
     def test_success_stores_vector(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2, 0.3]]) as mock_embed:
             assert embedding_index.embed_paper_to_db(seed_paper) is True
         mock_embed.assert_called_once()
@@ -145,14 +146,14 @@ class TestEmbedPaperToDb:
         assert embedding_index.unpack_vector(row["vector"]) == pytest.approx([0.1, 0.2, 0.3], abs=1e-5)
 
     def test_idempotent_skips_second_call(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]) as mock_embed:
             assert embedding_index.embed_paper_to_db(seed_paper) is True
             assert embedding_index.embed_paper_to_db(seed_paper) is True
         assert mock_embed.call_count == 1
 
     def test_http_failure_degrades_to_false(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", side_effect=RuntimeError("gateway down")):
             assert embedding_index.embed_paper_to_db(seed_paper) is False
 
@@ -163,12 +164,12 @@ class TestEmbedPaperToDb:
 
 class TestReindexPapers:
     def test_no_model_configured_degrades(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         result = embedding_index.reindex_papers()
         assert result == {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
 
     def test_indexes_all_papers(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
             result = embedding_index.reindex_papers()
         assert result["indexed"] == 1
@@ -178,7 +179,7 @@ class TestReindexPapers:
         assert result["dim"] == 2
 
     def test_second_run_is_noop(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]) as mock_embed:
             embedding_index.reindex_papers()
             result = embedding_index.reindex_papers()
@@ -187,18 +188,18 @@ class TestReindexPapers:
         assert mock_embed.call_count == 1  # zweiter Lauf ruft embed_texts gar nicht mehr auf
 
     def test_paper_without_abstract_or_chunks_falls_back_to_title(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.5]]) as mock_embed:
             embedding_index.reindex_papers()
         texts_sent = mock_embed.call_args.args[0]
         assert texts_sent == ["Test Paper Title"]
 
     def test_model_switch_triggers_reembed(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "model-a")
+        configure_llm(monkeypatch, embedding="model-a")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1]]):
             embedding_index.reindex_papers()
 
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "model-b")
+        configure_llm(monkeypatch, embedding="model-b")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.2, 0.3]]) as mock_embed:
             result = embedding_index.reindex_papers()
         assert result["indexed"] == 1
@@ -216,7 +217,7 @@ class TestReindexPapers:
         assert row["dim"] == 2
 
     def test_batch_error_counts_as_errors_not_crash(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", side_effect=RuntimeError("gateway down")):
             result = embedding_index.reindex_papers()
         assert result["errors"] == 1
@@ -276,12 +277,12 @@ def _insert_chunk(db, paper_id, chunk_text, chunk_index=0, page_start=1):
 
 class TestReindexChunks:
     def test_no_model_configured_degrades(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         result = embedding_index.reindex_chunks()
         assert result == {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
 
     def test_indexes_all_chunks(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _insert_chunk(db, seed_paper, "Erster Chunk.", chunk_index=0, page_start=1)
         _insert_chunk(db, seed_paper, "Zweiter Chunk.", chunk_index=1, page_start=2)
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2], [0.3, 0.4]]):
@@ -293,7 +294,7 @@ class TestReindexChunks:
         assert result["dim"] == 2
 
     def test_second_run_is_noop(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _insert_chunk(db, seed_paper, "Ein Chunk.")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]) as mock_embed:
             embedding_index.reindex_chunks()
@@ -305,7 +306,7 @@ class TestReindexChunks:
     def test_resumable_only_embeds_new_chunks(self, db, seed_paper, monkeypatch):
         """Idempotent + wiederaufnehmbar: a chunk added AFTER a first run is
         picked up on the next run without re-embedding the already-indexed one."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _insert_chunk(db, seed_paper, "Erster Chunk.")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]) as mock_embed:
             embedding_index.reindex_chunks()
@@ -320,7 +321,7 @@ class TestReindexChunks:
     def test_context_enriched_input_sent_to_embed_stored_chunk_text_unchanged(self, db, seed_paper, monkeypatch):
         """#102 AC: embedding input carries the paper context; the STORED
         paper_chunks.chunk_text stays byte-identical."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         conn = db._connect()
         try:
             conn.execute(
@@ -349,11 +350,11 @@ class TestReindexChunks:
 
     def test_model_switch_triggers_reembed(self, db, seed_paper, monkeypatch):
         chunk_id = _insert_chunk(db, seed_paper, "Ein Chunk.")
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "model-a")
+        configure_llm(monkeypatch, embedding="model-a")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1]]):
             embedding_index.reindex_chunks()
 
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "model-b")
+        configure_llm(monkeypatch, embedding="model-b")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.2, 0.3]]) as mock_embed:
             result = embedding_index.reindex_chunks()
         assert result["indexed"] == 1
@@ -371,7 +372,7 @@ class TestReindexChunks:
         assert row["dim"] == 2
 
     def test_batch_error_counts_as_errors_not_crash(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _insert_chunk(db, seed_paper, "Ein Chunk.")
         with patch.object(embedding_index, "embed_texts", side_effect=RuntimeError("gateway down")):
             result = embedding_index.reindex_chunks()
@@ -379,7 +380,7 @@ class TestReindexChunks:
         assert result["indexed"] == 0
 
     def test_no_chunks_is_a_noop(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts") as mock_embed:
             result = embedding_index.reindex_chunks()
         assert result == {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "test-embed-model", "dim": 0}
@@ -392,14 +393,14 @@ class TestReindexChunks:
 
 class TestEmbedChunksForPaper:
     def test_no_model_configured_degrades_to_zero(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         _insert_chunk(db, seed_paper, "Ein Chunk.")
         with patch.object(embedding_index, "embed_texts") as mock_embed:
             assert embedding_index.embed_chunks_for_paper(seed_paper) == 0
         mock_embed.assert_not_called()
 
     def test_embeds_only_this_papers_chunks(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         conn = db._connect()
         try:
             cur = conn.execute(
@@ -426,7 +427,7 @@ class TestEmbedChunksForPaper:
         assert len(rows) == 1
 
     def test_second_call_is_a_noop(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _insert_chunk(db, seed_paper, "Ein Chunk.")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]) as mock_embed:
             assert embedding_index.embed_chunks_for_paper(seed_paper) == 1
@@ -435,21 +436,21 @@ class TestEmbedChunksForPaper:
 
     def test_model_switch_reembeds(self, db, seed_paper, monkeypatch):
         _insert_chunk(db, seed_paper, "Ein Chunk.")
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "model-a")
+        configure_llm(monkeypatch, embedding="model-a")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1]]):
             embedding_index.embed_chunks_for_paper(seed_paper)
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "model-b")
+        configure_llm(monkeypatch, embedding="model-b")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.2, 0.3]]):
             assert embedding_index.embed_chunks_for_paper(seed_paper) == 1
 
     def test_gateway_failure_degrades_to_zero(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _insert_chunk(db, seed_paper, "Ein Chunk.")
         with patch.object(embedding_index, "embed_texts", side_effect=RuntimeError("gateway down")):
             assert embedding_index.embed_chunks_for_paper(seed_paper) == 0
 
     def test_unknown_paper_is_a_noop(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts") as mock_embed:
             assert embedding_index.embed_chunks_for_paper(999999) == 0
         mock_embed.assert_not_called()
@@ -457,7 +458,7 @@ class TestEmbedChunksForPaper:
     def test_reindex_chunks_afterwards_skips_what_the_import_hook_did(self, db, seed_paper, monkeypatch):
         """The import hook and the maintenance full run share one idempotency
         rule — a paper indexed at import time is 'skipped', not re-embedded."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _insert_chunk(db, seed_paper, "Ein Chunk.")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
             embedding_index.embed_chunks_for_paper(seed_paper)
@@ -476,7 +477,7 @@ class TestEmbedChunksForPaper:
 
 class TestEmbeddingStatus:
     def test_no_model_configured(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         status = embedding_index.embedding_status()
         assert status == {
             "indexed": 0, "total": 1, "model": "", "dim": 0,
@@ -484,7 +485,7 @@ class TestEmbeddingStatus:
         }
 
     def test_reports_n_of_m_and_dim(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2, 0.3, 0.4]]):
             embedding_index.embed_paper_to_db(seed_paper)
         status = embedding_index.embedding_status()
@@ -494,7 +495,7 @@ class TestEmbeddingStatus:
         }
 
     def test_reports_chunk_counts(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         conn = db._connect()
         try:
             conn.execute(
@@ -523,7 +524,7 @@ class TestEmbeddingStatus:
 
 class TestMaintenanceEmbeddingEndpoints:
     def test_status_endpoint(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
             embedding_index.embed_paper_to_db(seed_paper)
         resp = client.get("/api/maintenance/embeddings/status")
@@ -535,7 +536,7 @@ class TestMaintenanceEmbeddingEndpoints:
         }
 
     def test_status_endpoint_without_model(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         resp = client.get("/api/maintenance/embeddings/status")
         assert resp.status_code == 200
         assert resp.json() == {
@@ -544,7 +545,7 @@ class TestMaintenanceEmbeddingEndpoints:
         }
 
     def test_reindex_endpoint(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
             resp = client.post("/api/maintenance/embeddings/reindex")
         assert resp.status_code == 200
@@ -555,13 +556,13 @@ class TestMaintenanceEmbeddingEndpoints:
         assert body["dim"] == 2
 
     def test_reindex_endpoint_without_model_degrades(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         resp = client.post("/api/maintenance/embeddings/reindex")
         assert resp.status_code == 200
         assert resp.json() == {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
 
     def test_reindex_chunks_endpoint(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _insert_chunk(db, seed_paper, "Ein Chunk.")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
             resp = client.post("/api/maintenance/embeddings/reindex-chunks")
@@ -573,7 +574,7 @@ class TestMaintenanceEmbeddingEndpoints:
         assert body["dim"] == 2
 
     def test_reindex_chunks_endpoint_without_model_degrades(self, client, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         resp = client.post("/api/maintenance/embeddings/reindex-chunks")
         assert resp.status_code == 200
         assert resp.json() == {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
@@ -589,7 +590,7 @@ class TestImportPathDegradation:
         import importlib
 
         import_router = importlib.import_module("routers.import")
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
 
         with patch.object(import_indexing, "embed_paper_to_db", side_effect=RuntimeError("gateway down")), \
              patch.object(import_indexing, "embed_chunks_for_paper", side_effect=RuntimeError("gateway down")), \
@@ -620,7 +621,7 @@ class TestImportPathDegradation:
 
 class TestIndexPaperAfterImport:
     def test_builds_all_three_indexes(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(import_indexing, "chunk_paper_to_db", return_value=7), \
              patch.object(import_indexing, "embed_paper_to_db", return_value=True), \
              patch.object(import_indexing, "embed_chunks_for_paper", return_value=7) as mock_chunks:
@@ -631,7 +632,7 @@ class TestIndexPaperAfterImport:
     def test_chunk_vectors_are_built_for_a_freshly_chunked_paper(self, db, seed_paper, monkeypatch):
         """The #153 regression itself: chunks WITHOUT chunk_embeddings meant new
         papers silently fell back to BM25 until someone ran the reindex."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         with patch.object(import_indexing, "chunk_paper_to_db", side_effect=lambda pid, path: _insert_chunk(db, pid, "Frischer Chunk.") and 1), \
              patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
             result = import_indexing.index_paper_after_import(seed_paper, "irrelevant.pdf")
@@ -654,7 +655,7 @@ class TestIndexPaperAfterImport:
     )
     def test_never_raises_when_a_step_blows_up(self, db, seed_paper, monkeypatch, failing):
         """AC (#98/#153): a broken step degrades, it never blocks an import."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         defaults = {
             "chunk_paper_to_db": 3,
             "embed_paper_to_db": True,
@@ -683,7 +684,7 @@ class TestIndexPaperAfterImport:
             assert result["chunk_vectors"] == 0
 
     def test_without_model_only_chunks_are_built(self, db, seed_paper, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
         with patch.object(import_indexing, "chunk_paper_to_db", return_value=4), \
              patch.object(embedding_index, "embed_texts") as mock_embed:
             result = import_indexing.index_paper_after_import(seed_paper, "irrelevant.pdf")

@@ -16,7 +16,7 @@ describe('semantic search toggle (hidden without embedding model)', () => {
         document.body.innerHTML = '<div id="app"></div>';
         installFetchMock([
             { method: 'GET', url: /^\/api\/papers\?/, reply: PAPERS },
-            { method: 'GET', url: '/api/settings', reply: {} }, // no LLM_EMBED_MODEL
+            { method: 'GET', url: '/api/settings', reply: {} }, // defaultRoutes: embedding role unbound
             ...defaultRoutes(),
         ]);
         await import('../../static/app.js');

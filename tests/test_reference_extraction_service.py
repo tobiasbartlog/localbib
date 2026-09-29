@@ -12,6 +12,7 @@ import pytest
 
 import services.reference_extraction as ref_svc
 from llm_client import LLMClient
+from tests.llm_helpers import configure_llm, llm_off
 
 
 def _stub_llm(return_value: str = "", side_effect=None) -> LLMClient:
@@ -85,18 +86,16 @@ class TestFindReferenceSection:
 
 class TestLlmExtractReferences:
     def test_returns_empty_when_no_api_key(self, monkeypatch):
-        """Returns [] immediately when KICONNECT_API_KEY is not set."""
+        """Returns [] immediately when the fast role is not bound."""
         from literature_manager import Config
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", "")
+        llm_off(monkeypatch)
         result = ref_svc.llm_extract_references("some ref text")
         assert result == []
 
     def test_calls_llm_client_and_parses_json(self, monkeypatch):
         """Happy path: LLM returns valid JSON array → list of dicts."""
         from literature_manager import Config
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", "test-key")
-        monkeypatch.setattr(Config, "KICONNECT_API_URL", "http://fake-llm/v1")
-        monkeypatch.setattr(Config, "LLM_MODEL", "test-model")
+        configure_llm(monkeypatch)
 
         fake_response = '[{"title":"Paper A","authors":"Auth","year":2020,"journal":"J","doi":""}]'
         mock_llm = _stub_llm(fake_response)
@@ -111,9 +110,7 @@ class TestLlmExtractReferences:
     def test_chunks_long_text(self, monkeypatch):
         """Text longer than 15000 chars is split into chunks; all refs merged."""
         from literature_manager import Config
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", "test-key")
-        monkeypatch.setattr(Config, "KICONNECT_API_URL", "http://fake-llm/v1")
-        monkeypatch.setattr(Config, "LLM_MODEL", "test-model")
+        configure_llm(monkeypatch)
 
         chunk_result = '[{"title":"Ref","authors":"A","year":2022,"journal":"","doi":""}]'
         mock_llm = _stub_llm(chunk_result)
@@ -130,9 +127,7 @@ class TestLlmExtractReferences:
     def test_llm_error_returns_empty(self, monkeypatch):
         """LLM exception → returns [] without re-raising."""
         from literature_manager import Config
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", "test-key")
-        monkeypatch.setattr(Config, "KICONNECT_API_URL", "http://fake-llm/v1")
-        monkeypatch.setattr(Config, "LLM_MODEL", "test-model")
+        configure_llm(monkeypatch)
 
         mock_llm = _stub_llm(side_effect=RuntimeError("LLM error"))
 
@@ -144,9 +139,7 @@ class TestLlmExtractReferences:
     def test_llm_non_list_response_returns_empty(self, monkeypatch):
         """If LLM returns a dict instead of a list, returns []."""
         from literature_manager import Config
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", "test-key")
-        monkeypatch.setattr(Config, "KICONNECT_API_URL", "http://fake-llm/v1")
-        monkeypatch.setattr(Config, "LLM_MODEL", "test-model")
+        configure_llm(monkeypatch)
 
         mock_llm = _stub_llm('{"error": "not a list"}')
 

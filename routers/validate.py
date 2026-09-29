@@ -234,7 +234,7 @@ async def apply_doi(data: DoiApply):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (data.paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
 
         # DOI speichern
@@ -326,7 +326,7 @@ async def generate_abstract(paper_id: int):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
     finally:
         conn.close()
@@ -345,7 +345,7 @@ async def generate_abstract(paper_id: int):
             logging.info(f"📄 Abstract via CrossRef gefunden fuer Paper {paper_id}")
 
     # --- Schritt 2 & 3: LLM ---
-    if not abstract and Config.KICONNECT_API_KEY:
+    if not abstract and Config.llm_ready("fast"):
         # PDF-Text laden
         filepath = os.path.join(Config.ALL_DIR, os.path.basename(paper["filename"]))
         pdf_text = ""
@@ -413,14 +413,14 @@ async def ocr_paper(paper_id: int, pages: int = 10):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
     finally:
         conn.close()
 
     filepath = os.path.join(Config.ALL_DIR, os.path.basename(paper["filename"]))
     if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="PDF-Datei nicht gefunden")
+        raise HTTPException(status_code=404, detail="error.pdf_file_not_found")
 
     # 1. OCR ausfuehren (Text extrahieren)
     ocr_text = ocr_pdf(filepath, max_pages=pages)
@@ -447,7 +447,7 @@ async def ocr_paper(paper_id: int, pages: int = 10):
 
     # 4. LLM-Metadaten-Extraktion mit OCR-Text
     llm_data = {}
-    if Config.KICONNECT_API_KEY:
+    if Config.llm_ready("fast"):
         llm = llm_for("metadata_extract")
         llm_data = llm_extract_metadata(
             llm,

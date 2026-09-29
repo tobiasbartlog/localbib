@@ -20,6 +20,7 @@ import services.model_recommender as recommender
 import services.reference_extraction as ref_svc
 from literature_manager import Config
 from llm_client import TASK_MODELS, llm_for
+from tests.llm_helpers import configure_llm
 
 
 # ---------------------------------------------------------------------------
@@ -27,15 +28,13 @@ from llm_client import TASK_MODELS, llm_for
 # ---------------------------------------------------------------------------
 
 class TestConfigModelAccessors:
-    def test_fast_falls_back_to_reasoning_when_unset(self, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_MODEL", "big-model")
-        monkeypatch.setattr(Config, "LLM_MODEL_FAST", "")
+    def test_fast_falls_back_to_reasoning_when_unbound(self, monkeypatch):
+        configure_llm(monkeypatch, reasoning="big-model")
         assert Config.fast_model() == "big-model"
         assert Config.reasoning_model() == "big-model"
 
-    def test_fast_uses_fast_when_set(self, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_MODEL", "big-model")
-        monkeypatch.setattr(Config, "LLM_MODEL_FAST", "small-model")
+    def test_fast_uses_fast_when_bound(self, monkeypatch):
+        configure_llm(monkeypatch, reasoning="big-model", fast="small-model")
         assert Config.fast_model() == "small-model"
         assert Config.reasoning_model() == "big-model"
 
@@ -47,18 +46,16 @@ class TestReloadFromEnv:
 
         Seit #140 ist der ausgelieferte Default **leer** — ein Modellname ist
         anbieterspezifisch, und der Anbieter kommt erst aus dem Onboarding.
-        Einzige Quelle bleibt ``Config.reload_from_env()``."""
+        Einzige Quelle bleibt ``Config.reload_from_env()`` (heute: die
+        Lese-Migration der alten .env-Keys in das Verbindungsdokument)."""
         monkeypatch.delenv("LLM_MODEL", raising=False)
         old = {k: getattr(Config, k) for k in (
-            "LLM_PROVIDER", "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
-            "LLM_MODEL_FAST", "AVAILABLE_MODELS", "CROSSREF_MAILTO",
+            "LLM_DOCUMENT", "LLM_DOCUMENT_STORED", "CROSSREF_MAILTO",
             "WATCH_INTERVAL", "MAX_OCR_PAGES", "UNLOCK_PDFS",
-            "LLM_CHAT_URL", "LLM_MODELS_URL",
-            "KICONNECT_API_URL", "KICONNECT_API_KEY",
         )}
         try:
             Config.reload_from_env()
-            assert Config.LLM_MODEL == ""
+            assert Config.reasoning_model() == ""
         finally:
             for k, v in old.items():
                 setattr(Config, k, v)
@@ -71,8 +68,7 @@ class TestReloadFromEnv:
 class TestLlmForRouting:
     @pytest.fixture(autouse=True)
     def _models(self, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_MODEL", "big-model")
-        monkeypatch.setattr(Config, "LLM_MODEL_FAST", "small-model")
+        configure_llm(monkeypatch, reasoning="big-model", fast="small-model")
 
     def test_fast_tasks_use_fast_model(self):
         for task, tier in TASK_MODELS.items():
@@ -113,7 +109,7 @@ class TestSplitReferenceText:
         assert "".join(chunks) == text
 
     def test_wrapper_iterates_chunks(self, monkeypatch):
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", "key")
+        configure_llm(monkeypatch)
         calls = []
 
         def fake_single(chunk):
@@ -181,16 +177,21 @@ class TestParseLlmSuggestion:
 # ---------------------------------------------------------------------------
 
 class TestSuggestModelsEndpoint:
+    """The suggestion runs on ONE connection's list (the one the request
+    names — a draft here), never across connections."""
+
+    DRAFT = {"provider": "openai", "api_key": "k"}
+
     def test_llm_path(self, client, monkeypatch):
-        monkeypatch.setattr(Config, "AVAILABLE_MODELS", ["big", "small"])
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", "key")
+        monkeypatch.setattr("routers.llm.fetch_models", lambda base, key: (["big", "small"], None))
+        monkeypatch.setattr(Config, "llm_ready", classmethod(lambda cls, tier: True))
 
         class FakeLLM:
             def complete(self, *a, **k):
                 return '{"reasoning": "big", "fast": "small", "reasoning_reason": "strong", "fast_reason": "quick"}'
 
-        monkeypatch.setattr("routers.settings.llm_for", lambda task, model=None: FakeLLM())
-        resp = client.post("/api/llm/suggest-models")
+        monkeypatch.setattr("routers.llm.llm_for", lambda task, model=None: FakeLLM())
+        resp = client.post("/api/llm/suggest-models", json=self.DRAFT)
         assert resp.status_code == 200
         sug = resp.json()["suggestion"]
         assert sug["source"] == "llm"
@@ -198,24 +199,34 @@ class TestSuggestModelsEndpoint:
         assert sug["fast"] == "small"
 
     def test_falls_back_to_heuristic_on_llm_error(self, client, monkeypatch):
-        monkeypatch.setattr(Config, "AVAILABLE_MODELS", ["gpt-5-pro", "gpt-4o-mini"])
-        monkeypatch.setattr(Config, "KICONNECT_API_KEY", "key")
+        monkeypatch.setattr("routers.llm.fetch_models", lambda base, key: (["gpt-5-pro", "gpt-4o-mini"], None))
+        monkeypatch.setattr(Config, "llm_ready", classmethod(lambda cls, tier: True))
 
         class BoomLLM:
             def complete(self, *a, **k):
                 raise RuntimeError("boom")
 
-        monkeypatch.setattr("routers.settings.llm_for", lambda task, model=None: BoomLLM())
-        resp = client.post("/api/llm/suggest-models")
+        monkeypatch.setattr("routers.llm.llm_for", lambda task, model=None: BoomLLM())
+        resp = client.post("/api/llm/suggest-models", json=self.DRAFT)
         assert resp.status_code == 200
         sug = resp.json()["suggestion"]
         assert sug["source"] == "heuristic"
         assert sug["reasoning"] == "gpt-5-pro"
 
-    def test_no_models_returns_error(self, client, monkeypatch):
-        monkeypatch.setattr(Config, "AVAILABLE_MODELS", [])
-        monkeypatch.setattr(Config, "LLM_API_KEY", "")
-        monkeypatch.setattr(Config, "LLM_MODELS_URL", "")
-        resp = client.post("/api/llm/suggest-models")
+    def test_without_reasoning_role_uses_the_heuristic(self, client, monkeypatch):
+        """A fresh install has nothing to ask yet — the name heuristic still
+        gives the user a starting point."""
+        monkeypatch.setattr("routers.llm.fetch_models", lambda base, key: (["gpt-5-pro", "gpt-4o-mini"], None))
+        monkeypatch.setattr(Config, "llm_ready", classmethod(lambda cls, tier: False))
+        resp = client.post("/api/llm/suggest-models", json=self.DRAFT)
+        assert resp.json()["suggestion"]["source"] == "heuristic"
+
+    def test_no_models_returns_the_probe_error(self, client, monkeypatch):
+        monkeypatch.setattr(
+            "routers.llm.fetch_models",
+            lambda base, key: ([], {"code": "error.llm.models.http", "params": {"status": 401}}),
+        )
+        resp = client.post("/api/llm/suggest-models", json=self.DRAFT)
         assert resp.status_code == 200
         assert resp.json()["suggestion"] is None
+        assert resp.json()["error"]["code"] == "error.llm.models.http"

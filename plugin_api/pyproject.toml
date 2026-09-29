@@ -1,0 +1,43 @@
+# localbib-plugin-api — the Add-on Contract as a standalone package (ADR-0021).
+#
+# This folder *is* the package: `package-dir` maps `plugin_api` onto it, so the
+# core keeps importing `plugin_api` straight from the repo while
+#     pip install -e plugin_api
+# installs the same files as a distribution. Runtime is stdlib-only; the
+# `schema` extra only adds a full JSON Schema validator for cross-checks.
+# Semver: major == plugin_api.API_VERSION.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localbib-plugin-api"
+version = "2.0.0"
+description = "The Add-on Contract of LocalBib: protocols, manifest schema and test fakes for Add-on authors."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+schema = ["jsonschema>=4"]
+test = ["pytest>=7"]
+# The localbib-addon CLI itself is stdlib + this package only (see addon_tool.py);
+# this extra is how an Add-on author asks for it explicitly.
+dev = []
+
+[project.scripts]
+localbib-addon = "plugin_api.addon_tool:main"
+
+[tool.setuptools]
+packages = ["plugin_api"]
+package-dir = {"plugin_api" = "."}
+
+[tool.setuptools.package-data]
+plugin_api = ["manifest.schema.json", "CHANGELOG.md", "README.md", "AUTHORING.md"]

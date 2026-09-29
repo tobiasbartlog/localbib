@@ -14,8 +14,10 @@ describe('LLM-off hint after skipping onboarding', () => {
         await import('../../static/app.js');
         await flush(); await flush(); await flush();
 
-        // Asked once, never again.
+        // Asked once, never again — neither the configuration page nor the
+        // migration offer that follows it (#178) comes back on a reload.
         expect(document.querySelector('[data-testid="onboarding-dialog"]')).toBeFalsy();
+        expect(document.querySelector('[data-testid="onboarding-migrate-zotero_rdf"]')).toBeFalsy();
 
         const hint = document.querySelector('[data-testid="llm-off-hint"]');
         expect(hint).toBeTruthy();

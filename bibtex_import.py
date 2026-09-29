@@ -57,6 +57,27 @@ def parse_bib(text: str) -> list[dict]:
     return entries
 
 
+def parse_bib_verbatim(text: str) -> dict[str, dict]:
+    """Cite key → the entry's fields **exactly as written**, no LaTeX→Unicode pass.
+
+    ``parse_bib`` runs ``convert_to_unicode`` because a bibliographic field is
+    LaTeX: ``M\\"uller`` must become ``Müller``. A local file path is not LaTeX,
+    and the same pass eats it — ``C:\\citavi\\y.pdf`` turns into a combining
+    cedilla. The migration adapters (PRD #173) therefore read the untouched
+    record for the ``file`` field and keep the converted one for everything a
+    human reads. Entries without a key are skipped, like in ``parse_bib``.
+    """
+    parser = BibTexParser(common_strings=True)
+    parser.ignore_nonstandard_types = False
+    database = bibtexparser.loads(text, parser=parser)
+    out: dict[str, dict] = {}
+    for record in database.entries:
+        key = (record.get("ID") or "").strip()
+        if key:
+            out[key] = dict(record)
+    return out
+
+
 def extract_cited_keys(tex: str) -> set[str]:
     """Cite keys referenced by \\cite-family commands in LaTeX source
     (comment-stripped, comma lists split)."""

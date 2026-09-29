@@ -1,66 +1,69 @@
+"""Migration of the flat .env provider keys into the connection document.
+
+An installation that predates llm.json carries LLM_PROVIDER / LLM_API_KEY /
+LLM_BASE_URL / LLM_MODEL in its .env. ``Config.reload_from_env`` turns them
+into one connection ``default`` (read-only — nothing is written until the
+user saves the LLM tab), so every old install keeps working untouched.
+"""
 import pytest
 
 from literature_manager import Config
 
+_LEGACY = ("LLM_PROVIDER", "LLM_BASE_URL", "LLM_API_KEY", "KICONNECT_API_KEY",
+           "LLM_MODEL", "LLM_MODEL_FAST", "LLM_EMBED_MODEL", "LLM_EMBED_URL")
+
 
 @pytest.fixture
-def restore_llm_config():
-    """Snapshot and restore the mutable LLM-related Config attributes."""
-    snap = {
-        k: getattr(Config, k)
-        for k in (
-            "LLM_PROVIDER",
-            "LLM_BASE_URL",
-            "LLM_API_KEY",
-            "LLM_CHAT_URL",
-            "LLM_MODELS_URL",
-            "KICONNECT_API_URL",
-            "KICONNECT_API_KEY",
-        )
-    }
-    yield
-    for k, v in snap.items():
-        setattr(Config, k, v)
+def legacy_env(monkeypatch):
+    """A clean legacy environment: set what a test needs, reload, restore."""
+    for key in _LEGACY:
+        monkeypatch.delenv(key, raising=False)
+
+    def apply(**env):
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        Config.reload_from_env()
+        return Config
+
+    yield apply
+    monkeypatch.undo()
+    Config.reload_from_env()
 
 
-def test_preset_resolves_to_openai_compatible_endpoints(restore_llm_config):
-    Config.LLM_PROVIDER = "openrouter"
-    Config.LLM_BASE_URL = ""
-    Config.LLM_API_KEY = "sk-test"
-    Config.resolve_llm()
-
-    assert Config.LLM_CHAT_URL == "https://openrouter.ai/api/v1/chat/completions"
-    assert Config.LLM_MODELS_URL == "https://openrouter.ai/api/v1/models"
-    # Backward-compat aliases stay in sync with the resolved provider
-    assert Config.KICONNECT_API_URL == Config.LLM_CHAT_URL
-    assert Config.KICONNECT_API_KEY == "sk-test"
+def test_preset_resolves_to_openai_compatible_endpoints(legacy_env):
+    cfg = legacy_env(LLM_PROVIDER="openrouter", LLM_API_KEY="sk-test", LLM_MODEL="m")
+    ep = cfg.llm_endpoint("reasoning")
+    assert ep["chat_url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert ep["models_url"] == "https://openrouter.ai/api/v1/models"
+    assert ep["api_key"] == "sk-test"
+    assert ep["connection_id"] == "default"
 
 
-def test_custom_base_url_overrides_preset(restore_llm_config):
-    Config.LLM_PROVIDER = "custom"
-    Config.LLM_BASE_URL = "http://localhost:11434/v1/"  # trailing slash trimmed
-    Config.LLM_API_KEY = ""
-    Config.resolve_llm()
-
-    assert Config.LLM_CHAT_URL == "http://localhost:11434/v1/chat/completions"
-    assert Config.LLM_MODELS_URL == "http://localhost:11434/v1/models"
-
-
-def test_base_url_override_applies_to_named_preset(restore_llm_config):
-    Config.LLM_PROVIDER = "openai"
-    Config.LLM_BASE_URL = "https://proxy.example.com/v1"
-    Config.LLM_API_KEY = "key"
-    Config.resolve_llm()
-
-    assert Config.LLM_CHAT_URL == "https://proxy.example.com/v1/chat/completions"
+def test_custom_base_url_overrides_preset(legacy_env):
+    cfg = legacy_env(LLM_PROVIDER="custom", LLM_BASE_URL="http://localhost:11434/v1/",  # trailing slash trimmed
+                     LLM_MODEL="llama3")
+    ep = cfg.llm_endpoint("reasoning")
+    assert ep["chat_url"] == "http://localhost:11434/v1/chat/completions"
+    assert ep["models_url"] == "http://localhost:11434/v1/models"
+    # Keyless is a valid, READY configuration (Ollama).
+    assert ep["api_key"] == ""
+    assert cfg.llm_ready("reasoning")
 
 
-def test_api_key_falls_back_to_kiconnect_env(monkeypatch, restore_llm_config):
-    monkeypatch.setenv("KICONNECT_API_KEY", "legacy-key")
-    Config.LLM_PROVIDER = "kiconnect"
-    Config.LLM_BASE_URL = ""
-    Config.LLM_API_KEY = ""
-    Config.resolve_llm()
+def test_base_url_override_applies_to_named_preset(legacy_env):
+    cfg = legacy_env(LLM_PROVIDER="openai", LLM_BASE_URL="https://proxy.example.com/v1",
+                     LLM_API_KEY="key", LLM_MODEL="m")
+    assert cfg.llm_endpoint("reasoning")["chat_url"] == "https://proxy.example.com/v1/chat/completions"
 
-    assert Config.LLM_API_KEY == "legacy-key"
-    assert Config.KICONNECT_API_KEY == "legacy-key"
+
+def test_api_key_falls_back_to_kiconnect_env(legacy_env):
+    cfg = legacy_env(KICONNECT_API_KEY="legacy-key", LLM_PROVIDER="kiconnect", LLM_MODEL="m")
+    assert cfg.llm_endpoint("reasoning")["api_key"] == "legacy-key"
+
+
+def test_provider_without_model_is_migrated_but_not_ready(legacy_env):
+    """The onboarding used to store provider + key without a model; that is
+    a connection (so onboarding will not ask again) with nothing bound."""
+    cfg = legacy_env(LLM_PROVIDER="openai", LLM_API_KEY="k")
+    assert cfg.llm_status()["connections"] == 1
+    assert cfg.llm_ready("reasoning") is False

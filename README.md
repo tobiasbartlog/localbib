@@ -1,18 +1,16 @@
 # LocalBib
 
-**Automatisches Tagging und Kategorisierung wissenschaftlicher PDFs** — für
-Promovierende, Studierende und alle, die eine wachsende PDF-Sammlung
-durchsuchbar und kategorisiert halten wollen, ohne sich in einen
-Cloud-Referenzmanager einzuloggen. PDFs landen in einem Ordner, LocalBib
-erkennt die DOI, holt Titel/Autoren/Abstract von CrossRef, lässt ein LLM
-deiner Wahl die Kategorien zuweisen und legt Symlinks in deiner eigenen
-Ordnerstruktur an. Alles läuft lokal, auf deinem Rechner, in deiner eigenen
-SQLite-Datenbank.
+**Automatic tagging and categorisation of academic PDFs** — for doctoral
+researchers, students and anyone who wants a growing PDF collection to stay
+searchable and categorised without logging into a cloud reference manager.
+PDFs land in a folder, LocalBib detects the DOI, fetches title/authors/abstract
+from CrossRef, lets an LLM of your choice assign the categories, and creates
+symlinks in your own folder structure. Everything runs locally, on your
+machine, in your own SQLite database.
 
-**Quellcode (AGPL-3.0)** — frei nutzbar, selbst hostbar, kein Feature-Gating,
-kein Zwangs-Account. Ein vorcompiliertes **Windows-Installationsprogramm
-(.exe)** ist als Convenience-Build erhältlich, für alle, die kein Python
-aufsetzen wollen.
+**Source code (AGPL-3.0)** — free to use, free to self-host, no feature gating,
+no forced account. A precompiled **Windows installer (.exe)** is available as a
+convenience build for anyone who would rather not set up Python.
 
 ---
 
@@ -20,189 +18,193 @@ aufsetzen wollen.
 
 <p align="center">
   <a href="static/screenshots/wissensnetz.png">
-    <img src="static/screenshots/wissensnetz.png" width="100%" alt="Wissensnetz: Zitationsgraph aus 34 eigenen Papern und 3749 Referenzen mit Legende und Filtern">
+    <img src="static/screenshots/wissensnetz.png" width="100%" alt="Knowledge network: citation graph of 34 own items and 3749 references with legend and filters">
   </a><br>
-  <sub><b>Wissensnetz</b> — was deine Sammlung zitiert und wo sie sich überschneidet.
-  Suchtiefe 1–5, gemeinsame Quellen hervorgehoben, fehlende Paper sichtbar.</sub>
+  <sub><b>Knowledge network</b> — what your collection cites and where it overlaps.
+  Search depth 1–5, shared sources highlighted, missing items made visible.</sub>
 </p>
 
 <table>
   <tr>
     <td width="50%" valign="top">
       <a href="static/screenshots/paper-chat.png">
-        <img src="static/screenshots/paper-chat.png" width="100%" alt="Knoten-Popover im Zitationsgraph mit Abstract und darunter der Paper-Chat">
+        <img src="static/screenshots/paper-chat.png" width="100%" alt="Node popover in the citation graph showing an abstract, with the item chat below it">
       </a><br>
-      <sub><b>Paper-Chat aus dem Graphen</b> — Knoten anklicken, Abstract lesen,
-      direkt zu diesem Paper weiterfragen.</sub>
+      <sub><b>Item chat from the graph</b> — click a node, read the abstract,
+      keep asking about that item right there.</sub>
     </td>
     <td width="50%" valign="top">
       <a href="static/screenshots/research-chat.png">
-        <img src="static/screenshots/research-chat.png" width="100%" alt="Research Chat: Antwort über mehrere Paper mit Quellenverweisen Q1 bis Q3">
+        <img src="static/screenshots/research-chat.png" width="100%" alt="Research Chat: an answer spanning several items with source references Q1 to Q3">
       </a><br>
-      <sub><b>Research Chat</b> — Fragen über mehrere Paper hinweg, jede Aussage
-      mit Beleg auf die Textstelle, aus der sie stammt.</sub>
+      <sub><b>Research Chat</b> — questions across many items, every statement
+      backed by the passage it came from.</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <a href="static/screenshots/bibliothek.png">
-        <img src="static/screenshots/bibliothek.png" width="100%" alt="Bibliothek: Paperliste mit Kategorien-Sidebar im hellen Modus">
+        <img src="static/screenshots/bibliothek.png" width="100%" alt="Library: item list with the category sidebar in light mode">
       </a><br>
-      <sub><b>Bibliothek</b> — jedes Paper mit Jahr, Autoren, Abstract-Anriss und
-      automatisch vergebenen Kategorien; die Sidebar zählt mit.</sub>
+      <sub><b>Library</b> — every item with year, authors, an abstract snippet and
+      automatically assigned categories; the sidebar keeps count.</sub>
     </td>
     <td width="50%" valign="top">
       <a href="static/screenshots/bibliothek-dark.png">
-        <img src="static/screenshots/bibliothek-dark.png" width="100%" alt="Dieselbe Bibliothek im dunklen Modus mit semantischer Suche">
+        <img src="static/screenshots/bibliothek-dark.png" width="100%" alt="The same library in dark mode with semantic search">
       </a><br>
-      <sub><b>Dunkler Modus</b> — dieselbe Ansicht nachts, inklusive semantischer
-      Suche, die auch ohne wörtliche Treffer findet.</sub>
+      <sub><b>Dark mode</b> — the same view at night, including semantic search
+      that finds things without a literal keyword match.</sub>
     </td>
   </tr>
 </table>
 
 ---
 
-## App herunterladen (Windows-Installer)
+## Download the app (Windows installer)
 
-> **Fertiges Windows-Programm — kein Python, kein Terminal nötig.**
+> **A finished Windows program — no Python, no terminal required.**
 
-**14 Tage kostenlos testen, ganz ohne Lizenzschlüssel.** Lade den Installer
-herunter, installiere und nutze alle Funktionen 14 Tage lang uneingeschränkt.
+**Try it free for 14 days, without a license key.** Download the installer,
+install it, and use every feature for 14 days without restrictions.
 
-[**LocalBib kaufen (29,50 € einmalig)**](https://buy.polar.sh/polar_cl_ElgxYcLFsyVN4g0xWdBBGEV0tVh92y7XskHaS1hDgBD)
+[**Buy LocalBib (€29.50, one-off)**](https://buy.polar.sh/polar_cl_ElgxYcLFsyVN4g0xWdBBGEV0tVh92y7XskHaS1hDgBD)
 
-Danach fragt die App einmalig nach einem Lizenzschlüssel:
+After that the app asks once for a license key:
 
-- **29,50 € einmalig**, keine Abo, lebenslange Updates inklusive.
-- Ein Schlüssel gilt für **2 Geräte** (Aktivierungen).
-- Der Schlüssel wird **genau einmal** gegen den Polar-Store geprüft — danach
-  läuft LocalBib **für immer offline weiter**, ohne erneute Prüfung, ohne
-  Internetzwang, ohne Telemetrie.
-- Kein Kauf-Zwang zum Ausprobieren: der 14-Tage-Trial läuft ohne jede
-  Registrierung.
+- **€29.50 one-off**, no subscription, lifetime updates included.
+- One key covers **2 devices** (activations).
+- The key is checked against the Polar store **exactly once** — after that
+  LocalBib **keeps running offline forever**, with no re-check, no forced
+  internet connection, and no telemetry.
+- No purchase required to try it: the 14-day trial runs without any
+  registration.
 
-Der Installer selbst liegt als GitHub-Release-Asset `LocalBib-Setup-<version>.exe`
-bei den [Releases dieses Repositories](https://github.com/tobiasbartlog/localbib/releases) —
-öffentlich einsehbar, jederzeit nachprüfbar gegen den zu diesem Tag gehörenden
-Quellcode-Stand.
+The installer itself is published as the GitHub release asset
+`LocalBib-Setup-<version>.exe` under this repository's
+[Releases](https://github.com/tobiasbartlog/localbib/releases) — publicly
+visible and verifiable at any time against the source code belonging to that
+tag.
 
-### Der SmartScreen-Hinweis
+### About the SmartScreen warning
 
-Der Installer ist **nicht codesigniert** (Code-Signing kostet laufend Geld, das
-ein Solo-Projekt vor dem ersten Umsatz nicht ausgeben möchte). Windows zeigt
-deshalb beim ersten Start SmartScreen:
+The installer is **not code-signed** (code signing is a recurring cost a solo
+project would rather not carry before its first revenue). Windows therefore
+shows SmartScreen on first launch:
 
-1. **"Der Computer wurde durch Windows geschützt"**
-2. Klicke auf **"Weitere Informationen"**
-3. Klicke auf **"Trotzdem ausführen"**
+1. **"Windows protected your PC"**
+2. Click **"More info"**
+3. Click **"Run anyway"**
 
-Das ist normal für unsignierte, aber quelloffene Software — der komplette
-Quellcode liegt in diesem Repository und kann jederzeit geprüft werden. Wer
-dem Installer grundsätzlich nicht vertrauen möchte: siehe unten, Self-Host aus
-dem Quellcode braucht keinen Installer.
+That is normal for unsigned but open-source software — the complete source code
+is in this repository and can be inspected at any time. If you would rather not
+trust the installer at all: self-hosting from source, below, needs no installer.
 
 ---
 
 ## Features
 
-- **Watchdog**: Input-Ordner überwachen – PDFs rein, fertig
-- **DOI-Extraktion**: Automatische DOI-Erkennung + CrossRef-Metadaten (Titel, Autoren, Abstract, ...)
-- **OCR-Fallback**: Text auch aus gescannten PDFs
-- **LLM-Kategorisierung**: Automatische Zuordnung zu Kategorien über den LLM-Anbieter deiner Wahl
-- **Zitationsnetzwerk**: Verwandte Paper über OpenAlex entdecken
-- **Semantische Suche**: Hybrid aus Embeddings + BM25 (optional, nur mit konfiguriertem Embedding-Modell)
-- **SQLite-Datenbank**: Alle Metadaten + Zuordnungen, keine Cloud
-- **Symlinks**: Kategorie-Ordner mit Verknüpfungen zu den PDFs
-- **BibTeX-Export**: Direkt aus der DB exportieren
-- **Automatische Umbenennung**: `YYYY_Nachname_Titel.pdf`
+- **Watchdog**: watches an input folder — drop PDFs in, done
+- **DOI extraction**: automatic DOI detection plus CrossRef metadata (title, authors, abstract, …)
+- **OCR fallback**: text even from scanned PDFs
+- **LLM categorisation**: automatic assignment to categories via the LLM provider of your choice
+- **Citation network**: discover related work through OpenAlex
+- **Semantic search**: hybrid of embeddings + BM25 (optional, only with an embedding model configured)
+- **SQLite database**: all metadata and assignments, no cloud
+- **Symlinks**: category folders linking to the PDFs
+- **BibTeX export**: straight out of the database
+- **Automatic renaming**: `YYYY_Lastname_Title.pdf`
+- **Bilingual interface**: English and German, switchable in the settings
 
 ---
 
-## Self-Host (Python) — nie gated, nie im Trial, nie nach einem Schlüssel gefragt
+## Self-host (Python) — never gated, never on trial, never asked for a key
 
-Ein Self-Host-Install aus dem Quellcode ist an keiner Stelle an Trial oder
-Lizenzschlüssel gebunden — die AGPL-Freiheiten bleiben real, nicht nur auf
-dem Papier.
+A self-hosted install from source is never bound to a trial or a license key —
+the AGPL freedoms stay real, not just on paper.
 
 ### Installation
 
 ```bash
-# Repository klonen
+# Clone the repository
 git clone https://github.com/tobiasbartlog/localbib.git
 cd localbib
 
-# Dependencies installieren
+# Install dependencies
 pip install -r requirements.txt
 
-# Optional für Windows-Verknüpfungen:
+# Optional, for Windows shortcuts:
 pip install pywin32
 
-# .env Datei anlegen
+# Create the .env file
 copy .env.template .env   # Windows
 cp .env.template .env     # Linux/Mac
 ```
 
 ### Bring your own LLM key
 
-LocalBib liefert **bewusst keinen** LLM-Anbieter und **keinen** API-Key mit —
-du bringst deinen eigenen mit, bei einem Anbieter deiner Wahl. Beim ersten
-Start fragt das Onboarding danach; das lässt sich auch überspringen (die App
-bleibt nutzbar, nur die LLM-Funktionen bleiben dann aus) und jederzeit später
-in der `.env` oder unter Einstellungen nachtragen:
+LocalBib deliberately ships **no** LLM provider and **no** API key — you bring
+your own, from a provider of your choice. The first-run onboarding asks for it;
+you can skip that (the app stays usable, only the LLM features stay off) and
+set it up later under **Settings → LLM**. There you keep any number of
+*connections* (a provider account or a local endpoint, key optional) and bind
+the three *roles* — Reasoning, Simple tasks, Embedding — each to a connection
+and a model. Roles are independent: reasoning can run on OpenAI while
+embeddings run on a local Ollama. The configuration lives in `llm.json` next
+to your `.env`; keys never leave your machine.
 
-| Anbieter | `LLM_PROVIDER` | Key holen |
-|----------|----------------|-----------|
+| Provider | Preset | Get a key |
+|----------|--------|-----------|
 | OpenAI | `openai` | https://platform.openai.com/api-keys |
-| OpenRouter (viele Modelle, ein Key) | `openrouter` | https://openrouter.ai/keys |
+| OpenRouter (many models, one key) | `openrouter` | https://openrouter.ai/keys |
 | Groq | `groq` | https://console.groq.com/keys |
 | DeepSeek | `deepseek` | https://platform.deepseek.com/api_keys |
 | Mistral | `mistral` | https://console.mistral.ai/api-keys |
-| Lokal/eigener Endpunkt (z. B. Ollama) | `custom` + `LLM_BASE_URL` | — |
+| Local/own endpoint (e.g. Ollama) | `custom` + base URL | — (no key needed) |
 
-```
-LLM_PROVIDER=openai
-LLM_API_KEY=dein-key
-LLM_MODEL=gpt-4o
-```
+An older `.env` with `LLM_PROVIDER` / `LLM_API_KEY` / `LLM_MODEL` is picked up
+on start as one connection "default"; saving the LLM tab once moves it into
+`llm.json` and removes those keys from the `.env`.
 
-Zusätzlich frei lassbar (aber empfohlen): `CROSSREF_MAILTO` — deine eigene
-E-Mail-Adresse für den "polite pool" von CrossRef/OpenAlex (bessere
-Rate-Limits). Leer lassen heißt: es wird keine Adresse mitgeschickt, kein
-Ersatzwert wird untergeschoben.
+Optional but recommended: `CROSSREF_MAILTO` — your own email address for the
+CrossRef/OpenAlex "polite pool" (better rate limits). Leaving it empty means no
+address is sent; no substitute is slipped in.
 
-### Web-UI starten
+The interface language lives in `UI_LANGUAGE` (`en` or `de`, default `en`) and
+can also be switched at any time under Settings → Appearance.
+
+### Start the web UI
 
 ```bash
 python webapp.py
-# → Browser öffnen: http://localhost:8000
+# → open in a browser: http://localhost:8000
 ```
 
-### Schnellstart (CLI)
+### Quick start (CLI)
 
 ```bash
-# 1. Datenbank + Kategorien initialisieren
+# 1. Initialise the database and categories
 python literature_manager.py init
 
-# 2. PDFs in Input-Ordner legen
-#    Standard: ~/Literatur/input/
+# 2. Put PDFs into the input folder
+#    Default: ~/Literatur/input/
 
-# 3a. Einmalig importieren
+# 3a. Import once
 python literature_manager.py import
 
-# 3b. ODER: Ordner dauerhaft überwachen
+# 3b. OR: watch the folder continuously
 python literature_manager.py watch
 ```
 
-### Ordnerstruktur
+### Folder structure
 
 ```
 ~/Literatur/
-├── input/                  ← PDFs hier reinwerfen
-├── all/                    ← Alle PDFs (umbenannt)
+├── input/                  ← drop PDFs in here
+├── all/                    ← all PDFs (renamed)
 ├── kategorien/
 │   ├── Themen/
-│   │   ├── Lehm/           ← Symlinks
+│   │   ├── Lehm/           ← symlinks
 │   │   ├── 3D_Druck/
 │   │   ├── Materialeigenschaften/
 │   │   └── Dissertationen/
@@ -210,151 +212,173 @@ python literature_manager.py watch
 │   │   ├── LLM/
 │   │   └── World_Models/
 │   └── Dissertationen_Sammlung/
-├── literatur.db            ← SQLite-Datenbank
-└── literatur.bib           ← BibTeX (nach Export)
+├── literatur.db            ← SQLite database
+└── literatur.bib           ← BibTeX (after export)
 ```
 
-### Alle Befehle
+### All commands
 
-| Befehl | Beschreibung |
-|--------|-------------|
-| `init` | Datenbank + Standardkategorien erstellen |
-| `import` | PDFs aus Input-Ordner verarbeiten |
-| `watch` | Input-Ordner dauerhaft überwachen |
-| `list` | Alle Paper anzeigen |
-| `search "query"` | Paper suchen |
-| `categories` | Kategorien anzeigen |
-| `add-cat "Name" --parent ID --desc "..." --keywords "..."` | Neue Kategorie |
-| `bibtex [--output file.bib]` | BibTeX exportieren |
-| `rebuild` | Ordner + Symlinks neu aufbauen |
-| `stats` | Statistiken |
+| Command | Description |
+|---------|-------------|
+| `init` | Create the database and the default categories |
+| `import` | Process the PDFs in the input folder |
+| `watch` | Watch the input folder continuously |
+| `list` | Show all items |
+| `search "query"` | Search items |
+| `categories` | Show categories |
+| `add-cat "Name" --parent ID --desc "..." --keywords "..."` | New category |
+| `bibtex [--output file.bib]` | Export BibTeX |
+| `rebuild` | Rebuild folders and symlinks |
+| `stats` | Statistics |
 
-### Optionen
+### Options
 
 ```bash
-# Anderes Basis-Verzeichnis
+# A different base directory
 python literature_manager.py --dir "D:/Dissertation/Literatur" init
 
-# Verbose/Debug-Modus
+# Verbose/debug mode
 python literature_manager.py -v watch
 ```
 
-### Kategorien verwalten
+### Managing categories
 
 ```bash
-# Neue Unterkategorie hinzufügen (parent=1 ist "Themen")
-python literature_manager.py add-cat "Nachhaltigkeit" --parent 1 --desc "EPD, LCA, Ökobilanz" --keywords "sustainability, LCA, EPD, carbon"
+# Add a subcategory (parent=1 is "Themen")
+python literature_manager.py add-cat "Sustainability" --parent 1 --desc "EPD, LCA, life-cycle assessment" --keywords "sustainability, LCA, EPD, carbon"
 
-# Neue Oberkategorie
-python literature_manager.py add-cat "Methodik" --desc "Forschungsmethoden"
+# A new top-level category
+python literature_manager.py add-cat "Methodology" --desc "Research methods"
 ```
 
 ### Pipeline
 
 ```
-PDF im Input-Ordner
-  → SHA256-Hash (Duplikat-Check)
-  → Text extrahieren (PyMuPDF)
-  → DOI per Regex suchen
-  → CrossRef API → Metadaten (Titel, Autoren, Jahr, Abstract, Journal)
-  → Fallback: ISBN, Jahr aus Text
-  → LLM → Kategorien zuweisen
-  → Datei umbenennen → nach /all/ kopieren
-  → Symlinks in Kategorie-Ordnern erstellen
-  → Original aus /input/ löschen
+PDF in the input folder
+  → SHA256 hash (duplicate check)
+  → extract text (PyMuPDF)
+  → find the DOI by regex
+  → CrossRef API → metadata (title, authors, year, abstract, journal)
+  → fallback: ISBN, year from the text
+  → LLM → assign categories
+  → rename the file → copy into /all/
+  → create symlinks in the category folders
+  → delete the original from /input/
 ```
 
 ---
 
-## Agenten-API (externe Recherche)
+## Agent API (external research)
 
-Schlanke JSON-Endpunkte, damit ein externer Agent (z. B. Claude Code in einem
-anderen Projekt) die Bibliothek per `curl` abfragen kann — ohne Browser,
-ohne Session, ohne UI-Ballast. Voraussetzung: `python webapp.py` läuft.
+Lean JSON endpoints so an external agent (e.g. Claude Code in another project)
+can query the library with `curl` — no browser, no session, no UI ballast.
+Prerequisite: `python webapp.py` is running.
 
-- **Suche** (`/api/search/semantic`, `/api/search/passages`): semantisch
-  (Embeddings) + lexikalisch (BM25), per Reciprocal Rank Fusion kombiniert.
-  Ist kein `LLM_EMBED_MODEL` konfiguriert oder ist die Bibliothek noch nicht
-  indexiert, fällt die Suche kommentarlos auf rein lexikalisch zurück
-  (Antwortfeld `"mode"`: `"semantic"` / `"hybrid"` / `"bm25"`) — nie ein 500er.
-- **Abruf per Citekey** (`/api/search/reference/{citekey}`): löst einen
-  Treffer aus der Suche zu vollen Metadaten + Abstract auf.
-- **Chunk-Abruf per Citekey** (`/api/search/reference/{citekey}/chunks`):
-  paginierter Zugriff auf die rohen Textabschnitte eines Papers (mit
-  `page_start`/`page_end` — direkt zitierfähig).
+- **Search** (`/api/search/semantic`, `/api/search/passages`): semantic
+  (embeddings) + lexical (BM25), combined via reciprocal rank fusion. If the
+  Embedding role is not bound, or the library is not indexed yet, the
+  search falls back to purely lexical without comment (response field `"mode"`:
+  `"semantic"` / `"hybrid"` / `"bm25"`) — never a 500.
+- **Lookup by cite key** (`/api/search/reference/{citekey}`): resolves a search
+  hit to full metadata plus abstract.
+- **Chunk lookup by cite key** (`/api/search/reference/{citekey}/chunks`):
+  paginated access to an item's raw text passages (with `page_start`/`page_end`
+  — directly quotable).
 
 ```bash
-# Paper-Ebene: welche Paper sind relevant?
-curl "http://localhost:8000/api/search/semantic?q=Lehm+3D-Druck+Schichthaftung&top_k=5"
+# Item level: which items are relevant?
+curl "http://localhost:8000/api/search/semantic?q=earth+3D+printing+layer+adhesion&top_k=5"
 
-# Chunk-Ebene: welche Textstelle belegt das?
-curl "http://localhost:8000/api/search/passages?q=Lehm+3D-Druck+Schichthaftung&top_k=5"
+# Passage level: which passage supports that?
+curl "http://localhost:8000/api/search/passages?q=earth+3D+printing+layer+adhesion&top_k=5"
 
-# Volle Metadaten + Abstract zu einem Treffer
+# Full metadata plus abstract for one hit
 curl "http://localhost:8000/api/search/reference/Smith2023"
 
-# Rohe Chunks des gleichen Papers, seitenweise
+# Raw chunks of the same item, page by page
 curl "http://localhost:8000/api/search/reference/Smith2023/chunks?limit=20&offset=0"
 ```
 
-Beide Suchendpunkte akzeptieren auch `POST` mit JSON-Body (`{"q": "...",
-"top_k": 10}`) für lange/mehrzeilige Queries.
+Both search endpoints also accept `POST` with a JSON body (`{"q": "...",
+"top_k": 10}`) for long or multi-line queries.
 
-Für Plugins ist die gleiche Semantik zusätzlich über
-`plugin_api.LibraryApi.search_references()` erreichbar — semantisch
-gerankt, wenn ein Embedding-Modell konfiguriert und die Bibliothek indexiert
-ist, sonst lexikalischer Fallback (additiv, kein Breaking Change für
-bestehende Plugins).
-
----
+Plugins reach the same semantics through
+`plugin_api.LibraryApi.search_references()` — semantically ranked when an
+embedding model is configured and the library is indexed, lexical fallback
+otherwise (additive, no breaking change for existing plugins).
 
 ---
 
-## Lizenz
+## Add-ons in development (Dev-Suchpfad)
 
-Copyright © 2026 Tobias Bartlog. Das Repository trägt **zwei** Lizenzen:
+Add-ons are Bundles — a folder with a `plugin.json` Manifest, a Python package
+named after the Add-on id and an optional `frontend/` — that the core loads at
+runtime. They are not compiled into the `.exe`. Besides the installed Bundles,
+the core loads every folder on a **Dev-Suchpfad**:
 
-| Bereich | Lizenz | Datei |
-|---------|--------|-------|
-| Der gesamte Kern (App, Backend, SPA, CLI) | **AGPL-3.0** | [`LICENSE`](LICENSE) |
-| Das Plugin-Kontrakt-Paket `plugin_api/` | **MIT** | [`plugin_api/LICENSE`](plugin_api/LICENSE) |
+```bash
+# .env (or the environment); several folders separated by ; on Windows, : elsewhere
+LOCALBIB_PLUGIN_DEV_PATHS=path/to/my-addon
+```
 
-AGPL-3.0 für den Kern, weil PyMuPDF (die PDF-Engine) AGPL ist. Der Quellcode ist
-frei nutzbar, prüfbar und selbst baubar — es gibt kein Feature-Gating, keine
-abgespeckte Community-Edition und keinen Zwangs-Account. Der Windows-Installer
-oben ist ein bezahlter *Convenience*-Build derselben Software, kein
-zusätzliches Feature.
+Without a Dev-Suchpfad the core starts without that Add-on, silently. With it,
+the Add-on shows up under Settings -> Add-ons; switching it on asks for consent
+to the Berechtigungen its Manifest declares, and its settings (folders, keys)
+are edited there too. Its API lives under `/api/plugins/<id>/`, its data in the
+Add-on's own folder.
 
-### Plugins und die Plugin-API
+An Add-on's own checks run without the core:
 
-`plugin_api/` steht bewusst unter **MIT**, getrennt vom AGPL-Kern: Wer ein
-eigenes Plugin gegen diesen Kontrakt schreibt, kann es **frei lizenzieren** —
-der Kontrakt selbst legt dem Plugin keine Lizenz auf.
+```bash
+localbib-addon check path/to/my-addon          # Manifest, structure, locales
+cd path/to/my-addon && lint-imports            # imports only plugin_api
+pytest path/to/my-addon/tests                  # contract fakes, no core
+```
+---
 
-Zu beachten: Ein Plugin wird vom Kern per `importlib` geladen und läuft
-**in-process** mit dem AGPL-Kern. Für diese Konstellation ist eine
-**AGPL-kompatible Lizenzierung des Plugins empfohlen**. Das ist eine Empfehlung
-und keine Rechtsberatung; wer ein Plugin unter anderen Bedingungen ausliefern
-will, klärt das eigenverantwortlich.
+## License
 
-**Die Plugin-API ist als stabil erklärt.** `plugin_api` enthält ausschließlich
-Protocols/Dataclasses (Verträge, keine Laufzeitlogik) und ist über eine
-`API_VERSION`-Konstante versioniert (aktuell `1`); ein Plugin deklariert das
-von ihm benötigte Minimum in seinem Manifest. Ein Breaking Change an den
-Interfaces erhöht `API_VERSION` — bestehende Plugins brechen dadurch nicht
-stillschweigend.
+Copyright © 2026 Tobias Bartlog. The repository carries **two** licenses:
 
-Bewusst *nicht* entschieden: eine Plugin-Exception-Klausel auf dem AGPL-Kern
-(die proprietäre In-Process-Plugins eindeutig zulässig machen würde) gibt es
-nicht; die MIT-Aufteilung von `plugin_api/` hält diese Tür offen, ohne die
-Frage heute zu entscheiden. Ein Wechsel der PDF-Engine (`pypdfium2` statt
-PyMuPDF), der den Kern von der AGPL-Pflicht befreien würde, bleibt eine
-zukünftige Option, aber ungebaut.
+| Area | License | File |
+|------|---------|------|
+| The entire core (app, backend, SPA, CLI) | **AGPL-3.0** | [`LICENSE`](LICENSE) |
+| The plugin contract package `plugin_api/` | **MIT** | [`plugin_api/LICENSE`](plugin_api/LICENSE) |
+
+AGPL-3.0 for the core, because PyMuPDF (the PDF engine) is AGPL. The source
+code is free to use, to audit and to build yourself — there is no feature
+gating, no stripped-down community edition and no forced account. The Windows
+installer above is a paid *convenience* build of the same software, not an
+additional feature.
+
+### Plugins and the plugin API
+
+`plugin_api/` is deliberately **MIT**, separate from the AGPL core: anyone
+writing their own plugin against this contract can **license it freely** — the
+contract itself imposes no license on the plugin.
+
+Note that a plugin is loaded by the core via `importlib` and runs **in-process**
+with the AGPL core. For that constellation an **AGPL-compatible license for the
+plugin is recommended**. This is a recommendation, not legal advice; anyone who
+wants to ship a plugin under different terms should clarify that themselves.
+
+**The plugin API is declared stable.** `plugin_api` contains nothing but
+protocols and dataclasses (contracts, no runtime logic) and is versioned
+through an `API_VERSION` constant (currently `1`); a plugin declares the
+minimum it needs in its manifest. A breaking change to the interfaces raises
+`API_VERSION` — existing plugins do not break silently.
+
+Deliberately *not* decided: there is no plugin exception clause on the AGPL
+core (which would make proprietary in-process plugins unambiguously
+permissible); the MIT split of `plugin_api/` keeps that door open without
+settling the question today. Switching the PDF engine (`pypdfium2` instead of
+PyMuPDF), which would free the core from the AGPL obligation, remains a future
+option but is unbuilt.
 
 ---
 
-## Rechtliches
+## Legal
 
-[Impressum und Datenschutzerklärung](https://tobiasbartlog.github.io/literature-manager-v3/legal/)
+[Imprint and privacy policy](https://tobiasbartlog.github.io/literature-manager-v3/legal/)
 
-Kontakt: [support@localbib.com](mailto:support@localbib.com) · https://localbib.com
+Contact: [support@localbib.com](mailto:support@localbib.com) · https://localbib.com

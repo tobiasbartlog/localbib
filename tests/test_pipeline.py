@@ -145,6 +145,77 @@ class TestProcessPaper:
         assert row["isbn"] == "9783161484100"
 
 
+class TestNoPdfIsLost:
+    """A failure mid-import must never leave a DB row without its file — the
+    next run would take the input PDF for a duplicate and delete the only copy."""
+
+    def test_invented_category_id_does_not_abort_the_import(self, env):
+        db, input_dir, all_dir, mp = env
+        cid = db.add_category("AI", None)
+        # Real categorize_with_llm, fake LLM answer with an invented id and junk.
+        import llm_categorize
+
+        class FakeLLM:
+            def complete_json(self, *a, **k):
+                return [{"category_id": 9999, "confidence": 0.9}, "junk",
+                        {"category_id": str(cid), "confidence": 7}]
+
+        mp.setattr(Config, "llm_ready", classmethod(lambda cls, tier="reasoning": True))
+        mp.setattr(pipeline, "categorize_with_llm",
+                   lambda **k: llm_categorize.categorize_with_llm(**k, llm=FakeLLM()))
+        path = _make_pdf(input_dir)
+
+        pid = pipeline.process_paper(path, db)
+
+        assert pid is not None
+        assert [c["id"] for c in db.get_paper_categories(pid)] == [cid]
+        assert (all_dir / db.get_all_papers()[0]["filename"]).exists()
+        assert not Path(path).exists()
+
+    def test_failed_db_write_keeps_the_input_and_no_copy(self, env):
+        db, input_dir, all_dir, mp = env
+
+        def boom(data):
+            raise RuntimeError("db locked")
+
+        mp.setattr(db, "add_paper", boom)
+        path = _make_pdf(input_dir)
+
+        with pytest.raises(RuntimeError):
+            pipeline.process_paper(path, db)
+
+        assert Path(path).exists()
+        assert not list(all_dir.glob("*.pdf"))
+
+    def test_hash_duplicate_whose_copy_is_missing_is_restored(self, env):
+        db, input_dir, all_dir, mp = env
+        pid = pipeline.process_paper(_make_pdf(input_dir, "a.pdf"), db)
+        stored = all_dir / db.get_all_papers()[0]["filename"]
+        stored.unlink()  # a row without its file, as an interrupted run left it
+        again = _make_pdf(input_dir, "a.pdf")
+
+        assert pipeline.process_paper(again, db) is None
+
+        assert stored.exists()
+        assert not Path(again).exists()
+        assert len(db.get_all_papers()) == 1 and pid is not None
+
+
+class TestValidAssignments:
+    def test_keeps_only_known_ids_once_and_clamps_confidence(self):
+        from llm_categorize import valid_assignments
+
+        cats = [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]
+        raw = [{"category_id": 1, "confidence": 1.5}, {"category_id": 1, "confidence": 0.2},
+               {"category_id": "2"}, {"category_id": 3}, {"category_id": None}, [1], "x",
+               {"category_id": 2, "confidence": "high"}]
+
+        assert valid_assignments(raw, cats) == [
+            {"category_id": 1, "confidence": 1.0},
+            {"category_id": 2, "confidence": 0.0},
+        ]
+
+
 class TestPostImportIndexing:
     """#153: the classic path (CLI ``import``/``watch``, POST /api/import/process,
     POST /api/import/upload) all go through ``process_paper`` — so the index hook

@@ -1,7 +1,7 @@
 // Smoke (#140): on a fresh install the onboarding dialog appears, and
 // skipping it records that we asked without configuring anything.
 // app.js self-mounts once per test file, so the "already onboarded" case lives
-// in its own file (onboarding_done.test.js).
+// in its own file (onboarding_existing_install.test.js).
 import { describe, it, expect } from 'vitest';
 import { installFetchMock, defaultRoutes, flush } from './helpers.js';
 
@@ -30,9 +30,13 @@ describe('first-run onboarding', () => {
         const put = calls.find((c) => c.method === 'PUT' && c.url === '/api/settings');
         expect(put).toBeTruthy();
         expect(put.body.ONBOARDING_COMPLETED).toBe('true');
-        // Skipping configures nothing.
-        expect(put.body.LLM_API_KEY).toBeFalsy();
-        // Dialog is gone; the app underneath stays usable.
+        // Skipping configures no LLM connection.
+        expect(calls.some((c) => c.method === 'PUT' && c.url === '/api/llm/config')).toBe(false);
+        // The configuration page is done; what remains is the migration offer
+        // (#178), which is closable and never blocks the app underneath.
+        expect(document.querySelector('[data-testid="onboarding-provider"]')).toBeFalsy();
+        document.querySelector('[data-testid="onboarding-migrate-later"]').click();
+        await flush();
         expect(document.querySelector('[data-testid="onboarding-dialog"]')).toBeFalsy();
     });
 });

@@ -15,7 +15,8 @@ describe('Kaufhinweis während der Testphase', () => {
                     activated: false,
                     key: '',
                     checkout_url: 'https://buy.example/localbib',
-                    price_display: '29,50 €',
+                    price_amount: 29.5,
+    price_currency: 'EUR',
                     is_frozen: true,
                     trial: TRIAL,
                     blocked: false,
@@ -31,9 +32,9 @@ describe('Kaufhinweis während der Testphase', () => {
             if (!el) throw new Error('Kaufhinweis nicht gerendert');
             return el;
         });
-        expect(banner.textContent).toContain('noch 3 Tage');
+        expect(banner.textContent).toContain('3 days left');
         // Der Preis kommt aus der API-Antwort, nicht aus einem Literal in der SPA.
-        expect(banner.textContent).toContain('29,50 €');
+        expect(banner.textContent).toContain('€29.50');
         expect(document.querySelector('[data-testid="license-gate"]')).toBeNull();
     });
 });

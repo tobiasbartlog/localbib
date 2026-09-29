@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import webapp
-import routers.bibtex_import as _bibtex_router
+import paper_ingest
 
 BIB = r"""
 @article{doe_test_2024,
@@ -178,7 +178,7 @@ def test_commit_enriches_created_paper_with_abstract(client, db):
     with patch.object(
         webapp.metadata_validation, "fetch_crossref_abstract",
         return_value="Ein Abstract aus CrossRef.",
-    ), patch.object(_bibtex_router, "OpenAlexClient") as OA:
+    ), patch.object(paper_ingest, "OpenAlexClient") as OA:
         OA.return_value.fetch_works_by_doi.return_value = []
         resp = client.post("/api/import/bibtex/commit", json={"entries": [{
             "key": "enrichme2022", "title": "Anzureicherndes Werk",

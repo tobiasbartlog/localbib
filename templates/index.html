@@ -1,5 +1,5 @@
-﻿<!DOCTYPE html>
-<html lang="de">
+<!DOCTYPE html>
+<html lang="{{ ui_language }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -44,28 +44,35 @@
     <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
     <script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>
     <script src="https://d3js.org/d3.v7.min.js"></script>
-    <!-- CodeMirror 5 (buildless — ADR-0002 deferred): Notiz-Editor (Markdown)
-         und LaTeX-Editor teilen sich eine Instanz der Bibliothek. -->
+    <!-- CodeMirror 5 (buildless — ADR-0002 deferred): der Notiz-Editor
+         (Markdown). Add-ons teilen sich diese eine Instanz der Bibliothek und
+         bringen weitere Modi/Addons als eigene Assets mit (ADR-0021). -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/continuelist.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/stex/stex.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.js"></script>
     <!-- Markdown-Rendering fuer Notizen und Research-Chat. DOMPurify ist nicht
          optional, sobald gespeicherter Text als HTML eingesetzt wird. -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.4.14/purify.min.js"></script>
-    <!-- Bump BOTH ?v= stamps together on every static change. app.js and
-         style.css are one unit: the SPA binds `var(--lb-*)` tokens that live in
+    <!-- Bump ALL ?v= stamps together on every static change. app.js,
+         style.css and static/locales/*.js are one unit: the SPA binds `var(--lb-*)` tokens that live in
          the stylesheet, so a browser holding one version and fetching the other
          renders a broken page (an unresolved var() paints every chart series
          black). One stamp, both files, same commit. -->
-    <link rel="stylesheet" href="/static/style.css?v=20260916a">
+    <!-- i18n (ADR-0018): die Kataloge sind Script-Globals, kein Fetch.
+         `app.js` mountet sich selbst — ein asynchroner Katalog haette rohe
+         Key-Pfade aufblitzen lassen, bevor er da ist. Beide Sprachen liegen
+         im Speicher, deshalb wirkt das Umschalten sofort. -->
+    <script>window.LB_LANG = "{{ ui_language }}";</script>
+    <!-- Add-on frontends (#187): what app.js loads before it mounts the router. -->
+    <script>window.LB_ADDONS = {{ addons | tojson }};</script>
+    <script src="/static/locales/core.en.js?v=20260929b"></script>
+    <script src="/static/locales/core.de.js?v=20260929b"></script>
+    <link rel="stylesheet" href="/static/style.css?v=20260929b">
 </head>
 <body class="bg-bg text-ink font-sans min-h-screen">
     <div id="app"></div>
-    <script src="/static/app.js?v=20260916a"></script>
+    <script src="/static/app.js?v=20260929b"></script>
 </body>
 </html>

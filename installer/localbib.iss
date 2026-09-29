@@ -83,8 +83,11 @@ CloseApplications=force
 RestartApplications=no
 
 [Languages]
-Name: "german"; MessagesFile: "compiler:Languages\German.isl"
+; Englisch zuerst: Inno waehlt nach Systemsprache und faellt auf den ERSTEN
+; Eintrag zurueck, wenn es nichts erkennt. Seit ADR-0018 ist Englisch die
+; Voreinstellung des Produkts - der Installer darf davon nicht abweichen.
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "german"; MessagesFile: "compiler:Languages\German.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

@@ -112,7 +112,7 @@ def _rematch_references_for_paper(paper_id: int):
 async def upload_and_import_pdf(file: UploadFile = File(...)):
     """Nimmt eine PDF-Datei per Upload entgegen und importiert sie direkt."""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Nur PDF-Dateien erlaubt")
+        raise HTTPException(status_code=400, detail="error.only_pdf_accepted")
 
     # Datei in Input-Ordner speichern
     os.makedirs(Config.INPUT_DIR, exist_ok=True)
@@ -172,7 +172,7 @@ def _smart_import_response(target_path: str, original_filename: str, *,
 
     async def generate():
         # -- Duplikat-Check (hash) --
-        yield _sse({"type": "progress", "step": "hash", "message": "Pruefe auf Duplikate...", "percent": 5})
+        yield _sse({"type": "progress", "step": "hash", "message": "import.step.hash", "percent": 5})
         file_hash = compute_file_hash(target_path)
         if db.paper_exists(file_hash):
             # Find the existing paper for a helpful message
@@ -190,18 +190,18 @@ def _smart_import_response(target_path: str, original_filename: str, *,
             if dup_row:
                 yield _sse({
                     "type": "error",
-                    "message": f"Datei bereits in der Datenbank vorhanden (Duplikat).",
+                    "message": "import.step.duplicateFile",
                     "duplicate_paper_id": dup_row["id"],
                     "duplicate_title": dup_row["title"],
                     "duplicate_filename": dup_row["filename"],
                 })
             else:
-                yield _sse({"type": "error", "message": "Datei bereits in der Datenbank vorhanden (Duplikat)."})
+                yield _sse({"type": "error", "message": "import.step.duplicateFile"})
             return
 
         # -- PDF-Schutz --
         if Config.UNLOCK_PDFS:
-            yield _sse({"type": "progress", "step": "unlock", "message": "Entferne PDF-Schutz...", "percent": 8})
+            yield _sse({"type": "progress", "step": "unlock", "message": "import.step.unlock", "percent": 8})
             unlock_pdf(target_path)
 
         # -- Pure metadata pipeline (text -> DOI/CrossRef -> fallbacks -> LLM validate) --
@@ -219,9 +219,15 @@ def _smart_import_response(target_path: str, original_filename: str, *,
 
         text = result.text
         metadata = result.metadata
+        # LLM steps that failed at the transport level (rate limit, key,
+        # host): the pipeline reports validate, we add categories/abstract,
+        # and the complete event ships the list so the UI can explain the
+        # empty fields (a free-tier model rate-limited upstream is the
+        # common case, not an app bug).
+        llm_failures = list(result.llm_failures)
 
         # -- Duplikat-Check (DOI/Titel) --
-        yield _sse({"type": "progress", "step": "dupcheck", "message": "Pruefe auf inhaltliche Duplikate...", "percent": 53})
+        yield _sse({"type": "progress", "step": "dupcheck", "message": "import.step.dupcheck", "percent": 53})
         dup = db.find_duplicate_paper(doi=metadata.get("doi", ""), title=metadata.get("title", ""))
         if dup:
             try:
@@ -230,14 +236,14 @@ def _smart_import_response(target_path: str, original_filename: str, *,
                 pass
             yield _sse({
                 "type": "error",
-                "message": f"Paper bereits in Bibliothek vorhanden (gleiche DOI oder gleicher Titel).",
+                "message": "import.step.duplicateItem",
                 "duplicate_paper_id": dup["id"],
                 "duplicate_title": dup.get("title", ""),
             })
             return
 
         # -- Dateiname generieren & speichern --
-        yield _sse({"type": "progress", "step": "save", "message": "Speichere in Datenbank...", "percent": 55})
+        yield _sse({"type": "progress", "step": "save", "message": "import.step.save", "percent": 55})
         new_filename = generate_filename(metadata)
         target_all = os.path.join(Config.ALL_DIR, new_filename)
         c = 1
@@ -272,7 +278,7 @@ def _smart_import_response(target_path: str, original_filename: str, *,
             "page_count": _page_count,
         }
         paper_id = db.add_paper(paper_data)
-        yield _sse({"type": "progress", "step": "save", "message": f"Paper gespeichert (ID: {paper_id})", "percent": 60})
+        yield _sse({"type": "progress", "step": "save", "message": {"code": "import.step.saved", "params": {"id": paper_id}}, "percent": 60})
 
         # Datei kopieren
         shutil.copy2(target_path, target_all)
@@ -284,16 +290,18 @@ def _smart_import_response(target_path: str, original_filename: str, *,
 
         # -- Kategorisierung --
         assigned_categories = []
-        if do_categories and Config.KICONNECT_API_KEY:
-            yield _sse({"type": "progress", "step": "categories", "message": "KI kategorisiert Paper...", "percent": 65})
+        if do_categories and Config.llm_ready("fast"):
+            yield _sse({"type": "progress", "step": "categories", "message": "import.step.categorizing", "percent": 65})
             categories_json = db.get_categories()
             category_tree = db.get_category_tree()
+            cat_llm = llm_for("categorize")
             assignments = categorize_with_llm(
                 title=metadata["title"],
                 abstract=metadata["abstract"],
                 text_snippet=text[:2000],
                 category_tree=category_tree,
                 categories_json=categories_json,
+                llm=cat_llm,
             )
             for a in assignments:
                 cat_id = a.get("category_id")
@@ -306,16 +314,21 @@ def _smart_import_response(target_path: str, original_filename: str, *,
             if assigned_categories:
                 cat_names = ", ".join(c_item["name"] for c_item in assigned_categories)
                 yield _sse({"type": "progress", "step": "categories",
-                            "message": f"Kategorien: {cat_names}", "percent": 80})
+                            "message": {"code": "import.step.categories", "params": {"names": cat_names}}, "percent": 80})
+            elif cat_llm.last_error is not None:
+                failure = cat_llm.last_error.as_failure("categories")
+                llm_failures.append(failure)
+                yield _sse({"type": "progress", "step": "categories",
+                            "message": smart_import_pipeline.llm_failure_message(failure), "percent": 80})
             else:
-                yield _sse({"type": "progress", "step": "categories", "message": "Keine Kategorien zugewiesen", "percent": 80})
+                yield _sse({"type": "progress", "step": "categories", "message": "import.noCategoriesAssigned", "percent": 80})
         else:
-            yield _sse({"type": "progress", "step": "categories", "message": "Kategorisierung uebersprungen", "percent": 80})
+            yield _sse({"type": "progress", "step": "categories", "message": "import.step.categoriesSkipped", "percent": 80})
 
         # -- Abstract --
         abstract_source = ""
         if do_abstract and not metadata["abstract"]:
-            yield _sse({"type": "progress", "step": "abstract", "message": "Suche Abstract...", "percent": 85})
+            yield _sse({"type": "progress", "step": "abstract", "message": "import.step.abstractSearch", "percent": 85})
 
             # CrossRef Abstract (falls DOI vorhanden und noch kein Abstract)
             if metadata["doi"]:
@@ -328,26 +341,31 @@ def _smart_import_response(target_path: str, original_filename: str, *,
                     pass
 
             # LLM-Suche im PDF (metadata_validation owns prompt + KEIN_ABSTRACT sentinel)
-            if not metadata["abstract"] and Config.KICONNECT_API_KEY and text.strip():
-                yield _sse({"type": "progress", "step": "abstract", "message": "KI sucht Abstract im PDF...", "percent": 88})
+            abstract_failure = None
+            if not metadata["abstract"] and Config.llm_ready("fast") and text.strip():
+                abs_llm = llm_for("abstract")
+                yield _sse({"type": "progress", "step": "abstract", "message": "import.step.abstractInPdf", "percent": 88})
                 found = metadata_validation.llm_find_abstract_in_text(
-                    llm_for("abstract"),
+                    abs_llm,
                     metadata.get("title", ""), metadata.get("authors", ""), text[:6000],
                 )
                 if found:
                     metadata["abstract"] = found
                     abstract_source = "pdf"
-
-            # LLM generiert Zusammenfassung
-            if not metadata["abstract"] and Config.KICONNECT_API_KEY and text.strip():
-                yield _sse({"type": "progress", "step": "abstract", "message": "KI generiert Zusammenfassung...", "percent": 92})
-                generated = metadata_validation.llm_generate_abstract(
-                    llm_for("abstract"),
-                    metadata.get("title", ""), metadata.get("authors", ""), text[:6000],
-                )
-                if generated:
-                    metadata["abstract"] = generated
-                    abstract_source = "generated"
+                elif abs_llm.last_error is None:
+                    # LLM generiert Zusammenfassung -- not after a transport
+                    # failure: the second call would run into the same limit.
+                    yield _sse({"type": "progress", "step": "abstract", "message": "import.step.abstractGenerate", "percent": 92})
+                    generated = metadata_validation.llm_generate_abstract(
+                        abs_llm,
+                        metadata.get("title", ""), metadata.get("authors", ""), text[:6000],
+                    )
+                    if generated:
+                        metadata["abstract"] = generated
+                        abstract_source = "generated"
+                if abs_llm.last_error is not None:
+                    abstract_failure = abs_llm.last_error.as_failure("abstract")
+                    llm_failures.append(abstract_failure)
 
             if metadata["abstract"]:
                 conn_abs = _get_conn()
@@ -360,15 +378,18 @@ def _smart_import_response(target_path: str, original_filename: str, *,
                 finally:
                     conn_abs.close()
                 yield _sse({"type": "progress", "step": "abstract",
-                            "message": f"Abstract gefunden ({abstract_source})", "percent": 95})
+                            "message": {"code": "import.step.abstractFound", "params": {"source": abstract_source}}, "percent": 95})
+            elif abstract_failure is not None:
+                yield _sse({"type": "progress", "step": "abstract",
+                            "message": smart_import_pipeline.llm_failure_message(abstract_failure), "percent": 95})
             else:
-                yield _sse({"type": "progress", "step": "abstract", "message": "Kein Abstract gefunden", "percent": 95})
+                yield _sse({"type": "progress", "step": "abstract", "message": "import.step.abstractNotFound", "percent": 95})
         elif metadata["abstract"]:
             abstract_source = "crossref"
             yield _sse({"type": "progress", "step": "abstract",
-                        "message": "Abstract bereits vorhanden (CrossRef)", "percent": 95})
+                        "message": "import.step.abstractPresent", "percent": 95})
         else:
-            yield _sse({"type": "progress", "step": "abstract", "message": "Abstract-Suche uebersprungen", "percent": 95})
+            yield _sse({"type": "progress", "step": "abstract", "message": "import.step.abstractSkipped", "percent": 95})
 
         # -- Rematch --
         try:
@@ -383,7 +404,7 @@ def _smart_import_response(target_path: str, original_filename: str, *,
         # den Import nicht blockiert (PRD Entscheidung 5) — Ausgefallenes ist
         # per Maintenance-Reindex nachholbar. Dieselbe Funktion nutzt
         # ``pipeline.process_paper`` fuer den klassischen Import.
-        yield _sse({"type": "progress", "step": "chunking", "message": "Erstelle Text-Chunks fuer Research-Chat...", "percent": 97})
+        yield _sse({"type": "progress", "step": "chunking", "message": "import.step.chunking", "percent": 97})
         idx = index_paper_after_import(paper_id, target_all)
         if idx["chunks"] > 0:
             msg = f"{idx['chunks']} Chunks erstellt"
@@ -406,6 +427,7 @@ def _smart_import_response(target_path: str, original_filename: str, *,
             "journal": metadata["journal"],
             "publisher": metadata["publisher"],
             "categories": assigned_categories,
+            "llm_failures": llm_failures,
         })
 
     async def safe_generate():
@@ -414,7 +436,7 @@ def _smart_import_response(target_path: str, original_filename: str, *,
                 yield chunk
         except Exception as e:
             logging.error(f"Smart-Import Fehler: {e}", exc_info=True)
-            yield _sse({"type": "error", "message": f"Import-Fehler: {str(e)}"})
+            yield _sse({"type": "error", "message": {"code": "error.importFailed", "params": {"message": str(e)}}})
 
     return StreamingResponse(safe_generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -437,7 +459,7 @@ async def upload_smart(
     - do_validate: LLM-Metadaten-Validierung
     """
     if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Nur PDF-Dateien erlaubt")
+        raise HTTPException(status_code=400, detail="error.only_pdf_accepted")
 
     # Datei in Input-Ordner speichern
     os.makedirs(Config.INPUT_DIR, exist_ok=True)
@@ -531,7 +553,7 @@ async def process_single_import(filename: str):
     safe_name = os.path.basename(filename)
     filepath = os.path.join(Config.INPUT_DIR, safe_name)
     if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail=f"Datei '{safe_name}' nicht im Input-Ordner gefunden")
+        raise HTTPException(status_code=404, detail={"code": "error.file_not_in_input_folder", "params": {"name": safe_name}})
 
     try:
         paper_id = process_paper(filepath, db)
@@ -560,7 +582,7 @@ async def process_smart_from_input(
     safe_name = os.path.basename(filename)
     target_path = os.path.join(Config.INPUT_DIR, safe_name)
     if not os.path.exists(target_path):
-        raise HTTPException(status_code=404, detail=f"Datei '{safe_name}' nicht im Input-Ordner gefunden")
+        raise HTTPException(status_code=404, detail={"code": "error.file_not_in_input_folder", "params": {"name": safe_name}})
 
     return _smart_import_response(
         target_path, safe_name,

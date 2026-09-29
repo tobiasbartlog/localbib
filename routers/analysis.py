@@ -100,7 +100,7 @@ async def analyze_thesis(file: UploadFile = File(...)):
     Die PDF wird nur temporaer verarbeitet und danach geloescht.
     """
     if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Nur PDF-Dateien werden akzeptiert")
+        raise HTTPException(status_code=400, detail="error.only_pdf_accepted")
 
     # Temporaere Datei erstellen
     tmp_dir = tempfile.mkdtemp(prefix="thesis_analysis_")
@@ -115,7 +115,7 @@ async def analyze_thesis(file: UploadFile = File(...)):
         # 1. Gesamten Text extrahieren
         all_pages = _extract_all_pdf_pages(tmp_path)
         if not all_pages:
-            raise HTTPException(status_code=400, detail="PDF konnte nicht gelesen werden. Moeglicherweise ist sie geschuetzt oder beschaedigt.")
+            raise HTTPException(status_code=400, detail="error.pdf_unreadable")
 
         full_text = "\n\n".join(all_pages)
         total_pages = len(all_pages)
@@ -125,14 +125,14 @@ async def analyze_thesis(file: UploadFile = File(...)):
         if not ref_section or len(ref_section.strip()) < 50:
             raise HTTPException(
                 status_code=400,
-                detail="Kein Literaturverzeichnis gefunden. Bitte stelle sicher, dass die PDF ein Literaturverzeichnis enthaelt."
+                detail="error.no_bibliography"
             )
 
         references = _llm_extract_references(ref_section)
         if not references:
             raise HTTPException(
                 status_code=400,
-                detail="Keine Referenzen im Literaturverzeichnis erkannt. Moeglicherweise ist der Text nicht maschinenlesbar (Scan?)."
+                detail="error.no_references_detected"
             )
 
         # Index fuer nummerierte Zuordnung setzen
@@ -321,11 +321,11 @@ async def get_node_abstract(doi: str = "", openalex_id: str = ""):
 @router.post("/api/analysis/chat")
 async def analysis_chat(req: ChatRequest):
     """Stellt Fragen an das LLM ueber ausgewaehlte Paper. Streamt die Antwort als SSE."""
-    if not Config.KICONNECT_API_KEY:
-        return JSONResponse(status_code=400, content={"error": "Kein LLM API-Key konfiguriert. Bitte in den Einstellungen setzen."})
+    if not Config.llm_ready("reasoning"):
+        return JSONResponse(status_code=400, content={"error": "error.no_llm_key"})
 
     if not req.paper_ids and not req.external_papers:
-        return JSONResponse(status_code=400, content={"error": "Keine Paper ausgewaehlt."})
+        return JSONResponse(status_code=400, content={"error": "error.no_items_selected"})
 
     # Build context from DB papers (with PDF text)
     paper_contexts = []
@@ -380,18 +380,21 @@ async def analysis_chat(req: ChatRequest):
         paper_contexts.append(ctx)
 
     if not paper_contexts:
-        return JSONResponse(status_code=400, content={"error": "Keine Paper-Daten gefunden."})
+        return JSONResponse(status_code=400, content={"error": "error.no_item_data"})
 
     combined_context = "\n\n".join(paper_contexts)
 
-    system_prompt = f"""Du bist ein Experte fuer wissenschaftliche Literatur und hilfst beim Verstehen von Forschungspapern.
-Du hast Zugriff auf die folgenden Paper:
+    # Die Antwortsprache folgt der Oberflaeche (ADR-0018): was hier entsteht,
+    # entsteht in der Sprache, die der Nutzer gerade sieht.
+    system_prompt = f"""You are an expert on academic literature helping the user understand research items.
+You have access to the following items:
 
 {combined_context}
 
-Beantworte die Fragen des Nutzers basierend auf den bereitgestellten Paper-Informationen.
-Sei praezise und wissenschaftlich korrekt. Zitiere relevante Stellen aus den Papern wenn moeglich.
-Wenn du dir bei etwas nicht sicher bist, sage das klar. Antworte auf Deutsch, es sei denn der Nutzer fragt auf Englisch."""
+Answer the user's questions based on the item information provided.
+Be precise and scientifically accurate. Quote relevant passages from the items where possible.
+When you are unsure about something, say so plainly.
+Answer in {Config.ui_language_name()}, unless the user asks in a different language."""
 
     messages = [{"role": "system", "content": system_prompt}]
     # Add conversation history

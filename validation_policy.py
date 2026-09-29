@@ -108,7 +108,7 @@ async def validate_propose(paper_id: int, options: ValidateOptions = None):
     pdf_text = extract_text_from_pdf(filepath, max_pages=options.pages)
 
     llm_client = None
-    if options.use_llm and Config.KICONNECT_API_KEY:
+    if options.use_llm and Config.llm_ready("fast"):
         llm_client = llm_for("metadata_extract")
 
     category_tree = None

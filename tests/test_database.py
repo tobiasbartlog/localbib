@@ -5,9 +5,11 @@ FastAPI app, no network. The schema is created by ``Database.__init__``.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from database import Database
+from database import Database, normalize_tags
 
 
 @pytest.fixture
@@ -155,3 +157,75 @@ class TestAppSettings:
         tmp_db.set_app_setting("k", "v1")
         tmp_db.set_app_setting("k", "v2")
         assert tmp_db.get_app_setting("k") == "v2"
+
+
+# --- Migration schema (#174) ----------------------------------------------
+
+class TestTagsAndDateAdded:
+    def test_tags_are_stored_as_a_json_array(self, tmp_db):
+        pid = tmp_db.add_paper(_paper(tags=["ethics", "ml"]))
+        row = tmp_db._connect().execute(
+            "SELECT tags FROM papers WHERE id = ?", (pid,)).fetchone()
+        assert json.loads(row["tags"]) == ["ethics", "ml"]
+
+    def test_a_json_string_survives_unchanged(self, tmp_db):
+        pid = tmp_db.add_paper(_paper(tags='["a", "b"]'))
+        row = tmp_db._connect().execute(
+            "SELECT tags FROM papers WHERE id = ?", (pid,)).fetchone()
+        assert json.loads(row["tags"]) == ["a", "b"]
+
+    def test_no_tags_means_empty_not_null(self, tmp_db):
+        pid = tmp_db.add_paper(_paper())
+        row = tmp_db._connect().execute(
+            "SELECT tags, notes, date_added FROM papers WHERE id = ?", (pid,)).fetchone()
+        assert (row["tags"], row["notes"], row["date_added"]) == ("", "", "")
+
+    def test_notes_and_date_added_are_stored(self, tmp_db):
+        pid = tmp_db.add_paper(_paper(notes="Read me", date_added="2014-07-01"))
+        row = tmp_db._connect().execute(
+            "SELECT notes, date_added FROM papers WHERE id = ?", (pid,)).fetchone()
+        assert row["notes"] == "Read me"
+        assert row["date_added"] == "2014-07-01"
+
+    def test_normalize_tags_deduplicates_and_drops_blanks(self):
+        assert json.loads(normalize_tags(["a", "", "a", " b "])) == ["a", "b"]
+        assert normalize_tags(None) == ""
+        assert normalize_tags([]) == ""
+
+    def test_unparseable_tag_text_becomes_one_tag(self):
+        assert json.loads(normalize_tags("just a string")) == ["just a string"]
+
+
+class TestCategoryPath:
+    def test_creates_the_whole_chain_and_returns_the_leaf(self, tmp_db):
+        leaf = tmp_db.get_or_create_category_path(["Diss", "Kapitel 2"])
+        names = {c["id"]: c for c in tmp_db.get_categories()}
+        assert names[leaf]["name"] == "Kapitel 2"
+        assert names[names[leaf]["parent_id"]]["name"] == "Diss"
+
+    def test_an_existing_chain_is_reused(self, tmp_db):
+        first = tmp_db.get_or_create_category_path(["Diss", "Kapitel 2"])
+        second = tmp_db.get_or_create_category_path(["Diss", "Kapitel 2"])
+        assert first == second
+        assert len(tmp_db.get_categories()) == 2
+
+    def test_the_same_name_under_a_different_parent_is_a_different_category(self, tmp_db):
+        a = tmp_db.get_or_create_category_path(["Diss", "Methoden"])
+        b = tmp_db.get_or_create_category_path(["Lehre", "Methoden"])
+        assert a != b
+
+    def test_an_empty_path_creates_nothing(self, tmp_db):
+        assert tmp_db.get_or_create_category_path([]) is None
+        assert tmp_db.get_or_create_category_path(["", "  "]) is None
+        assert tmp_db.get_categories() == []
+
+
+class TestMigrationRuns:
+    def test_the_run_table_exists(self, tmp_db):
+        conn = tmp_db._connect()
+        conn.execute(
+            "INSERT INTO migration_runs (run_id, source, source_path, created_paper_ids) "
+            "VALUES ('r1', 'bibtex', '/tmp/x.bib', '[1, 2]')")
+        conn.commit()
+        row = conn.execute("SELECT * FROM migration_runs WHERE run_id = 'r1'").fetchone()
+        assert json.loads(row["created_paper_ids"]) == [1, 2]

@@ -19,7 +19,7 @@ function selectFile() {
 }
 
 function uncheck(label) {
-    const modal = findByText('h3', 'PDF verarbeiten').closest('div');
+    const modal = findByText('h3', 'Process PDF').closest('div');
     const box = [...modal.querySelectorAll('label')]
         .find((l) => l.textContent.includes(label))
         .querySelector('input[type=checkbox]');
@@ -46,13 +46,13 @@ describe('attach pdf two-phase flow (non-book)', () => {
 
         selectFile();
         await flush();
-        expect(findByText('h3', 'PDF verarbeiten')).toBeTruthy();
+        expect(findByText('h3', 'Process PDF')).toBeTruthy();
         uncheck('Chunks');            // assert this is forwarded as false
         uncheck('Text/OCR');          // avoid the OCR follow-up call
-        uncheck('Referenzen');        // avoid the references follow-up call
+        uncheck('references');        // avoid the references follow-up call
         await flush();
 
-        findByText('button', 'Starten').click();
+        findByText('button', 'Start').click();
         await flush(); await flush(); await flush();
 
         const attach = calls.find((c) => c.method === 'POST' && /attach-pdf/.test(c.url));

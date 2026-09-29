@@ -33,7 +33,8 @@ from pydantic import BaseModel
 # this router module (which Python knows as routers.bibtex_import).
 import bibtex_import as bibtex_import_core  # noqa: E402
 
-import metadata_validation
+import ca_trust
+import paper_ingest
 from cite_key_generator import dedupe as _dedupe_cite_key
 from context import get_conn
 # Chunking trio relocated to the neutral top-level module pdf_chunking.py (#87)
@@ -44,12 +45,8 @@ from import_indexing import index_paper_after_import
 from literature_manager import (
     Config,
     Database,
-    categorize_with_llm,
     create_symlinks,
     extract_text_from_pdf,
-    fetch_crossref_metadata,
-    generate_filename,
-    unlock_pdf,
 )
 from openalex_client import OpenAlexClient
 from paper_matcher import match as match_ref
@@ -120,202 +117,12 @@ class AttachFinalizeRequest(BaseModel):
 # BibTeX-import helpers
 # ---------------------------------------------------------------------------
 
-def _enrich_imported_papers(created: list[dict]) -> int:
-    """Nicht-destruktive Anreicherung frisch importierter Papers: Abstract via
-    CrossRef (Fallback OpenAlex) sowie fehlende Jahr/Autoren via OpenAlex.
-    Nur leere Felder werden gefuellt. Gibt die Zahl angereicherter Papers."""
-    if not created:
-        return 0
-    # OpenAlex-Works im Batch (DOI) fuer Jahr/Autoren (+ ggf. Abstract-Fallback).
-    works: dict = {}
-    dois = [bibtex_import_core.normalize_doi(r["doi"]).lower()
-            for r in created if (r.get("doi") or "").strip()]
-    if dois:
-        try:
-            for w in OpenAlexClient(_oa_mailto()).fetch_works_by_doi(dois):
-                works[w.doi] = w
-        except Exception as e:
-            logging.warning("OpenAlex-Batch fuer Import-Anreicherung fehlgeschlagen: %s", e)
-
-    enriched = 0
-    for r in created:
-        pid = r.get("paper_id")
-        if not pid:
-            continue
-        doi = (r.get("doi") or "").strip()
-        doi_norm = bibtex_import_core.normalize_doi(doi).lower() if doi else ""
-        work = works.get(doi_norm)
-        conn = _get_conn()
-        try:
-            row = conn.execute(
-                "SELECT abstract, year, authors FROM papers WHERE id = ?", (pid,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row:
-            continue
-        updates: dict = {}
-        if not (row["abstract"] or "").strip():
-            abstract = ""
-            if doi:
-                try:
-                    abstract = metadata_validation.fetch_crossref_abstract(
-                        doi, fetch=lambda d: fetch_crossref_metadata(d)
-                    ) or ""
-                except Exception:
-                    abstract = ""
-            if not abstract and work and (work.abstract or "").strip():
-                abstract = work.abstract
-            if abstract:
-                updates["abstract"] = abstract[:5000]
-        if work:
-            if not row["year"] and work.year:
-                updates["year"] = work.year
-            if not (row["authors"] or "").strip() and work.authors:
-                updates["authors"] = "; ".join(work.authors)
-        if updates:
-            sets = ", ".join(f"{k} = ?" for k in updates)
-            conn = _get_conn()
-            try:
-                conn.execute(
-                    f"UPDATE papers SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (*updates.values(), pid),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-            enriched += 1
-    return enriched
-
-
-# ---------------------------------------------------------------------------
-# PDF-attach helpers
-# ---------------------------------------------------------------------------
-
-def _attach_pdf_to_paper(paper_id: int, data: bytes, original_name: str,
-                         do_chunks: bool = True) -> dict:
-    """Haengt PDF-Bytes an ein Paper ohne Datei: echter SHA256 als file_hash,
-    Datei in ALL_DIR, Textextraktion + Seitenzahl, Symlinks. Die kuratierten
-    Metadaten bleiben unangetastet (CONTEXT.md "PDF Download"); die
-    LLM-Kategorisierung macht der Aufrufer."""
-    if not data[:1024].lstrip().startswith(b"%PDF"):
-        raise HTTPException(status_code=422, detail="Datei ist kein PDF")
-
-    conn = _get_conn()
-    try:
-        row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
-        if row["filename"]:
-            raise HTTPException(status_code=409, detail="Paper hat bereits ein PDF")
-        real_hash = hashlib.sha256(data).hexdigest()
-        other = conn.execute(
-            "SELECT id, title FROM papers WHERE file_hash = ? AND id != ?",
-            (real_hash, paper_id),
-        ).fetchone()
-        if other:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Dieses PDF gehoert bereits zu Paper {other['id']}: {other['title']}",
-            )
-        paper = dict(row)
-    finally:
-        conn.close()
-
-    new_filename = generate_filename(
-        {"title": paper["title"], "authors": paper["authors"], "year": paper["year"]}
-    )
-    target = os.path.join(Config.ALL_DIR, new_filename)
-    c = 1
-    while os.path.exists(target):
-        nm, ext = os.path.splitext(new_filename)
-        new_filename = f"{nm}_{c}{ext}"
-        target = os.path.join(Config.ALL_DIR, new_filename)
-        c += 1
-    with open(target, "wb") as f:
-        f.write(data)
-
-    if Config.UNLOCK_PDFS:
-        try:
-            unlock_pdf(target)
-        except Exception:
-            pass
-
-    text = ""
-    page_count = 0
-    try:
-        text = extract_text_from_pdf(target, Config.MAX_OCR_PAGES)
-    except Exception as e:
-        logging.warning("Textextraktion beim PDF-Anhaengen fehlgeschlagen: %s", e)
-    try:
-        import fitz as _fitz
-        _doc = _fitz.open(target)
-        page_count = len(_doc)
-        _doc.close()
-    except Exception:
-        pass
-
-    conn = _get_conn()
-    try:
-        conn.execute(
-            """UPDATE papers SET file_hash = ?, filename = ?, original_filename = ?,
-               ocr_text = ?, page_count = ?, updated_at = CURRENT_TIMESTAMP
-               WHERE id = ?""",
-            (real_hash, new_filename, original_name or new_filename,
-             text[:10000], page_count, paper_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    create_symlinks(_get_db(), paper_id, new_filename)
-
-    # Research-Chat: ein angehaengtes/geladenes PDF muss gechunkt werden, sonst
-    # taucht es nicht im RAG auf (gleiches Verhalten wie der normale Import).
-    # Seit #153 derselbe Hook wie im Import-Pfad, damit auch die Embeddings
-    # (Paper- UND Chunk-Ebene) sofort entstehen statt erst beim Maintenance-Reindex.
-    n_chunks = 0
-    if do_chunks:
-        n_chunks = index_paper_after_import(paper_id, target)["chunks"]
-
-    return {"paper_id": paper_id, "filename": new_filename,
-            "page_count": page_count, "chunks": n_chunks, "text": text}
-
-
-def _categorize_attached_paper(paper_id: int, title: str, abstract: str, text: str) -> list:
-    """LLM-Kategorisierung nach PDF-Anhang (Entscheidung: Anhaengen + Kategorisierung)."""
-    if not Config.KICONNECT_API_KEY:
-        return []
-    assigned = []
-    try:
-        _db = _get_db()
-        categories_json = _db.get_categories()
-        category_tree = _db.get_category_tree()
-        assignments = categorize_with_llm(
-            title=title, abstract=abstract or "", text_snippet=text[:2000],
-            category_tree=category_tree, categories_json=categories_json,
-        )
-        for a in assignments:
-            cat_id = a.get("category_id")
-            if cat_id:
-                _db.assign_category(paper_id, cat_id, a.get("confidence", 0.0))
-                cat_name = next(
-                    (c["name"] for c in categories_json if c["id"] == cat_id), "?"
-                )
-                assigned.append({"id": cat_id, "name": cat_name})
-        if assigned:
-            # Symlinks erneut, jetzt mit Kategorie-Ordnern
-            conn = _get_conn()
-            try:
-                fname = conn.execute(
-                    "SELECT filename FROM papers WHERE id = ?", (paper_id,)
-                ).fetchone()["filename"]
-            finally:
-                conn.close()
-            create_symlinks(_db, paper_id, fname)
-    except Exception as e:
-        logging.warning("Kategorisierung nach PDF-Anhang fehlgeschlagen: %s", e)
-    return assigned
+# The enrichment, attach and category helpers moved to the neutral module
+# ``paper_ingest`` (PRD #137 / ADR-0016) so the DOI intake router can share
+# them — a router never imports another router. The private aliases keep this
+# module's call sites and the tests' patch points unchanged.
+_attach_pdf_to_paper = paper_ingest.attach_pdf_to_paper
+_categorize_attached_paper = paper_ingest.categorize_attached_paper
 
 
 def _parse_printed_range(pages_field: str):
@@ -441,7 +248,7 @@ def _trim_pdf_file(path: str, start_page: int, end_page: int, keep_cover: bool =
         s = max(1, int(start_page))
         e = min(n, int(end_page))
         if e < s:
-            raise HTTPException(status_code=422, detail="Ungueltiger Seitenbereich")
+            raise HTTPException(status_code=422, detail="error.invalid_page_range")
         keep = []
         if keep_cover and s > 1:
             keep.append(0)  # Cover = PDF-Index 0
@@ -477,7 +284,7 @@ async def bibtex_import_preview(
     try:
         entries = bibtex_import_core.parse_bib(bib_text)
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"BibTeX nicht lesbar: {e}")
+        raise HTTPException(status_code=422, detail={"code": "error.bibtex_unreadable", "params": {"message": str(e)}})
 
     cited_keys = None
     if tex_file is not None:
@@ -617,7 +424,8 @@ async def bibtex_import_commit(payload: BibtexCommitRequest):
 
     # Frisch angelegte Eintraege nicht-destruktiv anreichern (Abstract + fehlende
     # Metadaten), damit Importe nicht "nackt" ohne Abstract in der Bibliothek landen.
-    enriched = _enrich_imported_papers([r for r in results if r["status"] == "created"])
+    enriched = paper_ingest.enrich_imported_papers(
+        [r for r in results if r["status"] == "created"])
 
     return {
         "total": len(payload.entries),
@@ -715,12 +523,12 @@ async def attach_finalize(paper_id: int, payload: AttachFinalizeRequest):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
     finally:
         conn.close()
     if not paper["filename"]:
-        raise HTTPException(status_code=409, detail="Paper hat kein PDF")
+        raise HTTPException(status_code=409, detail="error.item_has_no_pdf")
 
     path = os.path.join(Config.ALL_DIR, os.path.basename(paper["filename"]))
     trimmed_pages = None
@@ -782,7 +590,7 @@ async def fetch_oa_pdf(paper_id: int, payload: FetchOaPdfRequest):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
     finally:
         conn.close()
@@ -798,20 +606,21 @@ async def fetch_oa_pdf(paper_id: int, payload: FetchOaPdfRequest):
             work = oa.fetch_work_by_title(paper["title"])
         url = work.oa_pdf_url if work else ""
     if not url:
-        raise HTTPException(status_code=404, detail="Keine Open-Access-PDF-URL gefunden")
+        raise HTTPException(status_code=404, detail="error.no_oa_pdf_url")
 
     try:
         import httpx
         resp = httpx.get(
             url, timeout=60, follow_redirects=True,
             headers={"User-Agent": Config.user_agent("LocalBib")},
+            verify=ca_trust.ca_bundle() or True,  # httpx ignores REQUESTS_CA_BUNDLE
         )
         resp.raise_for_status()
         data = resp.content
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Download fehlgeschlagen: {e}")
+        raise HTTPException(status_code=502, detail={"code": "error.download_failed", "params": {"message": str(e)}})
 
     content_type = ""
     try:
@@ -821,7 +630,8 @@ async def fetch_oa_pdf(paper_id: int, payload: FetchOaPdfRequest):
     if not data[:1024].lstrip().startswith(b"%PDF"):
         raise HTTPException(
             status_code=422,
-            detail=f"URL lieferte kein PDF (Content-Type: {content_type or 'unbekannt'})",
+            detail={"code": "error.url_not_pdf",
+                    "params": {"contentType": content_type or "unknown"}},
         )
 
     result = _attach_pdf_to_paper(paper_id, data, os.path.basename(url.split("?")[0]) or "oa.pdf")

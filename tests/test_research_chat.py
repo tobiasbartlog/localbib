@@ -124,30 +124,72 @@ def test_ask_with_extra_context_included_in_prompt(client, seed_paper, db):
 # ---------------------------------------------------------------------------
 
 def test_core_has_no_static_plugin_import():
-    """webapp.py must not contain a static ``import <plugin>`` or
-    ``from <plugin> ...`` statement for any package in ``PLUGIN_MODULES`` —
+    """webapp.py must not contain a static ``import <addon>`` or
+    ``from <addon> ...`` statement for any Add-on Bundle under ``plugins/`` —
     the plugin boundary is enforced (P3 / ADR-0005).  Only importlib-gated
-    access in registry.py is allowed.
+    access by the Bundle loader is allowed.
 
-    Binds wherever plugins exist; in a public export ``PLUGIN_MODULES`` is empty
-    by design and there is nothing for the core to import statically.
+    Binds wherever Bundles exist; in a public export there are none and
+    nothing for the core to import statically.
     """
-    from context import PLUGIN_MODULES
+    bundles = pathlib.Path(webapp.__file__).resolve().parent / "plugins"
+    bundle_ids = sorted(
+        p.name for p in (bundles.iterdir() if bundles.is_dir() else []) if (p / "plugin.json").is_file()
+    )
 
     src = pathlib.Path(webapp.__file__).read_text(encoding="utf-8")
     tree = ast.parse(src, filename=str(webapp.__file__))
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
-            for plugin in PLUGIN_MODULES:
+            for plugin in bundle_ids:
                 assert not module.startswith(plugin), (
                     f"Static 'from {plugin}...' import found in webapp.py "
                     f"at line {node.lineno}"
                 )
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                for plugin in PLUGIN_MODULES:
+                for plugin in bundle_ids:
                     assert not alias.name.startswith(plugin), (
                         f"Static 'import {plugin}...' found in webapp.py "
                         f"at line {node.lineno}"
                     )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: an Add-on's chat-context block reaches the LLM on the wire (#190)
+# ---------------------------------------------------------------------------
+
+def test_addon_context_block_reaches_the_llm_request(client, seed_paper, db):
+    """The research-chat-context slot hands the SPA one text block, which it
+    appends to the existing ``extra_context``; the block must arrive in the
+    chat-completions payload the LLM endpoint receives (HTTP-level mock —
+    ``LLMClient`` speaks ``requests``, so respx cannot see it)."""
+    _seed_chunk(db, seed_paper, text="machine learning methods for materials science")
+
+    sent: list[dict] = []
+
+    def fake_post(url, headers=None, json=None, **kw):
+        sent.append({"url": url, "json": json})
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"choices": [{"message": {"content": "Mit Gruss."}}]}
+        return resp
+
+    block = "Greetings the user has sent so far."
+    with patch("llm_client.requests.post", side_effect=fake_post):
+        resp = client.post(
+            "/api/research-chat/ask",
+            json={
+                "question": "What machine learning methods are used?",
+                "paper_ids": [seed_paper],
+                "extra_context": [block],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["answer"] == "Mit Gruss."
+    assert sent and sent[0]["url"].endswith("/chat/completions")
+    user_msg = next(m["content"] for m in sent[0]["json"]["messages"] if m["role"] == "user")
+    assert "WEITERER KONTEXT" in user_msg
+    assert block in user_msg

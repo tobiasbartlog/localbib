@@ -22,7 +22,7 @@ describe('semantic search toggle (shown with embedding model)', () => {
         const calls = installFetchMock([
             { method: 'GET', url: /^\/api\/search\/semantic/, reply: SEMANTIC_RESPONSE },
             { method: 'GET', url: /^\/api\/papers\?/, reply: PAPERS },
-            { method: 'GET', url: '/api/settings', reply: { LLM_EMBED_MODEL: 'qwen3-embedding-8b' } },
+            { method: 'GET', url: '/api/llm/status', reply: { reasoning: true, fast: true, embedding: true, connections: 1 } },
             ...defaultRoutes(),
         ]);
         await import('../../static/app.js');

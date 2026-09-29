@@ -34,25 +34,23 @@ from datetime import datetime, timedelta
 # Laenge der Testphase in Tagen (PRD #138). Eine Zahl, ein Ort.
 TRIAL_DAYS = 14
 
-# Der Preis der Lizenz, fertig formatiert fuer die Anzeige (issue #154). Eine
-# Zahl-plus-Waehrung-Konstruktion wuerde die Dezimaltrennzeichen-Frage in jeden
-# Aufrufer verschieben — dafuer gibt es keinen Gewinn, jeder Konsument will
-# denselben gerenderten Text. Preisaenderung heisst: diese eine Zeile editieren.
-PRICE_DISPLAY = "29,50 €"
+# Der Preis der Lizenz als Zahl plus Waehrung (issue #154, seit ADR-0018).
+# Frueher stand hier ein fertig formatierter String — das ging, solange es eine
+# Sprache gab. Mit zweien ist genau das Dezimaltrennzeichen die Frage: „29,50 €“
+# im englischen UI liest sich falsch, „€29.50“ im deutschen ebenso. Formatiert
+# wird deshalb dort, wo die Locale lebt (die SPA, via Intl.NumberFormat).
+# Preisaenderung heisst weiterhin: diese eine Zeile editieren.
+PRICE_AMOUNT = 29.50
+PRICE_CURRENCY = "EUR"
 
 _SECONDS_PER_DAY = 86400
 
-# Der Satz fuer Installationen, die noch ein ``is_supporter=1`` aus der
+# Der Hinweis fuer Installationen, die noch ein ``is_supporter=1`` aus der
 # Lemon-Squeezy-Zeit tragen. Er muss zwei Dinge leisten: erklaeren, warum der
 # alte Key nichts mehr tut, und den kostenlosen Weg nennen — sonst waere das
-# genau die stumme Aussperrung, die ADR-0015 verbietet.
-LEGACY_SUPPORTER_NOTE = (
-    "Dieser Rechner trägt noch einen Supporter-Key aus dem alten Shop. "
-    "Den Shop gibt es nicht mehr, deshalb lässt sich der alte Key hier nicht "
-    "aktivieren — kaufen musst du aber nichts noch einmal: schreib kurz an "
-    "support@localbib.com, du bekommst kostenlos einen Code für einen neuen "
-    "Lizenzschlüssel."
-)
+# genau die stumme Aussperrung, die ADR-0015 verbietet. Den Satz dazu
+# formuliert die SPA (ADR-0018, Entscheidung 3).
+LEGACY_SUPPORTER_NOTE = "license.legacyNote"
 
 
 def running_frozen() -> bool:

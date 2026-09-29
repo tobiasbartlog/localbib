@@ -1,0 +1,4 @@
+# Artifacts of building/installing this folder as localbib-plugin-api
+build/
+dist/
+*.egg-info/

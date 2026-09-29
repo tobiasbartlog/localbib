@@ -142,3 +142,42 @@ def test_isbn_and_year_fallbacks_fill_empty_fields():
         )
     assert result.metadata["isbn"] == "978-3-16-148410-0"
     assert result.metadata["year"] == 1999
+
+
+def _rate_limited_response():
+    from unittest.mock import MagicMock
+    resp = MagicMock()
+    resp.status_code = 429
+    resp.headers = {}
+    resp.text = "rate-limited upstream"
+    return resp
+
+
+def test_llm_transport_failure_is_reported_not_swallowed(monkeypatch):
+    """A 429 on the validate step (free-tier model rate-limited upstream) ends
+    up in ``ImportResult.llm_failures`` and as a coded progress message,
+    instead of the generic "no result" line."""
+    monkeypatch.setattr("llm_client.time.sleep", lambda _s: None)
+    with patch.object(sip, "extract_text_from_pdf", return_value="A Title\nbody text of the paper"), \
+         patch.object(sip, "discover_doi", return_value=None), \
+         patch("llm_client.requests.post", return_value=_rate_limited_response()):
+        events, result = _drain(sip.run_pipeline("/tmp/x.pdf", "x.pdf", do_doi=False, do_validate=True))
+
+    assert len(result.llm_failures) == 1
+    failure = result.llm_failures[0]
+    assert failure["step"] == "validate"
+    assert failure["kind"] == "rate_limited"
+    assert failure["status"] == 429
+    assert failure["model"]
+
+    validate_msgs = [e["message"] for e in events if e["step"] == "validate"]
+    assert {"code": "import.step.llmFailed.rate_limited", "params": {"model": failure["model"]}} in validate_msgs
+
+
+def test_no_failure_recorded_when_llm_answers():
+    with patch.object(sip, "extract_text_from_pdf", return_value="A Title\nbody"), \
+         patch.object(sip, "discover_doi", return_value=None), \
+         patch.object(sip, "llm_extract_metadata", return_value={"title": "Better Title"}):
+        _events, result = _drain(sip.run_pipeline("/tmp/x.pdf", "x.pdf", do_doi=False, do_validate=True))
+    assert result.llm_failures == []
+    assert result.metadata["title"] == "Better Title"

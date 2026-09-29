@@ -78,7 +78,7 @@ async def create_custom_field(data: CustomFieldCreate):
         row = conn.execute("SELECT * FROM custom_fields WHERE id = ?", (field_id,)).fetchone()
         return dict(row)
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="Feld mit diesem Namen existiert bereits")
+        raise HTTPException(status_code=400, detail="error.field_name_exists")
     finally:
         conn.close()
 
@@ -90,7 +90,7 @@ async def update_custom_field(field_id: int, data: CustomFieldUpdate):
     try:
         row = conn.execute("SELECT * FROM custom_fields WHERE id = ?", (field_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Feld nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.field_not_found")
 
         updates, vals = [], []
         for f in ["name", "field_type", "options", "position"]:

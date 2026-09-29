@@ -101,7 +101,7 @@ async def merge_duplicates(data: MergeRequest):
         ).fetchone()
         if not keep:
             raise HTTPException(
-                status_code=404, detail="Zu behaltendes Paper nicht gefunden"
+                status_code=404, detail="error.keep_item_not_found"
             )
 
         for del_id in data.delete_ids:

@@ -32,12 +32,13 @@ async def upload_icon(file: UploadFile = File(...)):
     if ext not in allowed:
         raise HTTPException(
             status_code=400,
-            detail=f"Dateityp {ext} nicht erlaubt. Erlaubt: {', '.join(allowed)}",
+            detail={"code": "error.file_type_not_allowed",
+                    "params": {"ext": ext, "allowed": ", ".join(allowed)}},
         )
 
     content = await file.read()
     if len(content) > 2 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Datei zu gross (max. 2 MB)")
+        raise HTTPException(status_code=400, detail="error.file_too_large")
 
     for old in _STATIC_DIR.glob("custom_icon.*"):
         old.unlink()

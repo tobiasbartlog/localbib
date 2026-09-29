@@ -1,0 +1,147 @@
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns:z="http://www.zotero.org/namespaces/export#"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:bib="http://purl.org/net/biblio#"
+ xmlns:foaf="http://xmlns.com/foaf/0.1/"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:link="http://purl.org/rss/1.0/modules/link/"
+ xmlns:prism="http://prismstandard.org/namespaces/1.2/basic/">
+
+    <z:Collection rdf:about="#collection_1">
+        <dc:title>Diss</dc:title>
+        <dcterms:hasPart rdf:resource="#collection_2"/>
+        <dcterms:hasPart rdf:resource="#item_2"/>
+    </z:Collection>
+
+    <z:Collection rdf:about="#collection_2">
+        <dc:title>Kapitel 2</dc:title>
+        <dcterms:hasPart rdf:resource="http://dx.doi.org/10.1234/migrated"/>
+    </z:Collection>
+
+    <z:Collection rdf:about="#collection_3">
+        <dc:title>Zu lesen</dc:title>
+        <dcterms:hasPart rdf:resource="http://dx.doi.org/10.1234/migrated"/>
+    </z:Collection>
+
+    <bib:Article rdf:about="http://dx.doi.org/10.1234/migrated">
+        <z:itemType>journalArticle</z:itemType>
+        <dcterms:isPartOf>
+            <bib:Journal>
+                <prism:volume>12</prism:volume>
+                <dc:title>Journal of Things</dc:title>
+                <dc:identifier>ISSN 1234-5678</dc:identifier>
+            </bib:Journal>
+        </dcterms:isPartOf>
+        <bib:authors>
+            <rdf:Seq>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Smith</foaf:surname>
+                        <foaf:givenName>Jane</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Doe</foaf:surname>
+                        <foaf:givenName>John</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+            </rdf:Seq>
+        </bib:authors>
+        <link:link rdf:resource="#item_attachment_1"/>
+        <dc:subject>machine learning</dc:subject>
+        <dc:subject>
+            <z:AutomaticTag>
+                <rdf:value>ethics</rdf:value>
+            </z:AutomaticTag>
+        </dc:subject>
+        <dc:title>A Study of Migrated Things</dc:title>
+        <dcterms:abstract>We studied the things that were migrated.</dcterms:abstract>
+        <dc:date>2020-03-04</dc:date>
+        <z:libraryCatalog>Crossref</z:libraryCatalog>
+        <bib:pages>100-119</bib:pages>
+        <dc:identifier>DOI 10.1234/migrated</dc:identifier>
+        <dcterms:dateSubmitted>2014-07-01 09:15:00</dcterms:dateSubmitted>
+        <dcterms:isReferencedBy rdf:resource="#item_note_1"/>
+    </bib:Article>
+
+    <z:Attachment rdf:about="#item_attachment_1">
+        <z:itemType>attachment</z:itemType>
+        <rdf:resource rdf:resource="files/12/Smith%20-%202020%20-%20A%20Study%20of%20Migrated%20Things.pdf"/>
+        <dc:title>Full Text PDF</dc:title>
+        <link:type>application/pdf</link:type>
+    </z:Attachment>
+
+    <bib:Memo rdf:about="#item_note_1">
+        <rdf:value>&lt;p&gt;Read before chapter 2.&lt;/p&gt;
+&lt;p&gt;The method section is the useful part &amp;amp; the rest is filler.&lt;/p&gt;</rdf:value>
+    </bib:Memo>
+
+    <bib:Book rdf:about="#item_2">
+        <z:itemType>book</z:itemType>
+        <bib:authors>
+            <rdf:Seq>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Müller</foaf:surname>
+                        <foaf:givenName>Anna</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+            </rdf:Seq>
+        </bib:authors>
+        <link:link rdf:resource="#item_attachment_2"/>
+        <dc:title>Ein Buch über Migration</dc:title>
+        <dc:date>2018</dc:date>
+        <dc:publisher>
+            <foaf:Organization>
+                <foaf:name>Verlag für Dinge</foaf:name>
+            </foaf:Organization>
+        </dc:publisher>
+        <dc:identifier>ISBN 978-3-16-148410-0</dc:identifier>
+        <dcterms:dateSubmitted>2016-02-11 18:00:00</dcterms:dateSubmitted>
+        <dc:subject>migration</dc:subject>
+    </bib:Book>
+
+    <z:Attachment rdf:about="#item_attachment_2">
+        <z:itemType>attachment</z:itemType>
+        <rdf:resource rdf:resource="files/13/Mueller%20-%202018%20-%20Ein%20Buch.pdf"/>
+        <dc:title>Full Text PDF</dc:title>
+        <link:type>application/pdf</link:type>
+    </z:Attachment>
+
+    <bib:BookSection rdf:about="#item_3">
+        <z:itemType>bookSection</z:itemType>
+        <dcterms:isPartOf>
+            <bib:Book>
+                <dc:title>Sammelband zur Migration</dc:title>
+                <dc:identifier>ISBN 978-0-00-000000-0</dc:identifier>
+            </bib:Book>
+        </dcterms:isPartOf>
+        <bib:authors>
+            <rdf:Seq>
+                <rdf:li>
+                    <foaf:Person>
+                        <foaf:surname>Doe</foaf:surname>
+                        <foaf:givenName>John</foaf:givenName>
+                    </foaf:Person>
+                </rdf:li>
+            </rdf:Seq>
+        </bib:authors>
+        <dc:title>Ein Kapitel ohne PDF</dc:title>
+        <dc:date>2017</dc:date>
+        <bib:pages>45-60</bib:pages>
+    </bib:BookSection>
+
+    <rdf:Description rdf:about="#item_4">
+        <z:itemType>webpage</z:itemType>
+        <dc:title>Eine Webseite ohne Datei</dc:title>
+        <dc:date>2022-11-02</dc:date>
+        <dc:identifier>
+            <dcterms:URI>
+                <rdf:value>https://example.org/eine-webseite</rdf:value>
+            </dcterms:URI>
+        </dc:identifier>
+    </rdf:Description>
+
+</rdf:RDF>

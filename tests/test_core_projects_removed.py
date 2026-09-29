@@ -9,7 +9,6 @@ The projects/paper_projects tables stay in the DB as dead data.
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
 
 import webapp
 

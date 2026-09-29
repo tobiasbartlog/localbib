@@ -141,8 +141,8 @@ def test_second_activation_is_local_only(client, monkeypatch):
     assert webapp.db.get_app_setting("license_key") == "LB--VALID-KEY"
 
 
-def test_invalid_key_reports_german_error(client, monkeypatch):
-    """404 ResourceNotFound -> "ungueltig" message, nothing persisted."""
+def test_invalid_key_reports_its_own_code(client, monkeypatch):
+    """404 ResourceNotFound -> the invalid-key code, nothing persisted."""
     monkeypatch.setattr(
         "routers.license.httpx.post",
         _FakePolar(_response(404, {"error": "ResourceNotFound",
@@ -151,13 +151,13 @@ def test_invalid_key_reports_german_error(client, monkeypatch):
     body = client.post("/api/license/activate", json={"key": "NOPE"}).json()
 
     assert body["activated"] is False
-    assert "ungültig" in body["error"].lower()
+    assert body["error"] == "license.err.invalid"
     assert webapp.db.get_app_setting("license_activated") == ""
     assert webapp.db.get_app_setting("license_key") == ""
 
 
 def test_activation_limit_reports_distinct_error(client, monkeypatch):
-    """403 with Polar's limit detail -> the "zwei Geräte" message."""
+    """403 with Polar's limit detail -> the two-device code."""
     monkeypatch.setattr(
         "routers.license.httpx.post",
         _FakePolar(_response(403, {"error": "NotPermitted",
@@ -166,12 +166,12 @@ def test_activation_limit_reports_distinct_error(client, monkeypatch):
     body = client.post("/api/license/activate", json={"key": "LB--USED-UP"}).json()
 
     assert body["activated"] is False
-    assert "Geräten" in body["error"]
+    assert body["error"] == "license.err.limit"
     assert webapp.db.get_app_setting("license_activated") == ""
 
 
 def test_network_failure_reports_distinct_error(client, monkeypatch):
-    """A transport error -> the "nicht erreichbar" message, no persistence."""
+    """A transport error -> the unreachable code, no persistence."""
     monkeypatch.setattr(
         "routers.license.httpx.post",
         _FakePolar(exc=httpx.ConnectError("no route to host")),
@@ -179,7 +179,7 @@ def test_network_failure_reports_distinct_error(client, monkeypatch):
     body = client.post("/api/license/activate", json={"key": "LB--ANY"}).json()
 
     assert body["activated"] is False
-    assert "erreichbar" in body["error"]
+    assert body["error"] == "license.err.network"
     assert webapp.db.get_app_setting("license_activated") == ""
 
 
@@ -211,11 +211,11 @@ def test_limit_message_does_not_depend_on_polar_wording(client, monkeypatch):
     body = client.post("/api/license/activate", json={"key": "LB--USED-UP"}).json()
 
     assert body["activated"] is False
-    assert "Geräten" in body["error"]
+    assert body["error"] == "license.err.limit"
 
 
 def test_malformed_request_is_not_blamed_on_the_key(client, monkeypatch):
-    """422 is our bug, not a typo of the customer — say so, with the code."""
+    """422 is our bug, not a typo of the customer — its own code carries the status."""
     monkeypatch.setattr(
         "routers.license.httpx.post",
         _FakePolar(_response(422, {"error": "RequestValidationError",
@@ -224,8 +224,7 @@ def test_malformed_request_is_not_blamed_on_the_key(client, monkeypatch):
     body = client.post("/api/license/activate", json={"key": "LB--FINE"}).json()
 
     assert body["activated"] is False
-    assert "422" in body["error"]
-    assert "ungültig" not in body["error"].lower()
+    assert body["error"] == {"code": "license.err.unexpected", "params": {"status": 422}}
     assert webapp.db.get_app_setting("license_activated") == ""
 
 
@@ -237,7 +236,7 @@ def test_server_error_is_treated_as_unreachable(client, monkeypatch):
     body = client.post("/api/license/activate", json={"key": "LB--ANY"}).json()
 
     assert body["activated"] is False
-    assert "erreichbar" in body["error"]
+    assert body["error"] == "license.err.network"
 
 
 def test_empty_key_never_reaches_polar(client, monkeypatch):

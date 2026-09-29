@@ -7,12 +7,66 @@ damit es importzyklenfrei bleibt.
 
 import os
 import shutil
+import sys
 import logging
+
+# Leaf module (stdlib only) — the one exception to "no project imports" above,
+# and only because it has none of its own. See llm_config's docstring.
+import llm_config
+import plugins_config
 
 
 # =============================================================================
 # KONFIGURATION
 # =============================================================================
+
+
+def resolve_env_path() -> str:
+    """Where the ``.env`` lives — the ONE rule for every entry point.
+
+    Frozen build (PyInstaller): the exe/_internal folder may be read-only
+    (Program Files), so the persistent configuration sits next to the user's
+    data at ``~/Literatur/.env``. Source tree: the repo's own ``.env``; a git
+    worktree under ``.claude/worktrees/<name>/`` without one falls back to the
+    main checkout's file three levels up. ``webapp.py`` and
+    ``routers/settings.py`` used to carry a copy of this logic each; the LLM
+    document (``llm.json``, see ``LLM_CONFIG_PATH``) needs the same answer from
+    the CLI, which loads neither.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.expanduser("~"), "Literatur", ".env")
+    here = os.path.dirname(os.path.abspath(__file__))
+    env = os.path.join(here, ".env")
+    if not os.path.exists(env):
+        main_repo = os.path.normpath(os.path.join(here, "..", "..", "..", ".env"))
+        if os.path.exists(main_repo):
+            return main_repo
+    return env
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    """Tolerant numeric env parse: missing, empty or non-numeric text falls
+    back to ``default`` instead of raising.
+
+    ``reload_from_env`` runs at import AND after every settings save, so a
+    bare ``int(os.getenv(...))`` here is a startup crash waiting to happen —
+    ``PUT /api/settings`` used to write an unvalidated value (e.g. the SPA
+    clearing the field sends ``""``) straight to the ``.env``, and the next
+    process (this one, on its next reload, or the very next app start) died
+    on this line before anything else could run. Validation now also lives at
+    the write site (``routers/settings.py``), but this parse stays tolerant
+    regardless of how a bad value got into the ``.env``.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    return value
 
 # Polar-Store der ausgelieferten App (ADR-0015), aufgesetzt in #141. Beides
 # sind oeffentliche Kennungen: die Organisations-ID adressiert die
@@ -45,51 +99,72 @@ class Config:
         "custom":     {"label": "Custom (OpenAI-kompatibel)",  "base_url": ""},
     }
 
-    # Von reload_from_env() gesetzt (einzige Stelle mit den Env-Defaults) —
-    # beim Import und nach jedem Settings-Save.
-    # Leer = noch kein Anbieter gewaehlt (frische Installation). Das Onboarding
-    # (#140) setzt ihn; bis dahin bleiben LLM-Features aus, statt gegen einen
-    # Endpunkt zu laufen, den der Nutzer gar nicht erreichen kann.
-    LLM_PROVIDER = ""
-    LLM_BASE_URL = ""  # nur fuer Custom / Override
-    LLM_API_KEY = ""
-    LLM_MODEL = ""
-    # Zweites Default-Modell fuer einfache Tasks (Extraktion/Kategorisierung).
-    # Leer -> Fallback auf LLM_MODEL (siehe fast_model()).
-    LLM_MODEL_FAST = ""
-    AVAILABLE_MODELS: list = []
+    # Konfigurationsdateien: die .env (Skalare) und daneben llm.json (das
+    # LLM-Verbindungsdokument). LLM_CONFIG_PATH per Env ueberschreibbar —
+    # die Tests zeigen damit auf ein Temp-Verzeichnis, wie LITERATUR_BASE_DIR.
+    ENV_PATH: str = resolve_env_path()
+    LLM_CONFIG_PATH: str = ""  # von reload_from_env gesetzt
+
+    # -------------------------------------------------------------------
+    # LLM-Verbindungen (llm.json): benannte Verbindungen + drei Rollen
+    # -------------------------------------------------------------------
+    # Das Dokument ist die persistierte Wahrheit; llm_config.py kennt seine
+    # Form. Eine alte .env (LLM_PROVIDER/LLM_API_KEY/LLM_MODEL/...) wird beim
+    # Laden LESEND zu einer Verbindung "default" migriert — nichts wird
+    # ungefragt umgeschrieben; die alten Keys verschwinden erst, wenn der
+    # Nutzer im LLM-Tab speichert (PUT /api/llm/config).
+    LLM_DOCUMENT: dict = llm_config.empty_document()
+    # True, sobald llm.json existiert — d. h. die flachen Env-Keys sind nur
+    # noch Altlast (Lese-Migration), nicht mehr die Quelle.
+    LLM_DOCUMENT_STORED: bool = False
+
+    @classmethod
+    def llm_endpoint(cls, tier: str) -> dict | None:
+        """Der aufgeloeste Endpunkt einer Rolle (``reasoning`` / ``fast`` /
+        ``embedding``): ``{base_url, chat_url, models_url, embed_url, api_key,
+        model, connection_id, provider}`` — oder ``None``, wenn die Rolle nicht
+        nutzbar ist (keine Verbindung gebunden, kein Modell, keine URL).
+        ``fast`` faellt auf ``reasoning`` zurueck, ``embedding`` nie. Der Key
+        darf leer sein (Ollama & Co.)."""
+        return llm_config.resolve_role(cls.LLM_DOCUMENT, tier, cls.LLM_PROVIDERS)
+
+    @classmethod
+    def llm_ready(cls, tier: str) -> bool:
+        """Feature-Gate pro Rolle: gebunden an eine Verbindung mit URL und
+        Modell. Ersetzt das alte ``if Config.KICONNECT_API_KEY`` — ein leerer
+        Key ist kein Grund, ein laufendes Ollama fuer "kein LLM" zu halten,
+        und die Embedding-Rolle prueft die Embedding-Bindung, nicht die des
+        Chats."""
+        return cls.llm_endpoint(tier) is not None
+
+    @classmethod
+    def _role_model(cls, tier: str) -> str:
+        ep = cls.llm_endpoint(tier)
+        return ep["model"] if ep else ""
 
     @classmethod
     def reasoning_model(cls) -> str:
-        """Modell fuer Denkaufgaben (Chat, Analyse). Immer LLM_MODEL."""
-        return cls.LLM_MODEL
+        """Modell der Reasoning-Rolle (Chat, Analyse); leer = nicht gebunden."""
+        return cls._role_model("reasoning")
 
     @classmethod
     def fast_model(cls) -> str:
-        """Modell fuer einfache Tasks (Extraktion, Kategorisierung, Metadaten).
-        Faellt auf das Denk-Modell zurueck, wenn LLM_MODEL_FAST nicht gesetzt ist."""
-        return cls.LLM_MODEL_FAST or cls.LLM_MODEL
+        """Modell der Fast-Rolle (Extraktion, Kategorisierung, Metadaten).
+        Faellt auf die Reasoning-Rolle zurueck, wenn nicht gebunden."""
+        return cls._role_model("fast")
 
-    # Aufgeloeste Endpunkte (von resolve_llm gesetzt) + Backward-Compat-Aliase
-    LLM_CHAT_URL = ""
-    LLM_MODELS_URL = ""
-    # Historische Aliase (viele Aufrufstellen gaten auf KICONNECT_API_KEY).
-    # Der Name blieb, der KI-Connect-Default ist weg: leer = kein Endpunkt.
-    KICONNECT_API_URL = ""
-    KICONNECT_API_KEY = ""
+    @classmethod
+    def embed_model(cls) -> str:
+        """Modell der Embedding-Rolle; leer = semantische Features aus."""
+        return cls._role_model("embedding")
 
-    # Embedding-Modell fuer semantische Suche/Clustering (Kern-Slice H0,
-    # Issue #97). Anders als LLM_MODEL KEIN hartkodierter Fallback: leer
-    # (weder .env noch env var gesetzt) -> llm_client.embed_texts() degradiert
-    # per NotImplementedError (discovery A4, PRD-Entscheidung "Degradation
-    # statt Hard-Fail"). .env.template traegt "qwen3-embedding-8b" als
-    # empfohlenen Wert fuer Neuinstallationen; bestehende Installationen ohne
-    # den Key bleiben unveraendert ohne Embeddings. LLM_EMBED_URL
-    # ueberschreibt die aus KICONNECT_API_URL abgeleitete /embeddings-URL
-    # (jeder OpenAI-kompatible Anbieter, z. B. Ollama, fuer Nutzer ohne
-    # KI-Connect-Zugriff).
-    LLM_EMBED_MODEL = ""
-    LLM_EMBED_URL = ""
+    @classmethod
+    def llm_status(cls) -> dict:
+        """Was die SPA ausserhalb der Settings wissen muss: Bereitschaft pro
+        Rolle + Anzahl Verbindungen (die Frage des Onboardings)."""
+        out = {tier: cls.llm_ready(tier) for tier in llm_config.TIERS}
+        out["connections"] = len(cls.LLM_DOCUMENT.get("connections", []))
+        return out
 
     @classmethod
     def reload_from_env(cls):
@@ -97,20 +172,19 @@ class Config:
         Import UND nach jedem Settings-Save (PUT /api/settings). Die einzige
         Stelle, an der die Env-Defaults stehen (frueher drifteten config.py
         und routers/settings.py auseinander, z. B. beim LLM_MODEL-Default)."""
-        cls.LLM_PROVIDER = os.getenv("LLM_PROVIDER", "")
-        cls.LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
-        cls.LLM_API_KEY = os.getenv("LLM_API_KEY", "") or os.getenv("KICONNECT_API_KEY", "")
-        cls.LLM_MODEL = os.getenv("LLM_MODEL", "")
-        cls.LLM_MODEL_FAST = os.getenv("LLM_MODEL_FAST", "")
-        cls.LLM_EMBED_MODEL = os.getenv("LLM_EMBED_MODEL", "")
-        cls.LLM_EMBED_URL = os.getenv("LLM_EMBED_URL", "")
-        cls.AVAILABLE_MODELS = []  # bei Provider-Wechsel neu laden
+        cls._load_llm_document()
+        cls.load_plugins_document()
         # Leer per Default: die hoefliche mailto-Kennung ist die Adresse DES
         # NUTZERS (Onboarding, #140) — nie eine mitgelieferte fremde Adresse.
         cls.CROSSREF_MAILTO = os.getenv("CROSSREF_MAILTO", "").strip()
         cls.OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "")
-        cls.WATCH_INTERVAL = int(os.getenv("WATCH_INTERVAL", "5"))
-        cls.MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "5"))
+        # Oberflaechensprache (ADR-0018). Englisch ist die Quellsprache und
+        # der Default; Deutsch ist ein Katalog. Unbekannte Werte fallen auf
+        # "en" zurueck, damit ein vertippter .env-Eintrag kein Key-Salat wird.
+        _lang = os.getenv("UI_LANGUAGE", "en").strip().lower()
+        cls.UI_LANGUAGE = _lang if _lang in cls.UI_LANGUAGES else "en"
+        cls.WATCH_INTERVAL = _env_int("WATCH_INTERVAL", 5, minimum=1)
+        cls.MAX_OCR_PAGES = _env_int("MAX_OCR_PAGES", 5, minimum=1)
         cls.UNLOCK_PDFS = os.getenv("UNLOCK_PDFS", "true").lower() == "true"
         # Polar: mitgelieferte Defaults (oeffentliche Kennungen), per Env
         # ueberschreibbar - POLAR_API_BASE zeigt beim Testen auf die Sandbox.
@@ -122,25 +196,94 @@ class Config:
                                      or POLAR_ORGANIZATION_ID_DEFAULT)
         cls.POLAR_CHECKOUT_URL = (os.getenv("POLAR_CHECKOUT_URL", "").strip()
                                   or POLAR_CHECKOUT_URL_DEFAULT)
-        cls.resolve_llm()
+    @classmethod
+    def _load_llm_document(cls):
+        """llm.json laden — oder, solange es keins gibt, das Dokument aus den
+        flachen Env-Keys einer alten .env synthetisieren (Lese-Migration:
+        eine Verbindung "default", nichts wird geschrieben). Eine kaputte
+        Datei nimmt die App nicht mit: sie laeuft dann ohne LLM weiter."""
+        cls.LLM_CONFIG_PATH = os.getenv("LLM_CONFIG_PATH", "").strip() or os.path.join(
+            os.path.dirname(cls.ENV_PATH), "llm.json"
+        )
+        doc = llm_config.load(cls.LLM_CONFIG_PATH)
+        cls.LLM_DOCUMENT_STORED = doc is not None
+        if doc is not None:
+            try:
+                doc = llm_config.normalize(doc, cls.LLM_PROVIDERS)
+            except llm_config.DocumentError as exc:
+                logging.warning("llm.json unbrauchbar (%s) — LLM-Konfiguration leer", exc.code)
+                doc = llm_config.empty_document()
+            cls.LLM_DOCUMENT = doc
+            return
+        doc = llm_config.from_legacy_env(
+            provider=os.getenv("LLM_PROVIDER", ""),
+            base_url=os.getenv("LLM_BASE_URL", ""),
+            api_key=os.getenv("LLM_API_KEY", "") or os.getenv("KICONNECT_API_KEY", ""),
+            model=os.getenv("LLM_MODEL", ""),
+            model_fast=os.getenv("LLM_MODEL_FAST", ""),
+            embed_model=os.getenv("LLM_EMBED_MODEL", ""),
+            embed_url=os.getenv("LLM_EMBED_URL", ""),
+            providers=cls.LLM_PROVIDERS,
+        )
+        cls.LLM_DOCUMENT = doc if doc is not None else llm_config.empty_document()
+
+    # -------------------------------------------------------------------
+    # Add-ons (plugins.json, ADR-0021): Zustandsdokument + Ladeorte
+    # -------------------------------------------------------------------
+    PLUGINS_CONFIG_PATH: str = ""   # von load_plugins_document gesetzt
+    PLUGINS_DOCUMENT: dict = plugins_config.empty_document()
+    PLUGINS_DOCUMENT_STORED: bool = False
+    # Wurzel der installierten Bundles (<root>/<id>/<version>/) und die
+    # Dev-Suchpfade aus der Umgebung; die aus plugins.json kommen dazu.
+    PLUGIN_DIR: str = ""
+    PLUGIN_DEV_PATHS: tuple = ()
+    # Marketplace-Index-Cache (ADR-0021, issue #189): Zeitstempel-Datei plus
+    # gecachte Bilder, damit der Marketplace offline den zuletzt geholten
+    # Stand zeigt. Neben PLUGIN_DIR, gleiches Muster.
+    MARKETPLACE_CACHE_DIR: str = ""
+
+    @staticmethod
+    def default_plugin_dir() -> str:
+        """``%LOCALAPPDATA%/LocalBib/plugins`` unter Windows, sonst der XDG-Datenordner."""
+        if os.name == "nt":
+            base = os.getenv("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+            return os.path.join(base, "LocalBib", "plugins")
+        base = os.getenv("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+        return os.path.join(base, "localbib", "plugins")
 
     @classmethod
-    def resolve_llm(cls):
-        """Loest LLM_PROVIDER + optionale Overrides zu konkreten Endpunkten auf.
+    def load_plugins_document(cls):
+        """plugins.json laden — oder, solange es keins gibt, die Alt-Schluessel
+        der .env lesend uebernehmen (wie llm.json, ADR-0019). Ist das Dokument
+        gespeichert, ist es die Wahrheit; Add-ons lesen ihre Werte nur ueber
+        ``SettingsApi``, nie aus der Prozess-Umgebung. Aufgerufen von
+        ``reload_from_env`` und nach jedem Speichern des Dokuments."""
+        cls.PLUGINS_CONFIG_PATH = os.getenv("PLUGINS_CONFIG_PATH", "").strip() or os.path.join(
+            os.path.dirname(cls.ENV_PATH), "plugins.json"
+        )
+        doc = plugins_config.load(cls.PLUGINS_CONFIG_PATH)
+        cls.PLUGINS_DOCUMENT_STORED = doc is not None
+        if doc is not None:
+            cls.PLUGINS_DOCUMENT = plugins_config.normalize(doc)
+        else:
+            cls.PLUGINS_DOCUMENT = (plugins_config.from_legacy_env(os.environ)
+                                    or plugins_config.empty_document())
+        cls.PLUGIN_DIR = os.getenv("LOCALBIB_PLUGIN_DIR", "").strip() or cls.default_plugin_dir()
+        cls.PLUGIN_DEV_PATHS = tuple(
+            p.strip() for p in os.getenv("LOCALBIB_PLUGIN_DEV_PATHS", "").split(os.pathsep) if p.strip()
+        )
+        cls.MARKETPLACE_CACHE_DIR = os.getenv("LOCALBIB_MARKETPLACE_CACHE_DIR", "").strip() or os.path.join(
+            os.path.dirname(cls.PLUGIN_DIR), "marketplace"
+        )
 
-        Setzt LLM_CHAT_URL / LLM_MODELS_URL und haelt die Aliase
-        KICONNECT_API_URL / KICONNECT_API_KEY synchron, damit bestehende
-        Aufrufstellen unveraendert weiterfunktionieren.
-        """
-        provider = (cls.LLM_PROVIDER or "").lower()
-        preset = cls.LLM_PROVIDERS.get(provider, cls.LLM_PROVIDERS["custom"])
-        base = (cls.LLM_BASE_URL or preset["base_url"]).rstrip("/")
-        cls.LLM_API_KEY = cls.LLM_API_KEY or os.getenv("KICONNECT_API_KEY", "")
-        cls.LLM_CHAT_URL = f"{base}/chat/completions" if base else ""
-        cls.LLM_MODELS_URL = f"{base}/models" if base else ""
-        cls.KICONNECT_API_URL = cls.LLM_CHAT_URL
-        cls.KICONNECT_API_KEY = cls.LLM_API_KEY
-        return cls.LLM_CHAT_URL
+    @classmethod
+    def plugins_document(cls) -> dict:
+        """Eine Arbeitskopie des aktuellen Dokuments. Ungespeichert wird die
+        Lese-Migration frisch aus der Umgebung gebaut, damit ein erster
+        Schreibvorgang den aktuellen Stand festhaelt, nicht den vom Start."""
+        if cls.PLUGINS_DOCUMENT_STORED:
+            return plugins_config.normalize(cls.PLUGINS_DOCUMENT)
+        return plugins_config.from_legacy_env(os.environ) or plugins_config.empty_document()
 
     # CrossRef API (kostenlos, kein Key nötig)
     CROSSREF_API_URL = "https://api.crossref.org/works/"
@@ -175,6 +318,21 @@ class Config:
     # OpenAlex Premium API key (optional) — hebt das Rate-Limit/Budget an
     # (Premium-Pool statt Polite-Pool). Leer -> nur mailto-Polite-Pool.
     OPENALEX_API_KEY = ""  # von reload_from_env gesetzt
+
+    # Oberflaechensprache (von reload_from_env gesetzt, ADR-0018)
+    UI_LANGUAGES = ("en", "de")
+    UI_LANGUAGE = "en"
+    UI_LANGUAGE_NAMES = {"en": "English", "de": "German"}
+
+    @classmethod
+    def ui_language_name(cls) -> str:
+        """Der Sprachname fuer LLM-Prompts ("English" / "German").
+
+        LLM-Ausgaben folgen der Oberflaechensprache ab dem Zeitpunkt der
+        Generierung (ADR-0018). Bereits erzeugte Texte bleiben, wie sie sind -
+        es gibt kein nachtraegliches Uebersetzen.
+        """
+        return cls.UI_LANGUAGE_NAMES.get(cls.UI_LANGUAGE, "English")
 
     # Watchdog (von reload_from_env gesetzt)
     WATCH_INTERVAL = 5

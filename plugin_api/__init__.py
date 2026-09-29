@@ -1,19 +1,20 @@
-"""@localbib/plugin-api — the contract between the LocalBib core and its plugins.
+"""localbib-plugin-api — the Add-on Contract between the LocalBib core and its Add-ons.
 
-Python-native translation of the architecture document (Abschnitt 5). The
-original document assumes a TypeScript ``@localbib/plugin-api`` package; the
-real codebase is Python/FastAPI, so the contract lives here as Protocols and
-dataclasses. See ``docs/discovery.md`` (Weg A) for why.
+Python-native translation of the architecture document (Abschnitt 5): the
+contract lives here as Protocols and dataclasses. Since contract 2 this folder
+is also a standalone package (``pyproject.toml`` next to this file, semver
+major = ``API_VERSION``, changes in ``CHANGELOG.md``) so an Add-on can develop
+and test without the core — see ``plugin_api.testing`` for the fakes.
 
-This package contains **only** types and trivial dataclasses — no runtime
-logic, no I/O, no imports from the core. It is the boundary every plugin
-compiles against (P3: a plugin imports *only* from ``plugin_api``). The
+Stdlib-only, no imports from the core. Besides types it holds exactly one
+piece of logic, the manifest validator (``plugin_api.manifest``), which reads
+the ``manifest.schema.json`` shipped in the package. It is the boundary every
+plugin compiles against (P3: a plugin imports *only* from ``plugin_api``). The
 ``import-linter`` contract in ``.importlinter`` enforces that boundary.
 
-Licensed **MIT** (see ``plugin_api/LICENSE``), unlike the AGPL-3.0 core: a
-third-party plugin may license itself freely against this contract. While it
-runs in-process with the AGPL core, AGPL-compatible licensing is recommended —
-see the README and ADR-0015.
+Licensed **MIT** (see ``LICENSE``), unlike the AGPL-3.0 core: a third-party
+plugin may license itself freely against this contract. While it runs
+in-process with the AGPL core, AGPL-compatible licensing is recommended.
 """
 
 from __future__ import annotations
@@ -21,39 +22,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
-# Bump together with a breaking change to the interfaces below. Plugins declare
-# the minimum version they require via ``PluginManifest.min_api_version``.
-API_VERSION = 1
+from plugin_api.manifest import (
+    GATED_SERVICES,
+    MANIFEST_FILENAME,
+    PERMISSIONS,
+    SLOTS,
+    SETTING_TYPES,
+    FrontendSpec,
+    ManifestError,
+    NavItem,
+    Permission,
+    PermissionInfo,
+    PluginManifest,
+    SettingField,
+    granted_services,
+    load_manifest,
+    load_schema,
+    parse_permissions,
+    validate_manifest,
+)
 
-
-# =============================================================================
-# Manifest & UI contributions
-# =============================================================================
-
-@dataclass(frozen=True)
-class PluginManifest:
-    """Identity of a plugin. Mirrors ``PluginManifest`` in Abschnitt 5."""
-
-    id: str                      # e.g. "notes"
-    name: str
-    version: str
-    min_api_version: int = 1
-
-
-@dataclass(frozen=True)
-class NavItem:
-    """A navigation entry a plugin contributes to the LocalBib sidebar.
-
-    ``view`` is the frontend view key the SPA maps to a Vue component; the core
-    never renders the view itself, it only relays this descriptor to the SPA via
-    ``GET /api/plugins/nav``.
-    """
-
-    id: str
-    label: str
-    icon: str                    # inline SVG markup, rendered via v-html
-    route: str                   # hash-router path, e.g. "/notes"
-    view: str                    # frontend component key, e.g. "notes"
+# The Add-on Contract version. Bump together with a breaking change to the
+# interfaces below; the package's semver major equals it. Plugins declare the
+# version they are built against via ``PluginManifest.api_version``
+# (``api_version`` in ``plugin.json``). See CHANGELOG.md for 1 -> 2.
+API_VERSION = 2
 
 
 # =============================================================================
@@ -83,12 +76,40 @@ class ApiRegistry(Protocol):
 
 
 class LibraryApi(Protocol):
-    """Read-only access to the LocalBib core library (Abschnitt 5: ``library``).
+    """Access to the LocalBib core library (Abschnitt 5: ``library``).
 
-    Phase 0b declares the surface; the concrete implementation is filled in as
-    later phases need it. ``get_full_text`` may legitimately return ``None``
-    (discovery A5): plugins must degrade to abstract-only.
+    The handle exists with ``library.read``; every method but
+    :meth:`create_by_doi` reads. ``get_full_text`` may legitimately return
+    ``None`` (discovery A5): plugins must degrade to abstract-only.
     """
+
+    def create_by_doi(
+        self,
+        doi: str,
+        *,
+        title: str = "",
+        authors: "list[str] | str | None" = None,
+        year: Optional[int] = None,
+        journal: str = "",
+        abstract: str = "",
+    ) -> dict:
+        """Add one Item to the library from its DOI (the core's DOI intake,
+        ADR-0016). Needs ``library.write`` on top of ``library.read``; without
+        it the call raises ``PermissionError``.
+
+        The DOI is identity: an Item with that DOI already in the library is
+        returned untouched (``created`` False). A new Item gets the metadata
+        you pass, the core fills what you left empty from CrossRef/OpenAlex
+        and tries an Open-Access PDF on a best-effort basis; the Item's origin
+        is recorded as your Add-on's id. Blocking network I/O — call it from a
+        worker thread or a sync route, not from the event loop.
+
+        Returns ``{"doi": str (normalised), "created": bool, "paper_id": int,
+        "citekey": str, "pdf": "fetched" | "none"}``. Raises ``ValueError``
+        for an empty DOI or when the Item could not be created. Additive in
+        contract 2.0.0 — guard with ``getattr(library, "create_by_doi", None)``
+        if you support older hosts."""
+        ...
 
     def get_reference(self, citekey: str) -> Optional[dict]: ...
 
@@ -100,7 +121,7 @@ class LibraryApi(Protocol):
 
     def export_bibtex(self) -> str:
         """Full library as one .bib string (stored Cite Keys). Feeds the
-        manuscript preview compiler (docs/PRD-latex-editor.md)."""
+        manuscript preview compiler (the LaTeX editor)."""
         ...
 
     def get_core_projects(self) -> list[dict]:
@@ -156,22 +177,46 @@ class StorageApi(Protocol):
     def open_plugin_db(self, name: str) -> Any: ...  # returns a sqlite3.Connection-like handle
 
 
+@dataclass(frozen=True)
+class CoreSettings:
+    """The named core read set behind the ``settings.core`` permission.
+
+    Values are the user's, possibly empty (a fresh install has no mailto);
+    an empty string means "not configured", never "not allowed".
+    """
+
+    mailto: str                  # the user's polite-pool address (CrossRef/OpenAlex)
+    openalex_api_key: str
+    ui_language: str             # e.g. "en", "de"
+    base_dir: str                # the library base folder
+
+
 class SettingsApi(Protocol):
-    """Plugin-scoped settings."""
+    """Settings in the plugin's own namespace, plus the core read set.
+
+    ``get``/``set`` need no permission and only ever see the plugin's own keys.
+    ``core()`` returns :class:`CoreSettings` when the plugin declared
+    ``settings.core`` and ``None`` otherwise.
+    """
 
     def get(self, key: str) -> Optional[Any]: ...
 
     def set(self, key: str, value: Any) -> None: ...
 
+    def core(self) -> Optional[CoreSettings]: ...
+
 
 class PluginApi(Protocol):
     """The object handed to a plugin's ``activate()``. Abschnitt 5: ``PluginApi``.
 
-    ``ui``/``routes`` since Phase 0b; ``llm``/``library`` since Phase 4
-    (LLM-Matching). Either may be ``None`` when the host provides no such
-    service (e.g. router built in isolation for tests) — plugins must
-    degrade gracefully. ``files``/``storage``/``settings`` remain declared
-    contract members, wired up when a phase needs them.
+    ``ui``/``routes`` are always present. The gated services (``library``,
+    ``llm``, ``files``, ``storage`` — see ``GATED_SERVICES``) are handed over
+    only when the manifest declares the matching Berechtigung and are ``None``
+    otherwise; they may also be ``None`` when the host has no such service
+    (e.g. no embeddings endpoint). Plugins must degrade gracefully.
+    ``settings`` is the plugin-scoped store; its ``core()`` answers only with
+    ``settings.core`` declared. ``plugin_api.testing.make_api`` builds this
+    object from a permission set for tests without the core.
     """
 
     api_version: int
@@ -179,6 +224,9 @@ class PluginApi(Protocol):
     routes: ApiRegistry
     llm: Optional[LlmApi]
     library: Optional[LibraryApi]
+    files: Optional[FilesApi]
+    storage: Optional[StorageApi]
+    settings: Optional[SettingsApi]
 
 
 # =============================================================================
@@ -204,14 +252,30 @@ class LocalBibPlugin(Protocol):
 
 __all__ = [
     "API_VERSION",
+    "MANIFEST_FILENAME",
     "PluginManifest",
     "NavItem",
+    "SettingField",
+    "FrontendSpec",
+    "Permission",
+    "PermissionInfo",
+    "PERMISSIONS",
+    "GATED_SERVICES",
+    "SLOTS",
+    "SETTING_TYPES",
+    "ManifestError",
+    "granted_services",
+    "parse_permissions",
+    "load_manifest",
+    "load_schema",
+    "validate_manifest",
     "UiRegistry",
     "ApiRegistry",
     "LibraryApi",
     "LlmApi",
     "FilesApi",
     "StorageApi",
+    "CoreSettings",
     "SettingsApi",
     "PluginApi",
     "LocalBibPlugin",

@@ -6,7 +6,9 @@ Serves
   to the bundled APP_VERSION, returns update availability (cached for 1 hour);
 * ``POST /api/update/install`` — the one-click update (#148): download the
   release's installer, verify it, launch it silently, and exit so the installer
-  can replace the installation and relaunch the app.
+  can replace the installation and relaunch the app;
+* ``POST /api/app/restart`` — restart the frozen app in place (#193, after an
+  Add-on update or removal); ``error.restart_unavailable`` from source.
 
 The *decision* (is there an update, does the release ship an installer, may this
 installation update itself?) is pure and lives in ``services.update_offer``.
@@ -35,7 +37,9 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 
-from services import update_offer
+import marketplace_client
+from plugin_api import API_VERSION
+from services import addon_catalog, update_offer
 
 router = APIRouter()
 
@@ -133,8 +137,19 @@ async def check_version() -> dict:
 
     Cached for 1 hour. Never raises — network failures degrade silently to
     "no update known", with the manual link empty rather than broken.
+
+    Huckepack (ADR-0021, #189): the Marketplace-Index is refreshed here too,
+    at most once a day — ``marketplace_client.refresh_if_stale()`` is a no-op
+    on every poll but the first of the day, and never raises.
     """
-    return _current_offer().as_dict()
+    marketplace_client.refresh_if_stale()
+    return {**_current_offer().as_dict(), **_addon_facts()}
+
+
+def _addon_facts() -> dict:
+    """What the Marketplace compares an Add-on against (ADR-0021): the Add-on
+    Contract version and this interpreter's Python build tag."""
+    return {"api_version": API_VERSION, "python_tag": addon_catalog.python_tag()}
 
 
 # ---------------------------------------------------------------------------
@@ -238,20 +253,14 @@ async def install_update() -> JSONResponse:
     if not offer.is_frozen:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Das Ein-Klick-Update gibt es nur in der installierten Version. "
-                "Aus dem Quellcode gestartet aktualisierst du mit 'git pull'."
-            ),
+            detail="error.update_only_when_installed",
         )
     if not offer.update_available:
-        raise HTTPException(status_code=400, detail="Es liegt keine neuere Version vor.")
+        raise HTTPException(status_code=400, detail="error.no_newer_version")
     if not offer.installer_url:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Dieses Release enthält keinen Installer. Bitte lade die neue "
-                "Version von der Release-Seite herunter."
-            ),
+            detail="error.release_without_installer",
         )
 
     try:
@@ -259,19 +268,14 @@ async def install_update() -> JSONResponse:
     except Exception as exc:  # noqa: BLE001 - every failure reads the same to the user
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Der Installer konnte nicht geladen werden ({exc}). Bitte lade "
-                "ihn manuell von der Release-Seite herunter."
-            ),
+            detail={"code": "error.installer_download_failed",
+                    "params": {"message": str(exc)}},
         )
 
     if not _verify_installer(installer):
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Die heruntergeladene Datei ist unvollständig oder kein gültiger "
-                "Installer. Bitte lade ihn manuell von der Release-Seite herunter."
-            ),
+            detail="error.installer_corrupt",
         )
 
     try:
@@ -279,10 +283,8 @@ async def install_update() -> JSONResponse:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"Der Installer ließ sich nicht starten ({exc}). Bitte lade ihn "
-                "manuell von der Release-Seite herunter."
-            ),
+            detail={"code": "error.installer_launch_failed",
+                    "params": {"message": str(exc)}},
         )
 
     return JSONResponse(
@@ -297,3 +299,49 @@ async def install_update() -> JSONResponse:
         },
         background=BackgroundTask(_shutdown_after_grace),
     )
+
+
+# ---------------------------------------------------------------------------
+# Restart (#193) — the one-click update's pattern without the installer: start
+# our own exe again, detached, then leave. The new process waits for the port
+# (webapp.wait_for_free_port, up to RESTART_PORT_WAIT_SECONDS) because this one
+# still holds it for EXIT_DELAY_SECONDS. A source checkout cannot know how it
+# was started (venv, IDE, reloader), so there the answer is "not available"
+# and the SPA shows a hint instead of the button.
+# ---------------------------------------------------------------------------
+
+#: Marks the relaunched process: it waits for the port and opens no browser tab.
+RESTART_ENV = "LOCALBIB_RESTARTED"
+
+
+def _relaunch_self() -> None:
+    """Start this exe again, detached, with the same arguments."""
+    creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    )
+    env = dict(os.environ)
+    env[RESTART_ENV] = "1"
+    # PyInstaller >= 6.9: the child must set itself up as a new top-level
+    # instance instead of reusing this process' unpacked environment.
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(  # noqa: S603 - our own executable
+        [sys.executable, *sys.argv[1:]],
+        cwd=os.getcwd(),
+        env=env,
+        close_fds=True,
+        creationflags=creationflags,
+    )
+
+
+@router.post("/api/app/restart")
+async def restart_app() -> JSONResponse:
+    """Restart LocalBib (after an Add-on update or removal). Frozen build
+    only; a source checkout answers 409 ``error.restart_unavailable``."""
+    if not _running_frozen():
+        raise HTTPException(status_code=409, detail={"code": "error.restart_unavailable"})
+    try:
+        _relaunch_self()
+    except Exception as exc:  # noqa: BLE001 - the app keeps running; say why
+        raise HTTPException(status_code=500, detail={
+            "code": "error.restart_failed", "params": {"message": str(exc)[:300]}})
+    return JSONResponse({"status": "restarting"}, background=BackgroundTask(_shutdown_after_grace))

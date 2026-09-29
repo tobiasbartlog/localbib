@@ -157,6 +157,24 @@ async def list_papers(
     return papers
 
 
+def _remove_pdf_file_if_any(filename: str) -> None:
+    """Loescht die PDF-Datei eines Papers, falls vorhanden.
+
+    Importierte Eintraege (BibTeX/DOI/Migration) haben ``filename == ""`` --
+    ``os.path.join(Config.ALL_DIR, "")`` waere dann ``ALL_DIR`` selbst, ein
+    Verzeichnis, an dem ``os.remove`` mit einem OSError scheitert. Daher hier
+    zuerst auf eine nicht-leere Datei pruefen (wie der Bulk-Delete es schon
+    tut), statt das ALL_DIR anzufassen."""
+    if not filename:
+        return
+    fp = os.path.join(Config.ALL_DIR, filename)
+    if os.path.exists(fp):
+        try:
+            os.remove(fp)
+        except OSError as e:
+            logging.warning("PDF-Datei beim Loeschen nicht entfernbar: %s", e)
+
+
 @router.post("/api/papers/bulk-delete")
 async def bulk_delete_papers(payload: BulkDeleteRequest):
     """Loescht mehrere Papers auf einmal (z. B. einen ganzen Import wieder
@@ -170,14 +188,7 @@ async def bulk_delete_papers(payload: BulkDeleteRequest):
             if not row:
                 continue
             conn.execute("DELETE FROM papers WHERE id = ?", (pid,))
-            fn = row["filename"]
-            if fn:  # importierte Eintraege haben keine Datei -> ALL_DIR nicht anfassen
-                fp = os.path.join(Config.ALL_DIR, fn)
-                if os.path.exists(fp):
-                    try:
-                        os.remove(fp)
-                    except OSError as e:
-                        logging.warning("PDF-Datei beim Bulk-Delete nicht entfernbar: %s", e)
+            _remove_pdf_file_if_any(row["filename"])
             deleted += 1
         conn.commit()
     finally:
@@ -194,7 +205,7 @@ async def get_paper(paper_id: int):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
 
         cats = conn.execute(
@@ -232,7 +243,7 @@ async def update_paper(paper_id: int, data: PaperUpdate):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
 
         update_fields = []
@@ -306,15 +317,13 @@ async def delete_paper(paper_id: int):
     try:
         row = conn.execute("SELECT filename FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
 
         conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
         conn.commit()
 
         # Datei optional loeschen
-        filepath = os.path.join(Config.ALL_DIR, row["filename"])
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        _remove_pdf_file_if_any(row["filename"])
     finally:
         conn.close()
 
@@ -329,10 +338,10 @@ async def assign_paper_category(paper_id: int, data: PaperCategoryAssign):
     try:
         paper = conn.execute("SELECT filename FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not paper:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         cat = conn.execute("SELECT id FROM categories WHERE id = ?", (data.category_id,)).fetchone()
         if not cat:
-            raise HTTPException(status_code=404, detail="Kategorie nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.category_not_found")
     finally:
         conn.close()
 
@@ -348,7 +357,7 @@ async def remove_paper_category(paper_id: int, category_id: int):
     try:
         paper = conn.execute("SELECT filename FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not paper:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
 
         conn.execute(
             "DELETE FROM paper_categories WHERE paper_id = ? AND category_id = ?",
@@ -371,13 +380,13 @@ async def get_paper_pdf(paper_id: int):
     try:
         row = conn.execute("SELECT filename FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
     finally:
         conn.close()
 
     filepath = _safe_pdf_path(row["filename"])
     if not row["filename"] or not os.path.isfile(filepath):
-        raise HTTPException(status_code=404, detail="Kein PDF fuer dieses Paper")
+        raise HTTPException(status_code=404, detail="error.no_pdf_for_item")
     return FileResponse(
         filepath,
         media_type="application/pdf",
@@ -393,13 +402,13 @@ async def open_paper_pdf(paper_id: int):
     try:
         row = conn.execute("SELECT filename FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
     finally:
         conn.close()
 
     filepath = _safe_pdf_path(row["filename"])
     if not row["filename"] or not os.path.isfile(filepath):
-        raise HTTPException(status_code=404, detail="Kein PDF fuer dieses Paper")
+        raise HTTPException(status_code=404, detail="error.no_pdf_for_item")
     subprocess.Popen(["cmd", "/c", "start", "", filepath], shell=False)
     return {"status": "ok"}
 
@@ -411,13 +420,13 @@ async def download_paper_pdf(paper_id: int):
     try:
         row = conn.execute("SELECT filename FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
     finally:
         conn.close()
 
     filepath = _safe_pdf_path(row["filename"])
     if not row["filename"] or not os.path.isfile(filepath):
-        raise HTTPException(status_code=404, detail="Kein PDF fuer dieses Paper")
+        raise HTTPException(status_code=404, detail="error.no_pdf_for_item")
     return FileResponse(
         filepath,
         media_type="application/pdf",
@@ -432,7 +441,7 @@ async def get_paper_bibtex(paper_id: int):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
     finally:
         conn.close()
@@ -449,21 +458,22 @@ async def update_cite_key(paper_id: int, data: CiteKeyUpdate):
     if not key or not re.fullmatch(r"[^\s{},%#\\\"]+", key):
         raise HTTPException(
             status_code=422,
-            detail="Ungueltiger Cite Key (keine Leerzeichen, Klammern oder Kommas)",
+            detail="error.invalid_cite_key",
         )
 
     conn = _get_conn()
     try:
         row = conn.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         duplicate = conn.execute(
             "SELECT id FROM papers WHERE cite_key = ? AND id != ?", (key, paper_id)
         ).fetchone()
         if duplicate:
             raise HTTPException(
                 status_code=409,
-                detail=f"Cite Key '{key}' wird bereits von Paper {duplicate['id']} verwendet",
+                detail={"code": "error.cite_key_taken",
+                    "params": {"key": key, "id": duplicate["id"]}},
             )
         conn.execute(
             "UPDATE papers SET cite_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -490,7 +500,7 @@ async def update_notes(paper_id: int, data: NotesUpdate):
     try:
         row = conn.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         conn.execute(
             "UPDATE papers SET notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (data.notes, paper_id),

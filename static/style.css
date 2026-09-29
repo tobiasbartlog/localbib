@@ -23,6 +23,14 @@
   /* Fehlerrot. Als Token, weil die Ansage im Dark Mode sonst im Karton
      versinkt: #dc2626 auf #1f1e1a schafft keine 4.5:1. */
   --lb-danger:    #dc2626;
+  /* Status inks + tints (#168): done / running / failed for pills, dots and
+     the quality block. Ink on the light card; the dark theme swaps in the
+     design's own green/amber. The tints are alpha so they sit on any card. */
+  --lb-ok:        #1c7a45;
+  --lb-warn:      #8a6414;
+  --lb-ok-soft:   rgba(46, 204, 113, .16);
+  --lb-warn-soft: rgba(242, 178, 60, .16);
+  --lb-danger-soft: rgba(226, 72, 61, .14);
   --lb-shadow:    0 1px 0 rgba(26,26,26,.04);
   --lb-shadow-lg: 0 24px 48px -16px rgba(26,26,26,.22), 0 2px 4px rgba(26,26,26,.06);
 
@@ -37,13 +45,43 @@
   --lb-row-y:  22px;
   --lb-gap:    14px;
 
+  /* ── Motion tokens (#168) ───────────────────────────────────
+     Four durations, one curve, one stagger step. Dashboard transitions and
+     animations read these instead of `cubic-bezier` or duration literals;
+     app.js mirrors the numbers for rAF work (count-up, series morphing), so
+     the scale is documented here once.
+       --lb-dur-1  120ms  micro feedback: hover colour, focus ring, tooltip
+       --lb-dur-2  160ms  state flips: pills, chips, segment highlight
+       --lb-dur-3  280ms  enter/leave: cards, rows, page and tab crossfade
+       --lb-dur-4  320ms  data motion: growing bars, count-up, series morph
+       --lb-ease-out      fast start, long settle — no bounce, no overshoot
+       --lb-stagger 35ms  delay per staggered card/row, 30–40 ms by design;
+                          the entrance rule caps it at six steps (min(--lb-i, 5))
+     prefers-reduced-motion sets every duration to 0, and the JS side then
+     puts the end value in at once. */
+  --lb-dur-1: 120ms;
+  --lb-dur-2: 160ms;
+  --lb-dur-3: 280ms;
+  --lb-dur-4: 320ms;
+  --lb-ease-out: cubic-bezier(.16, 1, .3, 1);
+  --lb-stagger: 35ms;
+}
+/* Reduced motion zeroes the scale at the source: every token-driven duration
+   and stagger delay collapses without a second rule per component. */
+@media (prefers-reduced-motion: reduce) {
+  :root { --lb-dur-1: 0ms; --lb-dur-2: 0ms; --lb-dur-3: 0ms; --lb-dur-4: 0ms; --lb-stagger: 0ms; }
+}
+:root,
+:root[data-palette="sienna"] {
+
   /* ── Chart series palette (dataviz) ─────────────────────
      Slot 1 is the Sienna accent — single-series charts wear it alone.
      Fixed, CVD-validated order (adjacent-pair ΔE ≥ 8.4, validated with the
      dataviz skill's validate_palette.js against the white card surface);
      assigned in sequence, never cycled through generated hues. The remainder
      bucket ("Übrige Themen") deliberately wears the muted grey so it never
-     impersonates a topic. "Ohne Thema" (ADR-0012) is a *named* zone and gets
+     impersonates a topic. The unassigned zone (--lb-chart-unassigned; the
+     "Ohne Thema" band of ADR-0012) is a *named* zone and gets
      its own **light** warm neutral: the grey would file it back under
      leftovers, a palette slot would let it impersonate a topic — and a dark
      one turns the stacked area into a black mass, because this band is 43.8%
@@ -65,7 +103,7 @@
   --lb-chart-7: #4a3aa7;
   --lb-chart-8: #e34948;
   --lb-chart-other: #8e8a82;
-  --lb-chart-untopiced: #cfc7b4;
+  --lb-chart-unassigned: #cfc7b4;
 }
 
 :root[data-theme="dark"] {
@@ -85,6 +123,8 @@
   --lb-accent-soft:#3a1d0e;
   --lb-accent-ink:#ffb084;
   --lb-danger:    #f28b82;
+  --lb-ok:        #2ecc71;
+  --lb-warn:      #f2b23c;
   color-scheme: dark;
 
   /* Chart series on the dark card (validated against --lb-bg-elev #1f1e1a,
@@ -100,8 +140,19 @@
   --lb-chart-6: #008300;
   --lb-chart-7: #9085e9;
   --lb-chart-8: #e66767;
-  --lb-chart-untopiced: #6b6046;
+  --lb-chart-unassigned: #6b6046;
 }
+
+/* ── Stable design tokens — Add-on Contract surface (#190, ADR-0021) ──
+   An Add-on stylesheet may rely on exactly these; every other custom property
+   may change between core releases without notice. Renaming or removing one
+   is a contract change (plugin_api/CHANGELOG.md). Both themes define each.
+     Chart series   --lb-chart-1 … --lb-chart-8   fixed, CVD-validated order
+                    --lb-chart-other              remainder bucket (muted grey)
+                    --lb-chart-unassigned         a named "not assigned" zone
+     Motion         --lb-dur-1 … --lb-dur-4       120 / 160 / 280 / 320 ms,
+                                                  0 under reduced motion
+                    --lb-ease-out                 the one easing curve */
 
 /* ── Reset-ish ───────────────────────────────────────────── */
 body {
@@ -790,6 +841,15 @@ select.lb-tbtn { padding: 0 4px; }
   margin-bottom: 6px;
 }
 .lb-empty-text { max-width: 38ch; margin: 0 auto; font-size: 13.5px; line-height: 1.6; }
+/* The two ways into an empty library (#178). */
+.lb-empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 18px;
+}
+.lb-empty-actions > a { text-decoration: none; }
 
 /* ── Mono helper ─────────────────────────────────────────── */
 .lb-mono { font-family: var(--lb-font-mono); font-variant-numeric: tabular-nums; }
@@ -1459,7 +1519,6 @@ select.lb-tbtn { padding: 0 4px; }
 .lb-notes-editor .cm-variable-2 { color: var(--lb-accent); }   /* Listenmarker */
 .lb-notes-editor .cm-comment { color: var(--lb-mute); }
 
-
 /* ─────────────────────────────────────────────────────────── */
 /*        Tailwind-Standardpalette -> Tokens (nur Dark)        */
 /* ─────────────────────────────────────────────────────────── */
@@ -1583,3 +1642,75 @@ select.lb-tbtn { padding: 0 4px; }
    dunkler Knopf auf dunkler Schiene, der Schalter saehe leer aus. Er
    bekommt darum die Tinte als Flaeche, spiegelbildlich zum Light Mode. */
 :root[data-theme="dark"] .lb-knob { background-color: var(--lb-ink); }
+
+/* ── Umzugs-Assistent (PRD #173) ──────────────────────────────
+   Vier eigene Bausteine, die Tailwind-Utilities nicht sauber tragen:
+   die Schrittleiste, die Quellkarte, die Zahlenkachel und der
+   Auswahl-Chip. Alles andere an der Seite sind Utilities. Die Farben
+   kommen aus den Tokens, damit der Dark Mode ohne zweite Regel stimmt. */
+.lb-migrate-rail {
+  display: flex; flex-wrap: wrap; gap: 18px;
+  margin: 0 0 24px; padding: 0; list-style: none;
+}
+.lb-migrate-rail-step {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--lb-mute);
+}
+.lb-migrate-rail-step.is-active { color: var(--lb-ink); font-weight: 500; }
+.lb-migrate-rail-step.is-done { color: var(--lb-accent-ink); }
+.lb-migrate-rail-dot {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 999px;
+  border: 1px solid var(--lb-hairline-2);
+  font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.lb-migrate-rail-step.is-active .lb-migrate-rail-dot {
+  background: var(--lb-accent); border-color: var(--lb-accent); color: #fff;
+}
+.lb-migrate-rail-step.is-done .lb-migrate-rail-dot {
+  background: var(--lb-accent-soft); border-color: var(--lb-accent-soft);
+  color: var(--lb-accent-ink);
+}
+
+.lb-migrate-card {
+  display: flex; flex-direction: column; gap: 6px; text-align: left;
+  padding: 14px 16px; border-radius: 12px;
+  border: 1px solid var(--lb-hairline);
+  background: var(--lb-bg-elev);
+  transition: border-color var(--lb-dur-2), background var(--lb-dur-2);
+}
+.lb-migrate-card:hover:not(.is-disabled) { border-color: var(--lb-accent); }
+.lb-migrate-card.is-selected {
+  border-color: var(--lb-accent); background: var(--lb-accent-soft);
+}
+.lb-migrate-card.is-disabled { opacity: .5; cursor: not-allowed; }
+.lb-migrate-card-head { display: flex; align-items: center; gap: 8px; }
+.lb-migrate-card-title { font-size: 14px; font-weight: 600; color: var(--lb-ink); }
+.lb-migrate-card-hint { font-size: 12px; line-height: 1.45; color: var(--lb-ink-3); }
+.lb-migrate-badge {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+  padding: 2px 6px; border-radius: 999px;
+  background: var(--lb-bg-soft); color: var(--lb-mute);
+}
+
+.lb-migrate-tiles {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+}
+.lb-migrate-tile {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 12px 14px; border-radius: 10px;
+  border: 1px solid var(--lb-hairline); background: var(--lb-bg-elev);
+  font-size: 12px; color: var(--lb-ink-3);
+}
+.lb-migrate-tile-num {
+  font-size: 22px; font-weight: 600; color: var(--lb-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.lb-migrate-chip {
+  padding: 3px 10px; border-radius: 999px; font-size: 12px;
+  border: 1px solid var(--lb-hairline-2); background: var(--lb-bg-elev);
+  color: var(--lb-ink-2);
+}
+.lb-migrate-chip:hover { border-color: var(--lb-accent); color: var(--lb-accent-ink); }

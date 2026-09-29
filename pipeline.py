@@ -23,9 +23,9 @@ def process_paper(filepath: str, db: Database) -> Optional[int]:
     2. Text extrahieren (OCR)
     3. DOI suchen → CrossRef Metadaten
     4. LLM-Kategorisierung
-    5. In DB speichern
-    6. Datei umbenennen + in "all" kopieren
-    7. Symlinks erstellen
+    5. Datei umbenennen + in "all" kopieren
+    6. In DB speichern (erst nach der Kopie, s. u.)
+    7. Kategorien zuweisen, Symlinks erstellen
     8. Abgeleitete Indizes: Chunks + Embeddings (Research-Chat/semantische Suche)
 
     Gibt paper_id zurück oder None bei Fehler.
@@ -37,8 +37,18 @@ def process_paper(filepath: str, db: Database) -> Optional[int]:
 
     # 1. Duplikat-Check
     file_hash = compute_file_hash(filepath)
-    if db.paper_exists(file_hash):
+    existing = db.find_duplicate_paper(file_hash=file_hash)
+    if existing:
         logging.info(f"⏭️  Bereits in Datenbank (Hash: {file_hash[:12]}...)")
+        # The row exists but its copy in all/ does not (an earlier run died
+        # between the two): this input is the only copy left — restore it
+        # before the input is removed, never delete it unrestored.
+        stored_name = os.path.basename(existing.get("filename") or "")
+        stored_path = os.path.join(Config.ALL_DIR, stored_name)
+        if stored_name and not os.path.exists(stored_path):
+            shutil.copy2(filepath, stored_path)
+            create_symlinks(db, existing["id"], stored_name)
+            logging.info(f"🩹 Fehlende Datei wiederhergestellt: all/{stored_name}")
         # Datei aus Input-Ordner entfernen, damit sie nicht immer wieder auftaucht
         try:
             os.remove(filepath)
@@ -159,23 +169,36 @@ def process_paper(filepath: str, db: Database) -> Optional[int]:
         "ocr_text": text[:10000],
     }
 
-    paper_id = db.add_paper(paper_data)
+    # Datei zuerst, dann die DB-Zeile: eine Zeile ohne Datei liesse den
+    # naechsten Lauf das Input-PDF als "Duplikat" loeschen. Scheitert die
+    # Zeile, wird die Kopie wieder entfernt und das Input bleibt liegen.
+    shutil.copy2(filepath, target_path)
+    logging.info(f"📁 Kopiert nach: all/{new_filename}")
+    try:
+        paper_id = db.add_paper(paper_data)
+    except Exception:
+        try:
+            os.remove(target_path)
+        except OSError:
+            pass
+        raise
     logging.info(f"💾 Paper gespeichert (ID: {paper_id})")
 
-    # Kategorien zuweisen
+    # 7. Kategorien zuweisen — ein Fehler hier kostet nie den Import selbst
     for assignment in assignments:
         cat_id = assignment.get("category_id")
         confidence = assignment.get("confidence", 0.0)
-        if cat_id:
+        if not cat_id:
+            continue
+        try:
             db.assign_category(paper_id, cat_id, confidence)
-            cat_name = next(
-                (c["name"] for c in categories_json if c["id"] == cat_id), "?"
-            )
-            logging.info(f"  🏷️  → {cat_name} (Konfidenz: {confidence:.0%})")
-
-    # 7. Datei kopieren
-    shutil.copy2(filepath, target_path)
-    logging.info(f"📁 Kopiert nach: all/{new_filename}")
+        except Exception as e:
+            logging.warning(f"⚠️  Kategorie {cat_id} nicht zugewiesen: {e}")
+            continue
+        cat_name = next(
+            (c["name"] for c in categories_json if c["id"] == cat_id), "?"
+        )
+        logging.info(f"  🏷️  → {cat_name} (Konfidenz: {confidence:.0%})")
 
     # 8. Symlinks erstellen
     create_symlinks(db, paper_id, new_filename)

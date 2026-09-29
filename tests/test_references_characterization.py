@@ -141,7 +141,7 @@ class TestExtractReferences:
     def test_404_paper_not_found(self, client, db):
         resp = client.post("/api/papers/99999/extract-references")
         assert resp.status_code == 404
-        assert "nicht gefunden" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.item_not_found"
 
     def test_400_no_pdf_filename(self, client, db):
         """A paper row without a filename yields 400."""
@@ -158,7 +158,7 @@ class TestExtractReferences:
             conn.close()
         resp = client.post(f"/api/papers/{pid}/extract-references")
         assert resp.status_code == 400
-        assert "PDF" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.no_pdf_present"
 
     def test_404_pdf_file_missing_on_disk(self, client, db):
         """Paper has a filename, but the file is absent from ALL_DIR → 404."""
@@ -434,7 +434,7 @@ class TestUpdateReference:
             json={"title": "New Title"},
         )
         assert resp.status_code == 404
-        assert "Referenz" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.reference_not_found"
 
     def test_404_wrong_paper_id(self, client, db):
         """A ref that belongs to a different paper → 404."""
@@ -520,7 +520,7 @@ class TestDeleteReference:
         pid = _seed_paper(db, filename="del404.pdf")
         resp = client.delete(f"/api/papers/{pid}/references/77777")
         assert resp.status_code == 404
-        assert "Referenz" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.reference_not_found"
 
     def test_404_wrong_paper_id(self, client, db):
         """Ref belonging to a different paper → 404."""

@@ -9,6 +9,7 @@ import pytest
 import respx
 
 import webapp
+import paper_ingest
 import pdf_chunking
 import routers.bibtex_import as _bibtex_router
 from openalex_client import BASE_URL
@@ -91,7 +92,7 @@ def test_attach_finalize_whole_book_runs_processing(client, db, fake_text_extrac
         files={"file": ("book.pdf", data, "application/pdf")},
     )
     # categorize_with_llm moved to routers/bibtex_import.py (#84)
-    with patch.object(_bibtex_router, "categorize_with_llm", return_value=[]) as cat:
+    with patch.object(paper_ingest, "categorize_with_llm", return_value=[]) as cat:
         r = client.post(
             f"/api/papers/{paper_id}/attach-finalize",
             json={"trim": None, "do_categories": True, "do_chunks": False},
@@ -115,15 +116,17 @@ def _metadata_only_paper(client, key="attachme2020", title="Attach Me", doi=""):
 
 @pytest.fixture
 def no_llm_categorize():
-    # categorize_with_llm is now used inside routers/bibtex_import.py (#84)
-    with patch.object(_bibtex_router, "categorize_with_llm", return_value=[]) as m:
+    # categorize_with_llm is used inside the neutral paper_ingest module (ADR-0016)
+    with patch.object(paper_ingest, "categorize_with_llm", return_value=[]) as m:
         yield m
 
 
 @pytest.fixture
 def fake_text_extraction():
-    # extract_text_from_pdf is now used inside routers/bibtex_import.py (#84)
-    with patch.object(_bibtex_router, "extract_text_from_pdf", return_value="Volltext aus PDF"):
+    # extract_text_from_pdf: the attach path reads it in paper_ingest (ADR-0016),
+    # the trim path of attach-finalize still in routers/bibtex_import.py.
+    with patch.object(paper_ingest, "extract_text_from_pdf", return_value="Volltext aus PDF"), \
+         patch.object(_bibtex_router, "extract_text_from_pdf", return_value="Volltext aus PDF"):
         yield
 
 
@@ -283,7 +286,10 @@ def test_fetch_oa_pdf_rejects_landing_page(client, db):
     resp = client.post(f"/api/papers/{paper_id}/fetch-oa-pdf",
                        json={"url": "https://journal.example.org/view"})
     assert resp.status_code == 422
-    assert "text/html" in resp.json()["detail"]
+    assert resp.json()["detail"] == {
+        "code": "error.url_not_pdf",
+        "params": {"contentType": "text/html"},
+    }
 
 
 @respx.mock

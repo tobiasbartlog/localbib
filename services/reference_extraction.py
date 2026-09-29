@@ -178,7 +178,7 @@ def split_reference_text(ref_text: str, max_chars: int = REF_CHUNK_MAX_CHARS) ->
 
 def extract_references_from_chunk(chunk: str) -> list[dict]:
     """Extrahiert strukturierte Referenzen aus EINEM Text-Chunk via LLM."""
-    if not Config.KICONNECT_API_KEY:
+    if not Config.llm_ready("fast"):
         return []
     return _llm_extract_references_single(chunk)
 
@@ -190,7 +190,7 @@ def llm_extract_references(ref_text: str) -> list[dict]:
     Bequemer Wrapper fuer Aufrufer ohne Feinfortschritt (z.B. Bulk-Extraktion).
     Der Single-Paper-Weg iteriert stattdessen selbst ueber
     ``split_reference_text`` + ``extract_references_from_chunk``."""
-    if not Config.KICONNECT_API_KEY:
+    if not Config.llm_ready("fast"):
         return []
     all_refs: list[dict] = []
     for chunk in split_reference_text(ref_text):

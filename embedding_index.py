@@ -200,7 +200,7 @@ def reindex_chunks() -> dict:
         {"indexed": int, "skipped": int, "errors": int, "total": int,
          "model": str, "dim": int}
     """
-    model = (Config.LLM_EMBED_MODEL or "").strip()
+    model = Config.embed_model()
     if not model:
         return {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
 
@@ -263,7 +263,7 @@ def embed_paper_to_db(paper_id: int) -> bool:
     ``reindex_papers``. Idempotent: ist das Paper bereits mit dem aktuell
     konfigurierten Modell indexiert, wird nichts erneut geschickt.
     """
-    model = (Config.LLM_EMBED_MODEL or "").strip()
+    model = Config.embed_model()
     if not model:
         return False
 
@@ -321,7 +321,7 @@ def embed_chunks_for_paper(paper_id: int) -> int:
 
     Returns: Anzahl der in diesem Lauf neu embeddeten Chunks.
     """
-    model = (Config.LLM_EMBED_MODEL or "").strip()
+    model = Config.embed_model()
     if not model:
         return 0
 
@@ -379,7 +379,7 @@ def reindex_papers() -> dict:
         {"indexed": int, "skipped": int, "errors": int, "total": int,
          "model": str, "dim": int}
     """
-    model = (Config.LLM_EMBED_MODEL or "").strip()
+    model = Config.embed_model()
     if not model:
         return {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
 
@@ -456,7 +456,7 @@ def embedding_status() -> dict:
     Chunk-Reindex noch aussteht; dafuer gibt es keine eigene Chunk-Dimension im
     Response, die Chunk-Zaehler allein reichen fuer den Fortschrittsbalken).
     Funktioniert auch ohne konfiguriertes Modell (n=0)."""
-    model = (Config.LLM_EMBED_MODEL or "").strip()
+    model = Config.embed_model()
     conn = _get_conn()
     try:
         total = conn.execute("SELECT COUNT(*) AS n FROM papers").fetchone()["n"]
@@ -494,7 +494,7 @@ def semantic_paper_ids(query: str, top_k: int = 20) -> list | None:
     ranking math re-used verbatim from ``routers/search.py``).
 
     Returns ``None`` -- not an empty list -- whenever semantic ranking
-    cannot run at all: no query text, no ``LLM_EMBED_MODEL`` configured, no
+    cannot run at all: no query text, no embedding role bound, no
     indexed vectors for the currently configured model (PRD Entscheidung 7:
     never compare vectors across models), or the query-embed HTTP call
     fails. Callers use that ``None`` to fall back to a lexical search
@@ -510,7 +510,7 @@ def semantic_paper_ids(query: str, top_k: int = 20) -> list | None:
     query = (query or "").strip()
     if not query:
         return None
-    model = (Config.LLM_EMBED_MODEL or "").strip()
+    model = Config.embed_model()
     if not model:
         return None
 

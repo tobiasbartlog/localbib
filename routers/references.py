@@ -30,11 +30,11 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import List, Optional
 
 import services.reference_extraction as _ref_svc
 from context import get_conn
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from literature_manager import Config
 from pydantic import BaseModel
@@ -66,6 +66,18 @@ class ReferenceCreate(BaseModel):
     doi: Optional[str] = ""
 
 
+class BulkExtractRequest(BaseModel):
+    """Optional body of the bulk extraction (#174).
+
+    Without it the endpoint keeps its old meaning: every item in the library
+    that has a PDF and no references yet. With ``paper_ids`` the run is limited
+    to those items — how a migration extracts references for *its* import
+    instead of for the whole library (PRD #173).
+    """
+
+    paper_ids: Optional[List[int]] = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -79,16 +91,29 @@ def _sse(data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 @router.post("/api/papers/bulk-extract-references")
-async def bulk_extract_references():
-    """Extrahiert Referenzen fuer alle Paper die noch keine haben, mit SSE-Fortschritt."""
+async def bulk_extract_references(payload: Optional[BulkExtractRequest] = Body(None)):
+    """Extrahiert Referenzen fuer alle Paper die noch keine haben, mit SSE-Fortschritt.
+
+    Der Body ist optional: ohne ihn bleibt es der Lauf ueber die ganze
+    Bibliothek, mit ``paper_ids`` bleibt er auf diese Eintraege beschraenkt
+    (#174). Die Bedingung "hat PDF, hat noch keine Referenzen" gilt in beiden
+    Faellen — eine Auswahl engt ein, sie hebt nichts auf.
+    """
+    paper_ids = payload.paper_ids if payload else None
+    sql = """SELECT p.id, p.title, p.filename FROM papers p
+             WHERE p.filename IS NOT NULL AND p.filename != ''
+             AND p.id NOT IN (SELECT DISTINCT source_paper_id FROM paper_references)"""
+    params: list = []
+    if paper_ids:
+        sql += " AND p.id IN (%s)" % ",".join("?" for _ in paper_ids)
+        params = list(paper_ids)
+    elif paper_ids is not None:
+        # An explicit empty selection means "nothing", not "everything".
+        sql += " AND 0"
+
     conn = _get_conn()
     try:
-        rows = conn.execute(
-            """SELECT p.id, p.title, p.filename FROM papers p
-               WHERE p.filename IS NOT NULL AND p.filename != ''
-               AND p.id NOT IN (SELECT DISTINCT source_paper_id FROM paper_references)
-               ORDER BY p.id"""
-        ).fetchall()
+        rows = conn.execute(sql + " ORDER BY p.id", params).fetchall()
         candidates = [dict(r) for r in rows]
     finally:
         conn.close()
@@ -202,7 +227,7 @@ async def extract_references(paper_id: int, force: bool = Query(False)):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
         existing_count = conn.execute(
             "SELECT COUNT(*) as cnt FROM paper_references WHERE source_paper_id = ?", (paper_id,)
@@ -212,10 +237,10 @@ async def extract_references(paper_id: int, force: bool = Query(False)):
 
     filename = paper.get("filename", "")
     if not filename:
-        raise HTTPException(status_code=400, detail="Kein PDF vorhanden")
+        raise HTTPException(status_code=400, detail="error.no_pdf_present")
     filepath = os.path.join(Config.ALL_DIR, filename)
     if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="PDF-Datei nicht gefunden")
+        raise HTTPException(status_code=404, detail="error.pdf_file_not_found")
 
     async def generate():
         # Bereits extrahiert und kein force?
@@ -385,7 +410,7 @@ async def get_paper_references(paper_id: int):
     try:
         row = conn.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
 
         refs = conn.execute(
             """SELECT pr.*, p.title as matched_title, p.authors as matched_authors
@@ -415,7 +440,7 @@ async def update_reference(paper_id: int, ref_id: int, data: ReferenceUpdate):
             (ref_id, paper_id),
         ).fetchone()
         if not ref:
-            raise HTTPException(status_code=404, detail="Referenz nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.reference_not_found")
 
         updates = []
         values = []
@@ -459,7 +484,7 @@ async def delete_reference(paper_id: int, ref_id: int):
             (ref_id, paper_id),
         ).fetchone()
         if not ref:
-            raise HTTPException(status_code=404, detail="Referenz nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.reference_not_found")
         conn.execute("DELETE FROM paper_references WHERE id = ?", (ref_id,))
         conn.commit()
     finally:
@@ -474,7 +499,7 @@ async def add_reference(paper_id: int, data: ReferenceCreate):
     try:
         row = conn.execute("SELECT id FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
 
         max_idx = conn.execute(
             "SELECT COALESCE(MAX(ref_index), 0) as m FROM paper_references WHERE source_paper_id = ?",

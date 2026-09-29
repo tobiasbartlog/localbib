@@ -238,9 +238,10 @@ def test_legacy_supporter_counts_as_unactivated_but_gets_the_note(client, frozen
 
     assert body["activated"] is False
     assert body["legacy_supporter"] is True
-    assert body["legacy_note"]
-    assert "support@localbib.com" in body["legacy_note"]
-    assert "kostenlos" in body["legacy_note"]
+    # Der Satz selbst lebt seit ADR-0018 im Katalog; hier wird geprueft, dass
+    # ueberhaupt einer angefordert wird. Dass er die kostenlose Adresse nennt,
+    # bewacht tests/js/i18n_parity.test.js - dort, wo der Text jetzt steht.
+    assert body["legacy_note"] == license_state.LEGACY_SUPPORTER_NOTE
 
 
 def test_legacy_supporter_is_never_locked_out_silently(client, frozen):
@@ -389,11 +390,14 @@ def test_derive_tolerates_a_timezone_aware_stamp():
 # Price — one constant, one place (#154)
 # ---------------------------------------------------------------------------
 
-def test_status_carries_the_price_display_alongside_the_checkout_url(client):
+def test_status_carries_the_price_alongside_the_checkout_url(client):
     """GET /api/license/status is the SPA's only source for the price — no new
-    endpoint, the existing response just grows one field."""
+    endpoint, the existing response just grows two fields. Amount and currency
+    travel separately because the decimal separator belongs to the chosen UI
+    language, not to the server (ADR-0018)."""
     body = _status(client)
-    assert body["price_display"] == license_state.PRICE_DISPLAY
+    assert body["price_amount"] == license_state.PRICE_AMOUNT
+    assert body["price_currency"] == license_state.PRICE_CURRENCY
     assert "checkout_url" in body  # still present, unchanged shape
 
 
@@ -409,4 +413,4 @@ def test_context_glossary_pins_the_price_to_the_constant():
     The test itself *does* ship, so it skips where the file it guards cannot
     exist — the pin still holds in the one repo that owns the glossary."""
     context = (REPO_ROOT / "CONTEXT.md").read_text(encoding="utf-8")
-    assert license_state.PRICE_DISPLAY in context
+    assert f"{license_state.PRICE_AMOUNT:.2f} {license_state.PRICE_CURRENCY}" in context

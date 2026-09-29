@@ -35,7 +35,7 @@ describe('Lizenz-Tab bei einem Altbestand aus dem früheren Shop', () => {
         expect(note.textContent).toContain('support@localbib.com');
         // Die Testphase laeuft noch — der Hinweis ist eine Erklaerung, keine Sperre.
         expect(document.querySelector('[data-testid="license-trial"]').textContent)
-            .toContain('noch 6 Tage');
+            .toContain('6 days left');
         expect(document.querySelector('[data-testid="license-key-input"]')).not.toBeNull();
     });
 });

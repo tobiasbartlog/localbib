@@ -353,21 +353,21 @@ class TestAnalysisThesisErrorPaths:
             files={"file": ("essay.docx", b"content", "application/octet-stream")},
         )
         assert resp.status_code == 400
-        assert "PDF" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.only_pdf_accepted"
 
     def test_400_no_pages_extracted(self, client, db):
         """When _extract_all_pdf_pages returns [] → 400."""
         with _patch_pages([]):
             resp = _upload(client)
         assert resp.status_code == 400
-        assert "gelesen" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.pdf_unreadable"
 
     def test_400_no_reference_section(self, client, db):
         """When _find_reference_section returns '' → 400."""
         with _patch_pages(), patch.object(_analysis_router, "_find_reference_section", return_value=""):
             resp = _upload(client)
         assert resp.status_code == 400
-        assert "Literaturverzeichnis" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.no_bibliography"
 
     def test_400_reference_section_too_short(self, client, db):
         """Quirk frozen: ref sections with < 50 chars trigger the same 400 as empty."""
@@ -375,14 +375,14 @@ class TestAnalysisThesisErrorPaths:
                                           return_value="Too short."):
             resp = _upload(client)
         assert resp.status_code == 400
-        assert "Literaturverzeichnis" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.no_bibliography"
 
     def test_400_llm_returns_no_references(self, client, db):
         """When _llm_extract_references returns [] → 400."""
         with _patch_pages(), _patch_ref_section(), _patch_llm_refs([]):
             resp = _upload(client)
         assert resp.status_code == 400
-        assert "Referenzen" in resp.json()["detail"]
+        assert resp.json()["detail"] == "error.no_references_detected"
 
 
 # ===========================================================================

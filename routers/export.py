@@ -6,8 +6,10 @@ Serves:
   GET  /api/export/preview
   POST /api/import/ris
 
-Pure move from webapp.py (Backend-Modularisierung #82). No behaviour change.
-Output is byte-identical to the previous webapp.py handlers.
+Pure move from webapp.py (Backend-Modularisierung #82); the export side is
+byte-identical to the previous webapp.py handlers. The RIS *import* lost its
+hand-rolled parser in #174 — reading a .ris file is now ``ris_import``'s job,
+shared with the migration wizard (PRD #173); the response shape is unchanged.
 Shared state (Config, Database) comes from literature_manager; the cite-key
 helper is imported from cite_key_generator (its existing neutral home).
 """
@@ -26,6 +28,7 @@ from fastapi import APIRouter, File, Query, UploadFile
 from starlette.responses import StreamingResponse
 
 import bibtex_builder
+import ris_import
 from cite_key_generator import base_key as _legacy_cite_key_base
 from literature_manager import Config, Database
 
@@ -149,50 +152,18 @@ async def export_preview(
 
 @router.post("/api/import/ris")
 async def import_ris(file: UploadFile = File(...)):
-    """Importiert Paper aus einer RIS-Datei (Citavi, Zotero, Mendeley)."""
+    """Importiert Paper aus einer RIS-Datei (Citavi, Zotero, Mendeley).
+
+    Der handgeschriebene Parser, der hier stand, kannte neun Tags und keine
+    Fortsetzungszeilen; seit #174 liegt das Lesen in ``ris_import`` (PRD #173).
+    Die Antwortform ist unveraendert — es kommt nur mehr an: umgebrochene
+    Abstracts und jeder weitere Tag im ``raw_metadata``.
+    """
     db = _get_db()
     content = await file.read()
     text = content.decode("utf-8", errors="replace")
 
-    entries = []
-    current = {}
-
-    for line in text.splitlines():
-        line = line.rstrip()
-        if not line:
-            continue
-
-        if len(line) >= 6 and line[2:6] == "  - ":
-            tag = line[:2].strip()
-            value = line[6:].strip()
-
-            if tag == "TY":
-                current = {"type": value}
-            elif tag == "ER":
-                if current and current.get("title"):
-                    entries.append(current)
-                current = {}
-            elif tag in ("T1", "TI"):
-                current["title"] = value
-            elif tag in ("AU", "A1"):
-                current.setdefault("authors", []).append(value)
-            elif tag in ("PY", "Y1"):
-                year_match = re.search(r"(\d{4})", value)
-                if year_match:
-                    current["year"] = int(year_match.group(1))
-            elif tag == "DO":
-                current["doi"] = value
-            elif tag in ("JO", "JF", "T2"):
-                current.setdefault("journal", value)
-            elif tag in ("AB", "N2"):
-                current["abstract"] = value
-            elif tag == "PB":
-                current["publisher"] = value
-            elif tag == "SN":
-                current["isbn"] = value
-
-    if current and current.get("title"):
-        entries.append(current)
+    entries = ris_import.to_legacy_entries(text)
 
     results = []
     for entry in entries:

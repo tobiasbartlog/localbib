@@ -18,7 +18,7 @@ function selectFile() {
 }
 
 function uncheck(label) {
-    const modal = findByText('h3', 'PDF verarbeiten').closest('div');
+    const modal = findByText('h3', 'Process PDF').closest('div');
     const box = [...modal.querySelectorAll('label')]
         .find((l) => l.textContent.includes(label))
         .querySelector('input[type=checkbox]');
@@ -51,17 +51,17 @@ describe('attach pdf two-phase flow (book)', () => {
         selectFile();
         await flush();
         uncheck('Text/OCR');
-        uncheck('Referenzen');
+        uncheck('references');
         await flush();
-        findByText('button', 'Starten').click();
+        findByText('button', 'Start').click();
         await flush(); await flush(); await flush();
 
         // Trim modal appears, nothing finalized yet.
-        expect(findByText('h3', 'Buch erkannt')).toBeTruthy();
+        expect(findByText('h3', 'Book detected')).toBeTruthy();
         expect(calls.some((c) => /attach-finalize/.test(c.url))).toBe(false);
 
         // Confirm trimming -> finalize with the suggested range.
-        findByText('button', 'Zuschneiden').click();
+        findByText('button', 'Trim').click();
         await flush(); await flush(); await flush();
 
         const fin = calls.find((c) => c.method === 'POST' && /attach-finalize/.test(c.url));

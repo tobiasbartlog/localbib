@@ -20,6 +20,7 @@ import pytest
 import webapp
 from embedding_index import pack_vector
 from literature_manager import Config
+from tests.llm_helpers import configure_llm, llm_off
 
 
 def _seed_chunk(db, paper_id: int, text: str, chunk_index: int = 0, page_start: int = 1) -> int:
@@ -56,7 +57,7 @@ class TestHybridRetrievalUsed:
         cosine match to the (mocked) query embedding, must be surfaced -- BM25
         alone would never find it. A second chunk matches the question
         lexically but has no embedding, pulling the response into hybrid mode."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
 
         semantic_chunk_id = _seed_chunk(
             db, seed_paper, "Der Ofen brennt bei sehr hohen Temperaturen stundenlang.",
@@ -104,7 +105,7 @@ class TestRegressionWithoutEmbedModel:
     def test_no_embed_model_behaves_exactly_like_bm25_only(self, client, seed_paper, db, monkeypatch):
         """Without LLM_EMBED_MODEL configured, no embedding call is attempted
         and the answer/sources are identical to the pre-#103 BM25-only path."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "")
+        configure_llm(monkeypatch, embedding="")
 
         _seed_chunk(db, seed_paper, "machine learning methods for materials science", page_start=1)
 
@@ -135,7 +136,7 @@ class TestRegressionWithoutEmbedModel:
         this chat have a stored vector -- must degrade to BM25 without
         calling embed_texts (mirrors routers/search.py's model-mismatch
         fallback)."""
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         _seed_chunk(db, seed_paper, "machine learning methods for materials science", page_start=1)
 
         with patch("routers.research_chat.embed_texts") as mock_embed, \
@@ -155,7 +156,7 @@ class TestRegressionWithoutEmbedModel:
 
 class TestEmbedFailureDegrades:
     def test_embed_http_failure_degrades_to_bm25_answer_still_returned(self, client, seed_paper, db, monkeypatch):
-        monkeypatch.setattr(Config, "LLM_EMBED_MODEL", "test-embed-model")
+        configure_llm(monkeypatch, embedding="test-embed-model")
         chunk_id = _seed_chunk(db, seed_paper, "machine learning methods for materials science", page_start=1)
         _seed_chunk_embedding(db, chunk_id, "test-embed-model", [1.0, 0.0])
 

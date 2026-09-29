@@ -13,7 +13,39 @@ from config import Config
 
 
 class LLMClientError(Exception):
-    pass
+    """An LLM call failed at the transport/HTTP level.
+
+    ``status`` is the HTTP status (``None`` for a network error), ``model`` the
+    model that was asked. ``kind`` classifies the failure for callers that
+    degrade instead of aborting (the import keeps going without categories
+    or abstract) so the UI can say *why* the AI step was skipped: a free-tier
+    model that is rate-limited upstream reads very differently from a wrong
+    API key, and neither is a bug in the app.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, model: str = "") -> None:
+        super().__init__(message)
+        self.status = status
+        self.model = model
+
+    @property
+    def kind(self) -> str:
+        """``rate_limited`` (429), ``auth`` (401/403) or ``unavailable``."""
+        if self.status == 429:
+            return "rate_limited"
+        if self.status in (401, 403):
+            return "auth"
+        return "unavailable"
+
+    def as_failure(self, step: str) -> dict:
+        """The wire shape a degraded caller reports for ``step``."""
+        return {
+            "step": step,
+            "kind": self.kind,
+            "status": self.status,
+            "model": self.model,
+            "detail": str(self)[:200],
+        }
 
 
 # =============================================================================
@@ -110,13 +142,20 @@ def llm_for(task: str, model: str | None = None) -> "LLMClient":
     """Baut den LLMClient fuer einen Task laut TASK_MODELS.
 
     Ein unbekannter Task ist ein Programmierfehler (KeyError).
-    ``model`` uebersteuert die Tabelle (z. B. Plugin-Requests mit explizitem
-    Modellwunsch)."""
+    ``model`` uebersteuert das Modell der Rolle (z. B. Plugin-Requests mit
+    explizitem Modellwunsch) — die *Verbindung* bleibt die der Rolle: ein
+    Plugin nennt nie einen Endpunkt, nur seine Absicht.
+
+    Endpunkt (URL + Key) und Modell kommen aus ``Config.llm_endpoint(tier)``,
+    also aus der Verbindung, an die die Rolle gebunden ist. Ohne nutzbare
+    Rolle entsteht ein Client ohne URL — die Gates davor (``llm_ready``)
+    verhindern den Aufruf; kommt es doch dazu, scheitert der Request als
+    ``LLMClientError`` statt still."""
     tier = TASK_MODELS[task]
-    resolved = model or (
-        Config.fast_model() if tier == "fast" else Config.reasoning_model()
-    )
-    return LLMClient(Config.KICONNECT_API_URL, resolved, Config.KICONNECT_API_KEY)
+    ep = Config.llm_endpoint(tier)
+    if ep is None:
+        return LLMClient("", model or "", "")
+    return LLMClient(ep["chat_url"], model or ep["model"], ep["api_key"])
 
 
 # =============================================================================
@@ -139,16 +178,6 @@ _EMBED_QUERY_INSTRUCTION = (
 )
 
 
-def _embed_url() -> str:
-    """Embeddings-Endpunkt: ``LLM_EMBED_URL`` falls gesetzt (jeder
-    OpenAI-kompatible Anbieter, z. B. Ollama), sonst von ``KICONNECT_API_URL``
-    abgeleitet (``/chat/completions`` -> ``/embeddings``)."""
-    override = (Config.LLM_EMBED_URL or "").strip()
-    if override:
-        return override
-    return Config.KICONNECT_API_URL.replace("/chat/completions", "/embeddings")
-
-
 def _embed_request(url: str, headers: dict, model: str, chunk: list[str]) -> list[list[float]]:
     """Ein Embeddings-Request fuer <= EMBED_REQUEST_CHUNK_SIZE Texte, mit
     gedeckeltem 429/5xx-Backoff und Vollstaendigkeits-Pruefung der Antwort."""
@@ -164,7 +193,10 @@ def _embed_request(url: str, headers: dict, model: str, chunk: list[str]) -> lis
         if len(vectors) != len(chunk) or any(v is None for v in vectors):
             raise LLMClientError("Embeddings-Antwort unvollstaendig")
         return vectors
-    raise LLMClientError(f"Embeddings HTTP {resp.status_code}: {LLMClient._error_body(resp)}")
+    raise LLMClientError(
+        f"Embeddings HTTP {resp.status_code}: {LLMClient._error_body(resp)}",
+        status=resp.status_code, model=model,
+    )
 
 
 def embed_texts(texts: list[str], *, mode: str = "document") -> list[list[float]]:
@@ -176,30 +208,34 @@ def embed_texts(texts: list[str], *, mode: str = "document") -> list[list[float]
     empfohlenen Instruktions-Prefix hinzu (asymmetrisches Retrieval); der
     Default ``mode="document"`` laesst die Texte unveraendert.
 
-    Wirft ``NotImplementedError``, wenn kein Embedding-Modell konfiguriert ist
-    (``LLM_EMBED_MODEL`` leer) — Aufrufer muessen degradieren (discovery A4,
+    Endpunkt, Key und Modell kommen aus der Embedding-Rolle
+    (``Config.llm_endpoint("embedding")``) — die Rolle kann an eine andere
+    Verbindung gebunden sein als die Chat-Rollen (z. B. Ollama fuer
+    Embeddings, OpenAI fuer den Chat); frueher ging der Chat-Key an den
+    Embedding-Endpunkt, was genau diesen Fall brach.
+
+    Wirft ``NotImplementedError``, wenn die Embedding-Rolle nicht nutzbar ist
+    (kein Modell gebunden) — Aufrufer muessen degradieren (discovery A4,
     z. B. auf lexikalisches Ranking). Wirft ``LLMClientError`` bei HTTP- oder
     Validierungsfehlern.
     """
     if mode not in ("query", "document"):
         raise ValueError(f"embed_texts: unbekannter mode {mode!r}")
-    model = (Config.LLM_EMBED_MODEL or "").strip()
-    if not model:
-        raise NotImplementedError("Kein Embedding-Modell konfiguriert (LLM_EMBED_MODEL).")
+    ep = Config.llm_endpoint("embedding")
+    if ep is None:
+        raise NotImplementedError("Kein Embedding-Modell konfiguriert (Rolle 'embedding').")
     if not texts:
         return []
 
     inputs = [_EMBED_QUERY_INSTRUCTION + t for t in texts] if mode == "query" else list(texts)
-    url = _embed_url()
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {Config.KICONNECT_API_KEY}",
-    }
+    headers = {"Content-Type": "application/json"}
+    if ep["api_key"]:
+        headers["Authorization"] = f"Bearer {ep['api_key']}"
 
     vectors: list[list[float]] = []
     for i in range(0, len(inputs), EMBED_REQUEST_CHUNK_SIZE):
         chunk = inputs[i : i + EMBED_REQUEST_CHUNK_SIZE]
-        vectors.extend(_embed_request(url, headers, model, chunk))
+        vectors.extend(_embed_request(ep["embed_url"], headers, ep["model"], chunk))
     return vectors
 
 
@@ -208,12 +244,23 @@ class LLMClient:
         self._url = url
         self._model = model
         self._api_key = api_key
+        # The last transport/HTTP failure of complete(), None after a success.
+        # complete_json() swallows the exception and returns its default, so
+        # a caller that degrades (import: no categories, no abstract) reads
+        # this afterwards to tell the user why the AI step produced nothing.
+        self.last_error: LLMClientError | None = None
+
+    @property
+    def model(self) -> str:
+        return self._model
 
     def _headers(self) -> dict:
-        return {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
+        # Kein Authorization-Header ohne Key: lokale Anbieter (Ollama, LM
+        # Studio) haben keinen, und "Bearer " mit leerem Token lehnen manche ab.
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
 
     @staticmethod
     def _extract_content(result: dict) -> str:
@@ -309,6 +356,20 @@ class LLMClient:
         timeout: int = 60,
         temperature: float | None = None,
     ) -> str:
+        self.last_error = None
+        try:
+            return self._complete(messages, timeout, temperature)
+        except LLMClientError as exc:
+            exc.model = exc.model or self._model
+            self.last_error = exc
+            raise
+
+    def _complete(
+        self,
+        messages: list[dict],
+        timeout: int,
+        temperature: float | None,
+    ) -> str:
         payload: dict = {"model": self._model, "messages": messages}
         if temperature is not None:
             payload["temperature"] = temperature
@@ -335,7 +396,10 @@ class LLMClient:
                 del payload["temperature"]
                 continue
             break
-        raise LLMClientError(f"HTTP {resp.status_code}: {self._error_body(resp)}")
+        raise LLMClientError(
+            f"HTTP {resp.status_code}: {self._error_body(resp)}",
+            status=resp.status_code, model=self._model,
+        )
 
     def stream(self, messages: list[dict], timeout: int = 120) -> Iterator[str]:
         payload = {"model": self._model, "messages": messages, "stream": True}
@@ -344,7 +408,7 @@ class LLMClient:
             verify=ca_trust.ca_bundle(),
         )
         if resp.status_code != 200:
-            raise LLMClientError(f"HTTP {resp.status_code}")
+            raise LLMClientError(f"HTTP {resp.status_code}", status=resp.status_code, model=self._model)
         for line in resp.iter_lines():
             if not line:
                 continue

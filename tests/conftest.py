@@ -15,9 +15,26 @@ from pathlib import Path
 
 _test_base = Path(tempfile.mkdtemp(prefix="lit-mgr-test-"))
 os.environ["LITERATUR_BASE_DIR"] = str(_test_base)
-os.environ.setdefault("KICONNECT_API_KEY", "test-key")
-os.environ.setdefault("LLM_MODEL", "test-model")
+# The LLM connection document (llm.json) sits next to the developer's .env —
+# redirect it too, or a test's PUT /api/llm/config would rewrite the real one.
+os.environ["LLM_CONFIG_PATH"] = str(_test_base / "llm.json")
+# No llm.json in the temp dir, so Config migrates these flat keys into one
+# connection "default" (custom, http://llm.test/v1) with reasoning + fast bound
+# to "test-model": the LLM gates are ON by default, embeddings OFF, and no
+# test ever reaches a real endpoint. Per-test shapes: tests/llm_helpers.py.
+os.environ["LLM_PROVIDER"] = "custom"
+os.environ["LLM_BASE_URL"] = "http://llm.test/v1"
+os.environ["KICONNECT_API_KEY"] = "test-key"
+os.environ["LLM_MODEL"] = "test-model"
+for _legacy in ("LLM_API_KEY", "LLM_MODEL_FAST", "LLM_EMBED_MODEL", "LLM_EMBED_URL"):
+    os.environ.pop(_legacy, None)
 os.environ.setdefault("CROSSREF_MAILTO", "test@example.com")
+# The Add-on document (plugins.json) and the Bundle root likewise: a test that
+# toggles a plugin writes the document, and no test may install into the
+# developer's %LOCALAPPDATA%. Dev-Suchpfade from the shell are ignored.
+os.environ["PLUGINS_CONFIG_PATH"] = str(_test_base / "plugins.json")
+os.environ["LOCALBIB_PLUGIN_DIR"] = str(_test_base / "addon-bundles")
+os.environ.pop("LOCALBIB_PLUGIN_DEV_PATHS", None)
 
 _repo_root = Path(__file__).resolve().parent.parent
 if str(_repo_root) not in sys.path:
@@ -27,7 +44,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import webapp
-import routers.bibtex_import as _bibtex_router
+import paper_ingest
 from literature_manager import Config
 
 
@@ -46,8 +63,57 @@ def _stub_import_enrichment(request, monkeypatch):
     Anreicherung selbst pruefen, markieren sich mit ``real_enrichment``."""
     if request.node.get_closest_marker("real_enrichment"):
         return
-    # _enrich_imported_papers moved to routers/bibtex_import.py (#84) — patch there.
-    monkeypatch.setattr(_bibtex_router, "_enrich_imported_papers", lambda created: 0)
+    # Both intake paths (BibTeX commit, Paper per DOI) call the neutral module
+    # paper_ingest (ADR-0016) — patch there. The OpenAlex batch also feeds the
+    # DOI intake's OA attempt, so an empty batch means "pdf=none" offline.
+    monkeypatch.setattr(paper_ingest, "enrich_imported_papers",
+                        lambda created, works=None: 0)
+    monkeypatch.setattr(paper_ingest, "fetch_openalex_works", lambda dois: {})
+
+
+@pytest.fixture(autouse=True)
+def _no_real_marketplace_network(monkeypatch):
+    """``GET /api/version-check`` piggybacks a Marketplace-Index refresh onto
+    every poll (ADR-0021, #189, ``marketplace_client.refresh_if_stale``) — a
+    test that has nothing to do with the Marketplace must never actually hit
+    GitHub for it. Default: instant "offline", so the piggyback is a no-op in
+    every test but the ones that explicitly exercise it (which monkeypatch
+    ``marketplace_client.requests.get`` themselves, overriding this)."""
+    import marketplace_client
+
+    def _offline(*args, **kwargs):
+        raise OSError("network disabled in tests")
+
+    monkeypatch.setattr(marketplace_client.requests, "get", _offline)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_plugins_document():
+    """No test leaves plugins.json behind for the next one.
+
+    Once the document exists it is the truth for the legacy plugin switches
+    and Config mirrors them into the process environment — a stray file would
+    override the next test's ``monkeypatch.setenv``. So: remove it after each
+    test, put the legacy keys back as they were, and reload."""
+    import plugins_config
+
+    keys = list(plugins_config.LEGACY_ENV_KEYS) + [
+        "PLUGINS_CONFIG_PATH", "LOCALBIB_PLUGIN_DIR", "LOCALBIB_PLUGIN_DEV_PATHS"]
+    before = {k: os.environ.get(k) for k in keys}
+    yield
+    path = Path(os.environ.get("PLUGINS_CONFIG_PATH") or Config.PLUGINS_CONFIG_PATH)
+    dirty = path.exists() or Config.PLUGINS_DOCUMENT_STORED
+    for key, value in before.items():
+        if os.environ.get(key) != value:
+            dirty = True
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if path.exists():
+        path.unlink()
+    if dirty:
+        Config.reload_from_env()
 
 
 @pytest.fixture

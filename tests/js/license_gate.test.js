@@ -10,7 +10,8 @@ const BLOCKED_STATUS = {
     key: '',
     activated_at: '',
     checkout_url: 'https://buy.example/localbib',
-    price_display: '29,50 €',
+    price_amount: 29.5,
+    price_currency: 'EUR',
     is_frozen: true,
     trial: { days_total: 14, days_remaining: 0, expired: true },
     blocked: true,
@@ -41,9 +42,9 @@ describe('Blockierender Aktivierungsdialog nach abgelaufener Testphase', () => {
         ).toBe('https://buy.example/localbib');
         // Kein Kaufhinweis-Streifen daneben - eine Bitte reicht.
         expect(document.querySelector('[data-testid="banner-message"]')).toBeNull();
-        expect(gate.textContent).toContain('Testphase beendet');
+        expect(gate.textContent).toContain('Trial ended');
         // Der Preis kommt aus der API-Antwort, nicht aus einem Literal in der SPA.
-        expect(gate.textContent).toContain('29,50 €');
+        expect(gate.textContent).toContain('€29.50');
 
         typeInto(document.querySelector('[data-testid="license-gate-input"]'), 'LB--ABCD-1234');
         await flush();
@@ -60,8 +61,8 @@ describe('Blockierender Aktivierungsdialog nach abgelaufener Testphase', () => {
             if (!el) throw new Error('Bestätigung nicht gerendert');
             return el;
         });
-        expect(confirm.textContent).toContain('Freigeschaltet');
-        expect(confirm.textContent).toContain('dauerhaft und ohne weitere Prüfung');
+        expect(confirm.textContent).toContain('Unlocked');
+        expect(confirm.textContent).toContain('permanently on this machine');
         // Der maskierte Schlüssel kommt von der API — nichts in der SPA maskiert ihn erneut.
         expect(document.querySelector('[data-testid="license-gate-confirm-key"]').textContent).toBe('••••1234');
         expect(document.querySelector('[data-testid="license-gate-input"]')).toBeNull();

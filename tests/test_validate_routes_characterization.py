@@ -21,7 +21,7 @@ All external IO is mocked:
   - metadata_validation.llm_find_abstract_in_text
   - metadata_validation.llm_generate_abstract
 
-The LLM is never called (KICONNECT_API_KEY is "test-key" via conftest but LLM
+The LLM is never called (the fast role is bound via conftest but LLM
 calls are avoided by: for OCR/abstract routes, the PDF text is empty so the LLM
 path is not reached; for the service unit tests, LLMClient is mocked).
 """
@@ -36,6 +36,7 @@ import metadata_validation
 import routers.validate
 import webapp
 from literature_manager import Config
+from tests.llm_helpers import configure_llm, llm_off
 
 
 # ---------------------------------------------------------------------------
@@ -476,19 +477,9 @@ class TestGenerateAbstract:
             metadata_validation, "fetch_crossref_abstract",
             lambda doi, fetch: "",
         )
-        # Also suppress the LLM branch by forcing KICONNECT_API_KEY to empty
-        import os
-        old = os.environ.get("KICONNECT_API_KEY", "")
-        os.environ["KICONNECT_API_KEY"] = ""
-        try:
-            # Re-evaluate Config (Config caches the key at init time)
-            from literature_manager import Config as _Cfg
-            old_key = _Cfg.KICONNECT_API_KEY
-            _Cfg.KICONNECT_API_KEY = ""
-            resp = client.post(f"/api/papers/{pid}/generate-abstract")
-            _Cfg.KICONNECT_API_KEY = old_key
-        finally:
-            os.environ["KICONNECT_API_KEY"] = old
+        # Also suppress the LLM branch: no role bound.
+        llm_off(monkeypatch)
+        resp = client.post(f"/api/papers/{pid}/generate-abstract")
 
         body = resp.json()
         assert resp.status_code == 200
@@ -570,14 +561,9 @@ class TestOcrPaper:
         pid = _seed_paper(db, filename="stored_ocr.pdf", with_file=True)
         monkeypatch.setattr(routers.validate, "ocr_pdf", lambda *a, **kw: "Extracted OCR text.")
         monkeypatch.setattr(routers.validate, "ocr_pdf_searchable", lambda *a, **kw: True)
-        # Suppress LLM branch
-        from literature_manager import Config as _Cfg
-        old_key = _Cfg.KICONNECT_API_KEY
-        _Cfg.KICONNECT_API_KEY = ""
-        try:
-            resp = client.post(f"/api/papers/{pid}/ocr")
-        finally:
-            _Cfg.KICONNECT_API_KEY = old_key
+        # Suppress LLM branch: no role bound.
+        llm_off(monkeypatch)
+        resp = client.post(f"/api/papers/{pid}/ocr")
         assert resp.status_code == 200
 
         conn = db._connect()
@@ -591,13 +577,8 @@ class TestOcrPaper:
         pid = _seed_paper(db, filename="meta_ocr.pdf", with_file=True)
         monkeypatch.setattr(routers.validate, "ocr_pdf", lambda *a, **kw: "Some text here.")
         monkeypatch.setattr(routers.validate, "ocr_pdf_searchable", lambda *a, **kw: False)
-        from literature_manager import Config as _Cfg
-        old_key = _Cfg.KICONNECT_API_KEY
-        _Cfg.KICONNECT_API_KEY = ""
-        try:
-            resp = client.post(f"/api/papers/{pid}/ocr")
-        finally:
-            _Cfg.KICONNECT_API_KEY = old_key
+        llm_off(monkeypatch)
+        resp = client.post(f"/api/papers/{pid}/ocr")
         body = resp.json()
         assert "_ocr_chars" in body
         assert "_ocr_llm" in body
@@ -614,13 +595,8 @@ class TestOcrPaper:
             return "text " * 10
         monkeypatch.setattr(routers.validate, "ocr_pdf", _ocr)
         monkeypatch.setattr(routers.validate, "ocr_pdf_searchable", lambda *a, **kw: True)
-        from literature_manager import Config as _Cfg
-        old_key = _Cfg.KICONNECT_API_KEY
-        _Cfg.KICONNECT_API_KEY = ""
-        try:
-            client.post(f"/api/papers/{pid}/ocr?pages=3")
-        finally:
-            _Cfg.KICONNECT_API_KEY = old_key
+        llm_off(monkeypatch)
+        client.post(f"/api/papers/{pid}/ocr?pages=3")
         assert captured.get("max_pages") == 3
 
     def test_default_pages_is_10(self, client, db, monkeypatch):
@@ -631,11 +607,6 @@ class TestOcrPaper:
             return "text " * 10
         monkeypatch.setattr(routers.validate, "ocr_pdf", _ocr)
         monkeypatch.setattr(routers.validate, "ocr_pdf_searchable", lambda *a, **kw: True)
-        from literature_manager import Config as _Cfg
-        old_key = _Cfg.KICONNECT_API_KEY
-        _Cfg.KICONNECT_API_KEY = ""
-        try:
-            client.post(f"/api/papers/{pid}/ocr")
-        finally:
-            _Cfg.KICONNECT_API_KEY = old_key
+        llm_off(monkeypatch)
+        client.post(f"/api/papers/{pid}/ocr")
         assert captured.get("max_pages") == 10
