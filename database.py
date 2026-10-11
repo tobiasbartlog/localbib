@@ -271,6 +271,14 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Spalte existiert bereits
 
+        # Sammlungen aus Fremdtools (#203): JSON {created: [collection_id],
+        # added: [[collection_id, paper_id]]} — was das Undo zuruecknimmt.
+        try:
+            cursor.execute(
+                "ALTER TABLE migration_runs ADD COLUMN collections_json TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # Spalte existiert bereits
+
         # Selbstgebautes Notizfeld -> papers.notes (#162). Steht hier, weil es
         # sowohl die notes-Spalte als auch app_settings braucht (dort steht der
         # Erledigt-Vermerk, der den Lauf wirklich einmalig macht).
@@ -306,6 +314,34 @@ class Database:
                 FOREIGN KEY (chunk_id) REFERENCES paper_chunks(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_model ON chunk_embeddings(model);
+        """);
+
+        # Sammlungen (PRD #200, #201): von Hand kuratierte Listen von Eintraegen.
+        # Getrennt von den toten Kern-Projekten (projects/paper_projects,
+        # ADR-0004), die unangetastet bleiben. ``deleted_at`` ist ein Tombstone:
+        # eine geloeschte Sammlung verschwindet aus der Oberflaeche, ihre
+        # Mitgliedschaft bleibt als eingefrorener Stand lesbar (Add-on Contract).
+        # Wird ein Eintrag geloescht, faellt er per CASCADE aus allen Sammlungen.
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS collections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                archived_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS collection_items (
+                collection_id INTEGER NOT NULL,
+                paper_id INTEGER NOT NULL,
+                note TEXT DEFAULT '',
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (collection_id, paper_id),
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+                FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_collection_items_paper ON collection_items(paper_id);
         """);
 
         conn.commit()

@@ -3,6 +3,8 @@
 Serves:
   GET    /api/papers
   POST   /api/papers/bulk-delete
+  POST   /api/papers/categories
+  POST   /api/papers/categories/remove
   GET    /api/papers/{paper_id}
   PUT    /api/papers/{paper_id}
   DELETE /api/papers/{paper_id}
@@ -15,9 +17,12 @@ Serves:
   PUT    /api/papers/{paper_id}/cite-key
   PUT    /api/papers/{paper_id}/notes
 
-Pure move from webapp.py (Backend-Modularisierung #85). No behaviour change.
-HTTP contract (paths / methods / shapes / status codes) is bit-identical to the
-previous webapp.py handlers.
+``GET /api/papers`` takes ``collection_id`` (#201) as one more filter, and
+``GET /api/papers/{id}`` lists the Item's Collections with its note there,
+and its PDF's Stand as ``pdf_modified`` (#229).
+
+Moved from webapp.py (Backend-Modularisierung #85) without a behaviour change;
+the additions above came later.
 
 Route-order safety: literal/collection routes (bulk-delete) are registered
 BEFORE the parametric /{paper_id} route so they are never shadowed by the
@@ -38,8 +43,12 @@ from typing import List, Optional
 
 import bibtex_builder
 from cite_key_generator import base_key as _legacy_cite_key_base
+import collection_membership as membership
+import library_events as events
+import pdf_annotations
 from context import get_conn, safe_pdf_path
 from fastapi import APIRouter, HTTPException, Query
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from literature_manager import (
     Config,
@@ -48,7 +57,9 @@ from literature_manager import (
     create_symlinks,
     generate_filename,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from services import library_collections
 
 router = APIRouter()
 
@@ -89,6 +100,11 @@ class BulkDeleteRequest(BaseModel):
     paper_ids: List[int]
 
 
+class BulkCategoryRequest(BaseModel):
+    paper_ids: List[int] = Field(min_length=1)
+    category_id: int
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -114,7 +130,20 @@ async def list_papers(
     search: Optional[str] = Query(None),
     category_id: Optional[int] = Query(None),
     cite_keys: Optional[str] = Query(None),
+    collection_id: Optional[int] = Query(None),
 ):
+    # Collection scope (#201): resolved first so a tombstoned or unknown
+    # Collection is a 404, not an empty list that looks like a real result.
+    members = None
+    if collection_id is not None:
+        conn = _get_conn()
+        try:
+            if not library_collections.get_collection(conn, collection_id):
+                raise HTTPException(status_code=404, detail="error.collection_not_found")
+            members = library_collections.member_notes(conn, collection_id)
+        finally:
+            conn.close()
+
     db = _get_db()
     if search:
         papers = db.search_papers(search)
@@ -130,6 +159,12 @@ async def list_papers(
     if cite_keys is not None:
         wanted = {k.strip() for k in cite_keys.split(",") if k.strip()}
         papers = [p for p in papers if _cite_key(p) in wanted]
+
+    # Combinable with every other filter: it narrows whatever set they left.
+    if members is not None:
+        papers = [p for p in papers if p["id"] in members]
+        for p in papers:
+            p["collection_note"] = members[p["id"]]
 
     conn = _get_conn()
     try:
@@ -183,6 +218,7 @@ async def bulk_delete_papers(payload: BulkDeleteRequest):
     deleted = 0
     conn = _get_conn()
     try:
+        touched = membership.holding(conn, payload.paper_ids)
         for pid in payload.paper_ids:
             row = conn.execute("SELECT filename FROM papers WHERE id = ?", (pid,)).fetchone()
             if not row:
@@ -193,10 +229,86 @@ async def bulk_delete_papers(payload: BulkDeleteRequest):
         conn.commit()
     finally:
         conn.close()
+    events.collection_changed(events.MEMBERS_CHANGED, *touched)
     if deleted:
         db = _get_db()
-        _rebuild_all_symlinks(db)
+        await run_in_threadpool(_rebuild_all_symlinks, db)
     return {"deleted": deleted, "requested": len(payload.paper_ids)}
+
+
+def _require_category(conn, category_id: int) -> None:
+    if not conn.execute("SELECT 1 FROM categories WHERE id = ?", (category_id,)).fetchone():
+        raise HTTPException(status_code=404, detail="error.category_not_found")
+
+
+def _require_category_and_papers(conn, category_id: int, paper_ids: List[int]) -> dict:
+    """404 vor jedem Schreiben; liefert ``{paper_id: filename}``."""
+    _require_category(conn, category_id)
+    marks = ",".join("?" * len(paper_ids))
+    filenames = {
+        r["id"]: r["filename"]
+        for r in conn.execute(f"SELECT id, filename FROM papers WHERE id IN ({marks})", paper_ids)
+    }
+    if len(filenames) != len(paper_ids):
+        raise HTTPException(status_code=404, detail="error.item_not_found")
+    return filenames
+
+
+@router.post("/api/papers/categories")
+async def bulk_assign_category(payload: BulkCategoryRequest):
+    """Fuegt eine Kategorie zu mehreren Eintraegen hinzu (Drag & Drop, #199).
+
+    INSERT OR IGNORE statt ``Database.assign_category`` (INSERT OR REPLACE):
+    eine bestehende Zuordnung -- auch eine vom LLM -- bleibt unveraendert und
+    wird als ``already_ids`` gemeldet, damit das Undo sie nie anfasst."""
+    paper_ids = list(dict.fromkeys(payload.paper_ids))
+    added, already = [], []
+    conn = _get_conn()
+    try:
+        filenames = _require_category_and_papers(conn, payload.category_id, paper_ids)
+        for pid in paper_ids:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO paper_categories "
+                "(paper_id, category_id, confidence, assigned_by) VALUES (?, ?, 0.0, 'manual')",
+                (pid, payload.category_id),
+            )
+            (added if cur.rowcount else already).append(pid)
+        conn.commit()
+    finally:
+        conn.close()
+
+    if added:
+        db = _get_db()
+        for pid in added:
+            create_symlinks(db, pid, filenames[pid])
+    return {"added_ids": added, "already_ids": already}
+
+
+@router.post("/api/papers/categories/remove")
+async def bulk_remove_category(payload: BulkCategoryRequest):
+    """Undo-Gegenstueck zu ``bulk_assign_category``: entfernt genau die
+    genannten Paare und baut die Symlinks einmal am Ende neu auf. Ein
+    zwischenzeitlich geloeschter Eintrag ist kein Fehler: sein Paar ist per
+    CASCADE schon weg, das Undo der uebrigen soll trotzdem greifen."""
+    paper_ids = list(dict.fromkeys(payload.paper_ids))
+    removed = []
+    conn = _get_conn()
+    try:
+        _require_category(conn, payload.category_id)
+        for pid in paper_ids:
+            cur = conn.execute(
+                "DELETE FROM paper_categories WHERE paper_id = ? AND category_id = ?",
+                (pid, payload.category_id),
+            )
+            if cur.rowcount:
+                removed.append(pid)
+        conn.commit()
+    finally:
+        conn.close()
+
+    if removed:
+        await run_in_threadpool(_rebuild_all_symlinks, _get_db())
+    return {"removed_ids": removed}
 
 
 @router.get("/api/papers/{paper_id}")
@@ -230,10 +342,27 @@ async def get_paper(paper_id: int):
              "options": r["options"], "value": r["value"] or ""}
             for r in cvs
         ]
+
+        # Collections (#201) with this Item's note there; tombstones hidden.
+        paper["collections"] = library_collections.collections_of_paper(conn, paper_id)
     finally:
         conn.close()
 
+    # The file's Stand (#229), the one the annotation reading reports: the
+    # preview URL carries it from the first load on.
+    paper["pdf_modified"] = _pdf_stand(paper.get("filename"))
     return paper
+
+
+def _pdf_stand(filename: Optional[str]) -> Optional[str]:
+    if not filename:
+        return None
+    try:
+        return pdf_annotations.file_state(_safe_pdf_path(filename))[2]
+    # The file is gone or its stat unusable (odd name, mtime out of range):
+    # the Item is still there, and PUT answers with this after its commit.
+    except (HTTPException, OSError, ValueError, OverflowError):
+        return None
 
 
 @router.put("/api/papers/{paper_id}")
@@ -303,7 +432,7 @@ async def update_paper(paper_id: int, data: PaperUpdate):
                 finally:
                     conn2.close()
                 db = _get_db()
-                _rebuild_all_symlinks(db)
+                await run_in_threadpool(_rebuild_all_symlinks, db)
             except OSError as e:
                 logging.warning(f"Rename failed: {e}")
 
@@ -319,8 +448,10 @@ async def delete_paper(paper_id: int):
         if not row:
             raise HTTPException(status_code=404, detail="error.item_not_found")
 
+        touched = membership.holding(conn, [paper_id])
         conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
         conn.commit()
+        events.collection_changed(events.MEMBERS_CHANGED, *touched)
 
         # Datei optional loeschen
         _remove_pdf_file_if_any(row["filename"])
@@ -328,7 +459,7 @@ async def delete_paper(paper_id: int):
         conn.close()
 
     db = _get_db()
-    _rebuild_all_symlinks(db)
+    await run_in_threadpool(_rebuild_all_symlinks, db)
     return {"status": "ok"}
 
 
@@ -369,7 +500,7 @@ async def remove_paper_category(paper_id: int, category_id: int):
 
     # Symlinks neu erstellen
     db = _get_db()
-    _rebuild_all_symlinks(db)
+    await run_in_threadpool(_rebuild_all_symlinks, db)
     return {"status": "ok"}
 
 
@@ -387,11 +518,14 @@ async def get_paper_pdf(paper_id: int):
     filepath = _safe_pdf_path(row["filename"])
     if not row["filename"] or not os.path.isfile(filepath):
         raise HTTPException(status_code=404, detail="error.no_pdf_for_item")
+    # The reader may save annotations into this file at any time (#229): the
+    # browser asks again every time (a 304 when nothing changed) instead of
+    # showing the preview a cached copy.
     return FileResponse(
         filepath,
         media_type="application/pdf",
         filename=row["filename"],
-        headers={"Content-Disposition": "inline"},
+        headers={"Content-Disposition": "inline", "Cache-Control": "no-cache"},
     )
 
 

@@ -34,6 +34,7 @@ import logging
 import os
 import shutil
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -41,7 +42,7 @@ from typing import Any, Callable, Optional
 import plugins_config
 from config import Config
 from context import registry
-from plugin_api import API_VERSION, GATED_SERVICES, CoreSettings, Permission, PluginManifest
+from plugin_api import API_VERSION, GATED_SERVICES, CoreSettings, Permission, PluginManifest, setting_value
 from services import addon_catalog, addon_frontend, addon_lifecycle
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,25 @@ def _save(doc: dict) -> None:
     _persist(doc)
 
 
+# One read-modify-write of plugins.json at a time from this module (the
+# loader's own fields, an Add-on's SettingsApi.set from any thread).
+_doc_lock = threading.RLock()
+
+
+def _patch(addon_id: str, *, boot_marker: Optional[str] = None, **fields: Any) -> None:
+    """Re-read the document, set ``fields`` on ``addon_id``'s entry (and the
+    boot marker) and save. Never a snapshot taken before the Add-on ran: what
+    it wrote meanwhile through ``SettingsApi.set`` — in ``activate()``, say —
+    would be lost (ADD-3)."""
+    with _doc_lock:
+        doc = Config.plugins_document()
+        if fields:
+            plugins_config.ensure_entry(doc, addon_id).update(fields)
+        if boot_marker is not None:
+            doc["boot_marker"] = boot_marker
+        _save(doc)
+
+
 # ---------------------------------------------------------------------------
 # Settings service handed to an Add-on
 # ---------------------------------------------------------------------------
@@ -166,9 +186,13 @@ class AddonSettings:
         return values[key] if key in values else self._defaults.get(key)
 
     def set(self, key: str, value: Any) -> None:
-        doc = Config.plugins_document()
-        plugins_config.ensure_entry(doc, self._id)["settings"][str(key)] = value
-        _save(doc)
+        # str/bool/None as is, int/float as str, anything else TypeError -
+        # the one rule the contract's fake applies too (ADD-4).
+        value = setting_value(value)
+        with _doc_lock:
+            doc = Config.plugins_document()
+            plugins_config.ensure_entry(doc, self._id)["settings"][str(key)] = value
+            _save(doc)
 
     def core(self) -> Optional[CoreSettings]:
         if not self._core:
@@ -202,6 +226,26 @@ class AddonLibrary:
             raise PermissionError(f"Add-on {self._id!r} did not declare library.write")
         return self._host.create_by_doi(doi, title=title, authors=authors, year=year,
                                         journal=journal, abstract=abstract, source=self._id)
+
+    def on_change(self, callback: Callable[[dict], None]) -> Callable[[], None]:
+        """The host's change feed, booked under the Add-on: an Add-on that
+        forgets to unsubscribe in ``deactivate()`` is unsubscribed on unload
+        (:func:`_drop_subscriptions`), so no dead callback outlives it."""
+        stop = self._host.on_change(callback)
+        _subscriptions.setdefault(self._id, []).append(stop)
+        return stop
+
+
+# Change-feed unsubscribers per Add-on id (``AddonLibrary.on_change``).
+_subscriptions: dict[str, list[Callable[[], None]]] = {}
+
+
+def _drop_subscriptions(addon_id: str) -> None:
+    for stop in _subscriptions.pop(addon_id, []):
+        try:
+            stop()
+        except Exception as exc:  # an unsubscriber is idempotent; never block unload
+            logger.warning("Add-on %s: unsubscribe failed: %s", addon_id, exc)
 
 
 def _services_for(addon_id: str, manifest: PluginManifest) -> dict[str, Any]:
@@ -260,23 +304,21 @@ def _check_prefix(addon_id: str) -> None:
                 raise _LoadError("error.plugins.routePrefix", f"{path} is outside {prefix}/")
 
 
-async def _load(candidate: addon_catalog.Candidate, doc: dict) -> None:
-    """Import and activate one Add-on; record the outcome in ``doc`` (persisted)."""
+async def _load(candidate: addon_catalog.Candidate) -> None:
+    """Import and activate one Add-on; record the outcome in the document
+    (persisted, patched onto a fresh read — see :func:`_patch`)."""
     addon_id = candidate.id
     manifest = candidate.manifest
     assert manifest is not None
-    entry = plugins_config.ensure_entry(doc, addon_id)
     entries = [str(candidate.path), str(candidate.path / "vendor")]
 
     existing = sys.modules.get(addon_id)
     if existing is not None and not _module_inside(existing, candidate.path):
-        entry["error"] = {"code": "error.plugins.moduleConflict",
-                          "message": f"module name {addon_id!r} is already taken"}
-        _save(doc)
+        _patch(addon_id, error={"code": "error.plugins.moduleConflict",
+                                "message": f"module name {addon_id!r} is already taken"})
         return
 
-    doc["boot_marker"] = addon_id
-    _save(doc)
+    _patch(addon_id, boot_marker=addon_id)
     added = [e for e in entries if e not in sys.path]
     sys.path.extend(added)
     importlib.invalidate_caches()
@@ -300,13 +342,12 @@ async def _load(candidate: addon_catalog.Candidate, doc: dict) -> None:
             await registry.deactivate(addon_id)
         except Exception as teardown_exc:  # the Add-on's own teardown; state is reset anyway
             logger.warning("Add-on %s: deactivate nach Fehler: %s", addon_id, teardown_exc)
+        _drop_subscriptions(addon_id)
         _drop_paths(added)
         _purge_modules(addon_id)
     else:
         _loaded[addon_id] = _Loaded(path=candidate.path, source=candidate.source, sys_path=added, manifest=manifest)
-    entry["error"] = error
-    doc["boot_marker"] = ""
-    _save(doc)
+    _patch(addon_id, boot_marker="", error=error)
 
 
 async def _unload(addon_id: str) -> None:
@@ -315,6 +356,7 @@ async def _unload(addon_id: str) -> None:
         await registry.deactivate(addon_id)
     except Exception as exc:
         logger.warning("Add-on %s: deactivate fehlgeschlagen: %s", addon_id, exc)
+    _drop_subscriptions(addon_id)
     if loaded is not None:
         _drop_paths(loaded.sys_path)
     _purge_modules(addon_id)
@@ -413,7 +455,7 @@ async def sync_all(*, startup: bool = False) -> None:
         if addon_id in _loaded:
             continue
         try:
-            await _load(candidate, doc)
+            await _load(candidate)
         except Exception as exc:  # persistence failed — keep the others going
             logger.warning("Add-on %s: Laden abgebrochen: %s", addon_id, exc)
 

@@ -1,7 +1,7 @@
 """Metadata-validation policy: the propose/apply pair, transport-free.
 
 Holds the two core Metadata Validation operations that both the validate router
-AND the maintenance router need:
+AND the refresh review router need:
 
   * ``validate_propose(paper_id, options)`` — compute a Metadata Proposal for one
     Paper without persisting anything.
@@ -10,15 +10,16 @@ AND the maintenance router need:
     categories).
 
 These previously lived in ``routers/validate.py``. They were relocated here
-(Backend-Modularisierung #92) because ``routers/maintenance.py``'s ``full_refresh``
-calls them, and a router importing another router would violate the
+(Backend-Modularisierung #92) because the former full refresh in
+``routers/maintenance.py`` called them (since #213 ``routers/refresh_review.py``
+does), and a router importing another router would violate the
 ``routers-independent`` import-linter contract. ``validation_policy`` is a NEUTRAL
 top-level module — neither a router nor a service — so it MAY persist / do I/O and
 both routers may import it freely.
 
 Canonical home for test patching: ``patch.object(validation_policy,
 "validate_propose"/"validate_apply", ...)``. Both ``routers/validate.py`` and
-``routers/maintenance.py`` reference these via this module so there is exactly one
+``routers/refresh_review.py`` reference these via this module so there is exactly one
 patch target.
 
 Behaviour is bit-identical to the previous ``routers/validate.py`` handlers.
@@ -33,6 +34,7 @@ from typing import List
 import metadata_validation
 from context import get_conn
 from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
 from literature_manager import (
     Config,
     Database,
@@ -41,6 +43,7 @@ from literature_manager import (
     extract_text_from_pdf,
     generate_filename,
 )
+from filenames import stored_pdf_path
 from llm_client import llm_for
 from pydantic import BaseModel
 
@@ -96,14 +99,14 @@ async def validate_propose(paper_id: int, options: ValidateOptions = None):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
     finally:
         conn.close()
 
-    filepath = os.path.join(Config.ALL_DIR, os.path.basename(paper["filename"]))
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="PDF-Datei nicht gefunden")
+    filepath = stored_pdf_path(paper["filename"])
+    if not filepath:
+        raise HTTPException(status_code=404, detail="error.pdf_file_not_found")
 
     pdf_text = extract_text_from_pdf(filepath, max_pages=options.pages)
 
@@ -155,7 +158,7 @@ async def validate_apply(paper_id: int, data: ValidateApplyRequest):
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
     finally:
         conn.close()
@@ -189,10 +192,10 @@ async def validate_apply(paper_id: int, data: ValidateApplyRequest):
 
     # 2. Rename the PDF file if title/authors/year changed
     new_filename = None
-    filepath = os.path.join(Config.ALL_DIR, os.path.basename(paper["filename"]))
+    filepath = stored_pdf_path(paper["filename"])
     rename_needed = (
         (changes.get("title") or changes.get("authors") or changes.get("year"))
-        and os.path.exists(filepath)
+        and filepath is not None
     )
     if rename_needed:
         merged = {
@@ -223,7 +226,7 @@ async def validate_apply(paper_id: int, data: ValidateApplyRequest):
                 finally:
                     conn.close()
                 db = _get_db()
-                _rebuild_all_symlinks(db)
+                await run_in_threadpool(_rebuild_all_symlinks, db)
             except OSError as e:
                 logging.warning(f"Rename failed: {e}")
 

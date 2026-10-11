@@ -1,6 +1,6 @@
 // Notes block in the paper detail view (#160): a paper with notes opens them
 // rendered, a paper without notes opens straight into the editor, and the
-// block sits between the abstract and the user-defined fields.
+// block sits in the side panel's Notes tab (#230).
 //
 // One boot per file (vitest isolates module graphs per file, and app.js mounts
 // itself on import), so the three cases are three papers the test navigates
@@ -68,14 +68,21 @@ describe('paper notes block', () => {
         expect(document.querySelector('[data-testid="paper-notes-editor"]')).toBeTruthy();
         expect(document.querySelector('[data-testid="paper-notes-rendered"]')).toBeFalsy();
 
-        // Position: abstract -> notes -> user-defined fields.
+        // Position (#230), default layout: abstract -> annotations (#229) in
+        // the main column; Notes in its tab, shown first; the user-defined
+        // fields in the Metadata tab.
         await open(9);
-        const headings = [...document.querySelectorAll('.lb-modal-main .lb-detail-section')]
+        const headings = (zone) => [...document.querySelectorAll(`[data-zone="${zone}"] .lb-detail-section`)]
             .map((s) => ((s.querySelector('.lb-detail-h') || {}).textContent || '').trim());
-        const at = (label) => headings.findIndex((h) => h.startsWith(label));
-        expect(at('Abstract')).toBeGreaterThanOrEqual(0);
-        expect(at('Notes')).toBe(at('Abstract') + 1);
-        expect(at('Custom fields')).toBe(at('Notes') + 1);
+        const main = headings('main');
+        expect(main.findIndex((h) => h.startsWith('Abstract'))).toBeGreaterThanOrEqual(0);
+        expect(main.findIndex((h) => h.startsWith('Annotations'))).toBe(
+            main.findIndex((h) => h.startsWith('Abstract')) + 1);
+        expect(main.some((h) => h.startsWith('Notes'))).toBe(false);
+        const notesPanel = document.querySelector('[data-zone="tab2"]');
+        expect(notesPanel.querySelector('[data-testid="paper-notes"]')).toBeTruthy();
+        expect(notesPanel.style.display).not.toBe('none');
+        expect(headings('tab0').some((h) => h.startsWith('Custom fields'))).toBe(true);
     });
 
     it('switches to editing when the rendered notes are clicked', async () => {

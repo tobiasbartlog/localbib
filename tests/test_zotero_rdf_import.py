@@ -83,6 +83,13 @@ class TestCollections:
 
     def test_an_item_in_no_collection_has_an_empty_path(self, items):
         assert _by_key(items, "doe2017").collection_path == []
+        assert _by_key(items, "doe2017").collection_paths == []
+
+    def test_every_collection_of_an_item_is_kept_for_the_collections(self, items):
+        """#203: each Zotero collection becomes a Collection, so an item in
+        several carries all of them, the first one first."""
+        assert items[0].collection_paths == [["Diss", "Kapitel 2"], ["Zu lesen"]]
+        assert _by_key(items, "muller2018").collection_paths == [["Diss"]]
 
 
 class TestTagsNotesAndDates:

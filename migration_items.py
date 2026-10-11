@@ -78,12 +78,36 @@ class MigrationItem:
     journal: str = ""
     publisher: str = ""
     tags: list[str] = field(default_factory=list)
+    # The first collection the source put the item in (what the wizard's
+    # preview shows as "the" path) ...
     collection_path: list[str] = field(default_factory=list)
+    # ... and every one of them (#203). An item lives in many collections and
+    # so may an Item in many Collections; ``collection_path`` stays for the
+    # callers that only ever wanted one chain. Read both through
+    # :func:`collection_paths_of`.
+    collection_paths: list[list[str]] = field(default_factory=list)
     notes: str = ""
     date_added: str | None = None
     attachments: list[str] = field(default_factory=list)
     attachments_missing: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
+
+
+def collection_paths_of(item: MigrationItem) -> list[list[str]]:
+    """Every collection path of ``item``, de-duplicated, first one first.
+    Falls back to ``collection_path`` for an adapter that only fills that."""
+    paths: list[list[str]] = []
+    for path in [item.collection_path, *item.collection_paths]:
+        clean = [part for part in (path or []) if part]
+        if clean and clean not in paths:
+            paths.append(clean)
+    return paths
+
+
+def collection_name(path: list[str]) -> str:
+    """A nested collection as the name of one flat Collection: ``Diss / Kap 2``.
+    Collections have no tree; the full path keeps two "Kap 2" apart."""
+    return " / ".join(part.strip() for part in path if part and part.strip())
 
 
 @dataclass

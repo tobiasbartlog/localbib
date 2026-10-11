@@ -23,7 +23,8 @@ Three endpoints, three promises:
   ``run_id``.
 * **undo** spends that record: the papers this run created are deleted with
   their files, files this run *attached* to papers that already existed are
-  detached again, and matched papers are otherwise left alone. A migration a
+  detached again, the Collections this run created are deleted, and matched
+  papers are otherwise left alone. A migration a
   reader cannot take back is a migration they will not dare to run.
 
 Adding a source means one entry in :data:`ADAPTERS` and one adapter module —
@@ -47,16 +48,25 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from fastapi import APIRouter, HTTPException
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import bibtex_migration
+import collection_membership as membership
+import library_events as events
 import paper_ingest
 import ris_import
 import zotero_rdf_import
 from context import get_conn
 from literature_manager import Config, Database, _rebuild_all_symlinks
-from migration_items import MigrationItem, MigrationOptions, MigrationUnreadable
+from migration_items import (
+    MigrationItem,
+    MigrationOptions,
+    MigrationUnreadable,
+    collection_name,
+    collection_paths_of,
+)
 from openalex_client import OpenAlexClient
 from paper_matcher import match as match_ref
 from services import pdf_folder_match
@@ -245,6 +255,7 @@ def _item_payload(item: MigrationItem, match: dict) -> dict:
         "journal": item.journal,
         "tags": list(item.tags),
         "collection_path": list(item.collection_path),
+        "collection_paths": collection_paths_of(item),
         "has_notes": bool(item.notes),
         "date_added": item.date_added,
         "attachments": list(item.attachments),
@@ -310,8 +321,9 @@ async def migration_analyze(payload: AnalyzeRequest):
     collections: list[list[str]] = []
     tags: list[str] = []
     for item in items:
-        if item.collection_path and item.collection_path not in collections:
-            collections.append(list(item.collection_path))
+        for path in collection_paths_of(item):
+            if path not in collections:
+                collections.append(list(path))
         for tag in item.tags:
             if tag not in tags:
                 tags.append(tag)
@@ -375,6 +387,7 @@ async def _commit_events(items: List[MigrationItem], options: MigrationOptions,
     """
     run_id = uuid.uuid4().hex
     db = _get_db()
+    collections = _RunCollections()
     created_ids: list[int] = []
     created_rows: list[dict] = []
     attached_rows: list[dict] = []
@@ -391,7 +404,7 @@ async def _commit_events(items: List[MigrationItem], options: MigrationOptions,
                             "params": {"total": total}}})
     if total == 0:
         yield _sse({"type": "complete", "run_id": run_id, "results": [],
-                    "llm_failures": [], **counts})
+                    "llm_failures": [], "collections_created": 0, **counts})
         return
 
     try:
@@ -402,7 +415,8 @@ async def _commit_events(items: List[MigrationItem], options: MigrationOptions,
                                     "params": {"index": index, "total": total,
                                                "title": (item.title or item.key)[:80]}}})
             try:
-                outcome = _import_item(db, item, options, source_name, attach_only)
+                outcome = _import_item(db, item, options, source_name, attach_only,
+                                       collections)
             except Exception as e:
                 logging.warning("Migration: Eintrag '%s' fehlgeschlagen: %s", item.key, e)
                 counts["failed"] += 1
@@ -429,7 +443,8 @@ async def _commit_events(items: List[MigrationItem], options: MigrationOptions,
                             "message": {"code": "migration.step.attached",
                                         "params": {"title": (item.title or item.key)[:80]}}})
     finally:
-        _record_run(run_id, source_id, path, created_ids, attached_rows)
+        _record_run(run_id, source_id, path, created_ids, attached_rows,
+                    collections.created)
 
     if options.fill_missing and created_rows:
         yield _sse({"type": "progress", "step": "enrich", "percent": 93,
@@ -440,21 +455,32 @@ async def _commit_events(items: List[MigrationItem], options: MigrationOptions,
             logging.warning("Migration: Anreicherung fehlgeschlagen: %s", e)
 
     yield _sse({"type": "complete", "run_id": run_id, "results": results,
-                "llm_failures": llm_failures, **counts})
+                "llm_failures": llm_failures,
+                "collections_created": len(collections.created), **counts})
 
 
 @router.post("/api/migration/undo")
 async def migration_undo(payload: UndoRequest):
-    """Take back one run: delete the papers it created and their files, and
-    detach the files it hung onto papers that already existed.
+    """Take back one run: delete the papers it created and their files,
+    detach the files it hung onto papers that already existed, and delete the
+    Collections it created (#203).
 
     Matched papers are untouched — they were the library's before the run
     started. A paper the reader has since deleted by hand is simply skipped.
+
+    A run's Collections are deleted the way the reader deletes one: as a
+    tombstone, not a hard delete. Papers are hard-deleted because nothing
+    outside the core points at a paper row the run made; a Collection may
+    already have been picked up by an Add-on that mirrors Collections (PRD
+    #200), and the tombstone is the one deletion signal the Add-on
+    Contract defines. Its membership — the matched papers; the created ones
+    leave with their rows — stays frozen and invisible, like any deleted
+    Collection's.
     """
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT run_id, created_paper_ids, attached_paper_ids "
+            "SELECT run_id, created_paper_ids, attached_paper_ids, collections_json "
             "FROM migration_runs WHERE run_id = ?",
             (payload.run_id,),
         ).fetchone()
@@ -470,6 +496,10 @@ async def migration_undo(payload: UndoRequest):
             attached = []
 
         detached = _detach_all(conn, attached)
+        tombstoned = [cid for cid in _run_collection_ids(row["collections_json"])
+                      if membership.tombstone(conn, cid)]
+        collections_deleted = len(tombstoned)
+        touched = membership.holding(conn, paper_ids)
         deleted = 0
         for paper_id in paper_ids:
             paper = conn.execute(
@@ -491,21 +521,81 @@ async def migration_undo(payload: UndoRequest):
         conn.commit()
     finally:
         conn.close()
+    events.collection_changed(events.DELETED, *tombstoned)
+    events.collection_changed(events.MEMBERS_CHANGED, *touched)
     if detached or deleted:
         # Ein abgehaengtes PDF oder ein geloeschtes Paper laesst
         # Kategorie-Verknuepfungen (Symlinks) ins Leere zeigen.
-        _rebuild_all_symlinks(_get_db())
+        await run_in_threadpool(_rebuild_all_symlinks, _get_db())
     return {"run_id": payload.run_id, "deleted": deleted, "created": len(paper_ids),
-            "detached": detached, "attached": len(attached)}
+            "detached": detached, "attached": len(attached),
+            "collections_deleted": collections_deleted}
+
+
+def _run_collection_ids(raw: Optional[str]) -> list[int]:
+    """The Collections a run booked; a run recorded before #203 has none."""
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        return []
+    created = data.get("created") if isinstance(data, dict) else None
+    return [c for c in created or [] if isinstance(c, int)]
 
 
 # ---------------------------------------------------------------------------
 # The per-item import (the only place this router writes a paper)
 # ---------------------------------------------------------------------------
 
+class _RunCollections:
+    """The Collections one migration run fills (#203).
+
+    An export's collections become core Collections, no longer category paths
+    (data migrated before #203 keeps its categories — nothing is converted).
+    A nested path becomes one flat Collection named ``Parent / Child``.
+
+    Every run creates its own Collections, even when one with that name
+    exists already: what a run created is exactly what its undo deletes, and
+    a reused Collection would blur that boundary (the undo of one run would
+    tombstone what a later run filled). ``created`` is booked under the run.
+    """
+
+    def __init__(self) -> None:
+        self.by_name: dict[str, int] = {}
+        self.created: list[int] = []
+
+    def assign(self, paper_id: int, paths: list[list[str]]) -> None:
+        names = [n for n in dict.fromkeys(collection_name(p) for p in paths) if n]
+        if not names:
+            return
+        conn = get_conn()
+        created, filled = [], []
+        try:
+            for name in names:
+                cid = self.by_name.get(name)
+                if cid is None:
+                    cid = membership.create(conn, name)
+                    self.by_name[name] = cid
+                    self.created.append(cid)
+                    created.append(cid)
+                if membership.add_items(conn, cid, [paper_id])["added_ids"]:
+                    filled.append(cid)
+            conn.commit()
+        finally:
+            conn.close()
+        events.collection_changed(events.CREATED, *created)
+        events.collection_changed(events.MEMBERS_CHANGED, *filled)
+
+
 def _import_item(db: Database, item: MigrationItem, options: MigrationOptions,
-                 source_name: str, attach_only: set) -> dict:
-    """One item → one paper row (or a match). Returns the result entry."""
+                 source_name: str, attach_only: set,
+                 collections: Optional[_RunCollections] = None) -> dict:
+    """One item → one paper row (or a match). Returns the result entry.
+
+    With ``import_collections`` the item joins its Collections — a matched
+    item too, so a Collection arrives complete even when the library already
+    had some of its entries."""
+    if collections is None:
+        collections = _RunCollections()
     conn = get_conn()
     try:
         match = _match_item(item, conn)
@@ -520,6 +610,8 @@ def _import_item(db: Database, item: MigrationItem, options: MigrationOptions,
     wants_pdf = _wants_pdf(item, options, attach_only)
 
     if matched_id is not None:
+        if options.import_collections:
+            collections.assign(matched_id, collection_paths_of(item))
         attached_filename = None
         if options.duplicates == "attach" and wants_pdf:
             attached_filename = _attach_first(matched_id, item, options)
@@ -529,11 +621,8 @@ def _import_item(db: Database, item: MigrationItem, options: MigrationOptions,
 
     paper_id = db.add_paper(_paper_data(item, options, source_name))
 
-    if options.import_collections and item.collection_path:
-        category_id = db.get_or_create_category_path(item.collection_path)
-        if category_id:
-            db.assign_category(paper_id, category_id, confidence=1.0,
-                               assigned_by="import")
+    if options.import_collections:
+        collections.assign(paper_id, collection_paths_of(item))
 
     attached = bool(_attach_first(paper_id, item, options)) if wants_pdf else False
     if not attached and options.oa_fallback and options.attach_pdfs != "none":
@@ -614,15 +703,18 @@ def _attach_first(paper_id: int, item: MigrationItem,
 
 
 def _record_run(run_id: str, source: str, path: str, created_ids: list[int],
-                attached: Optional[list[dict]] = None) -> None:
+                attached: Optional[list[dict]] = None,
+                collection_ids: Optional[list[int]] = None) -> None:
     conn = get_conn()
     try:
         conn.execute(
             """INSERT INTO migration_runs (run_id, source, source_path,
-                                           created_paper_ids, attached_paper_ids)
-               VALUES (?, ?, ?, ?, ?)""",
+                                           created_paper_ids, attached_paper_ids,
+                                           collections_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (run_id, source, path, json.dumps(created_ids),
-             json.dumps(attached or [])),
+             json.dumps(attached or []),
+             json.dumps({"created": list(collection_ids or [])})),
         )
         conn.commit()
     finally:
@@ -746,40 +838,45 @@ def _commit_pdf_folder(adapter: MigrationSource, payload: CommitRequest):
                         "llm_failures": [], **counts})
             return
 
-        for index, pair in enumerate(pairs, 1):
-            name = os.path.basename(pair.pdf_path)
-            percent = int((index - 1) / total * 95)
-            yield _sse({"type": "progress", "step": "item", "percent": percent,
-                        "message": {"code": "migration.step.item",
-                                    "params": {"index": index, "total": total,
-                                               "title": name[:80]}}})
-            error = _pdf_in_folder(pair.pdf_path, folder)
-            if error is None:
-                try:
-                    outcome = paper_ingest.attach_pdf_from_path(
-                        pair.paper_id, os.path.abspath(
-                            os.path.expanduser(pair.pdf_path)))
-                except Exception as e:
-                    error = str(e)
-                else:
-                    counts["matched"] += 1
-                    counts["attached"] += 1
-                    attached_rows.append({"paper_id": pair.paper_id,
-                                          "filename": outcome["filename"]})
+        # Booked in a finally: a client that goes away mid-stream closes this
+        # generator between two yields, and the files already attached must still
+        # be recorded or undo can never detach them.
+        try:
+            for index, pair in enumerate(pairs, 1):
+                name = os.path.basename(pair.pdf_path)
+                percent = int((index - 1) / total * 95)
+                yield _sse({"type": "progress", "step": "item", "percent": percent,
+                            "message": {"code": "migration.step.item",
+                                        "params": {"index": index, "total": total,
+                                                   "title": name[:80]}}})
+                error = _pdf_in_folder(pair.pdf_path, folder)
+                if error is None:
+                    try:
+                        outcome = paper_ingest.attach_pdf_from_path(
+                            pair.paper_id, os.path.abspath(
+                                os.path.expanduser(pair.pdf_path)))
+                    except Exception as e:
+                        error = str(e)
+                    else:
+                        counts["matched"] += 1
+                        counts["attached"] += 1
+                        attached_rows.append({"paper_id": pair.paper_id,
+                                              "filename": outcome["filename"]})
+                        results.append({"key": pair.pdf_path, "title": name,
+                                        "status": "attached", "paper_id": pair.paper_id,
+                                        "attached": True})
+                        yield _sse({"type": "progress", "step": "attach", "percent": percent,
+                                    "message": {"code": "migration.step.attached",
+                                                "params": {"title": name[:80]}}})
+                if error is not None:
+                    logging.info("PDF-Ordner: %s nicht anhaengbar: %s", pair.pdf_path, error)
+                    counts["failed"] += 1
                     results.append({"key": pair.pdf_path, "title": name,
-                                    "status": "attached", "paper_id": pair.paper_id,
-                                    "attached": True})
-                    yield _sse({"type": "progress", "step": "attach", "percent": percent,
-                                "message": {"code": "migration.step.attached",
-                                            "params": {"title": name[:80]}}})
-            if error is not None:
-                logging.info("PDF-Ordner: %s nicht anhaengbar: %s", pair.pdf_path, error)
-                counts["failed"] += 1
-                results.append({"key": pair.pdf_path, "title": name,
-                                "status": "failed", "paper_id": pair.paper_id,
-                                "error": error})
+                                    "status": "failed", "paper_id": pair.paper_id,
+                                    "error": error})
 
-        _record_run(run_id, adapter.id, folder, [], attached_rows)
+        finally:
+            _record_run(run_id, adapter.id, folder, [], attached_rows)
         yield _sse({"type": "complete", "run_id": run_id, "results": results,
                     "llm_failures": [], **counts})
 

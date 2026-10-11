@@ -426,6 +426,121 @@ def test_a_dev_folder_claiming_an_installed_id_does_not_inherit_its_consent(mark
         # is an index install (`source.origin`) a same-id dev folder shadowed.
         assert body["addon"]["dev_shadow_disabled"] is True
         assert _listed(c)["dev_shadow_disabled"] is True
+        # ...and the Marketplace card, which is what the SPA reads (ADD-1).
+        assert _card(c)["dev_shadow_disabled"] is True
+
+
+def _card(c, addon_id: str = "hello") -> dict:
+    return next(a for a in c.get("/api/marketplace").json()["addons"] if a["id"] == addon_id)
+
+
+def test_marketplace_card_carries_every_installed_field_of_the_listing(market):
+    """ADD-1: the card is built from a copy of the ``describe_one`` row; a field
+    the copy dropped (``dev_shadow_disabled``) always read ``false``. Every
+    field of the row the card shows must arrive unchanged."""
+    from services import marketplace
+
+    _write_index(market, sha=market.sha, size=len(market.zip))
+    with respx.mock() as mock, TestClient(webapp.app) as c:
+        mock.get(URL).mock(return_value=httpx.Response(200, content=market.zip))
+        _index_install_and_consent(market, c)
+        c.post("/api/marketplace/dev-path", json={"path": str(HELLO)})  # shadows the Bundle
+        row, card = _listed(c), _card(c)
+    shared = set(marketplace.lifecycle_fields({})) & set(row)
+    assert {"dev_shadow_disabled", "needs_confirmation", "origin", "rollback_available"} <= shared
+    assert {k: card[k] for k in shared} == {k: row[k] for k in shared}
+    renamed = {"installed_version": "version", "addon_state": "state", "source": "source"}
+    assert {k: card[k] for k in renamed} == {k: row[v] for k, v in renamed.items()}
+    assert card["dev_shadow_disabled"] is True
+
+
+def _fail_the_save_after_place(monkeypatch) -> None:
+    """The first ``plugins.json`` save after the Bundle was placed raises — what
+    an EDR agent holding the file does to ``_record_install`` (ADD-7)."""
+    import settings_store
+
+    placed = {"done": False}
+    real_place, real_save = addon_installer.place, settings_store.save_plugins_document
+
+    def place(staged, manifest):
+        target = real_place(staged, manifest)
+        placed["done"] = True
+        return target
+
+    def save(doc, env=None):
+        if placed["done"]:
+            placed["done"] = False
+            raise PermissionError("[WinError 5] Access is denied: 'plugins.json'")
+        return real_save(doc, env)
+
+    monkeypatch.setattr(addon_installer, "place", place)
+    monkeypatch.setattr(settings_store, "save_plugins_document", save)
+
+
+def test_an_interrupted_file_install_over_a_switched_off_addon_fails_closed(market, monkeypatch):
+    """ADD-7: a file of the same id and version swaps the folder of a switched-
+    off index install. If saving ``plugins.json`` then fails, the entry must
+    not still claim ``source: index`` — enabling would run the file's code
+    under the index consent, without the file warning or its checksum."""
+    _write_index(market, sha=market.sha, size=len(market.zip))
+    imposter, sha = _variant(market, "same-version", tagline="not from the index")
+    with respx.mock() as mock, TestClient(webapp.app) as c:
+        mock.get(URL).mock(return_value=httpx.Response(200, content=market.zip))
+        _index_install_and_consent(market, c)
+        assert c.post("/api/plugins/hello/disable").json()["enabled"] is False
+
+        _fail_the_save_after_place(monkeypatch)
+        with pytest.raises(PermissionError):
+            _upload(c, imposter)
+        assert json.loads((market.bundles / "hello" / "0.1.0" / "plugin.json").read_text(
+            encoding="utf-8"))["tagline"] == "not from the index"  # the swap happened
+
+        stored = json.loads(market.doc.read_text(encoding="utf-8"))["plugins"]["hello"]
+        assert stored["source"] == {"origin": "file", "sha256": sha}
+        assert stored["consent"]["origin"] == "index"
+        refused = c.post("/api/plugins/hello/enable")
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["code"] == "error.plugins.consentRequired"
+        listed = _listed(c)
+        # The card offers the file's dialog: its warning and its checksum.
+        assert (listed["origin"], listed["sha256"], listed["needs_confirmation"]) == ("file", sha, True)
+        assert "hello" not in _nav_ids(c)
+    with TestClient(webapp.app) as c:  # the next start does not load it either
+        assert "hello" not in _nav_ids(c)
+        # Recoverable the usual way: confirm the file, then switch it on.
+        assert c.post("/api/plugins/hello/consent", json={"permissions": HELLO_PERMISSIONS}).status_code == 200
+        assert c.post("/api/plugins/hello/enable").json()["state"] == "active"
+    consent = json.loads(market.doc.read_text(encoding="utf-8"))["plugins"]["hello"]["consent"]
+    assert (consent["origin"], consent["sha256"]) == ("file", sha)
+
+
+def test_an_interrupted_first_file_install_is_not_offered_as_an_index_addon(market, monkeypatch):
+    """No entry yet: the placed folder is the one the core finds, so its
+    Herkunft must be on record before it is placed, not after."""
+    _write_index(market, sha=market.sha, size=len(market.zip))
+    with TestClient(webapp.app) as c:
+        _fail_the_save_after_place(monkeypatch)
+        with pytest.raises(PermissionError):
+            _upload(c, market.zip)
+        listed = _listed(c)
+        assert (listed["origin"], listed["sha256"], listed["needs_confirmation"]) == ("file", market.sha, True)
+        assert c.post("/api/plugins/hello/enable").status_code == 409
+
+
+def test_a_refused_file_install_over_the_running_version_changes_nothing(market):
+    """The write-ahead must not relabel the running folder when the install is
+    refused before anything moves (``alreadyLoaded``)."""
+    _write_index(market, sha=market.sha, size=len(market.zip))
+    imposter, _sha = _variant(market, "running", tagline="not from the index")
+    with respx.mock() as mock, TestClient(webapp.app) as c:
+        mock.get(URL).mock(return_value=httpx.Response(200, content=market.zip))
+        _index_install_and_consent(market, c)
+        before = json.loads(market.doc.read_text(encoding="utf-8"))["plugins"]["hello"]
+        resp = _upload(c, imposter)
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "error.marketplace.alreadyInstalled"
+        assert json.loads(market.doc.read_text(encoding="utf-8"))["plugins"]["hello"] == before
+        assert _listed(c)["state"] == "active"
 
 
 def test_legacy_consent_keeps_working_but_never_passes_to_a_file(market):
@@ -455,3 +570,36 @@ def test_load_from_folder_refuses_a_folder_without_manifest(market, tmp_path):
         resp = c.post("/api/marketplace/dev-path", json={"path": str(tmp_path)})
     assert resp.status_code == 422
     assert resp.json()["detail"]["code"] == "error.marketplace.folderNotABundle"
+
+
+def test_an_unrecognised_installed_origin_fails_closed(market):
+    """Cloud handoff task 5: a recorded Herkunft the core does not know is
+    never taken for the index; the running Add-on stops until the user
+    confirms it again, through the dialog with the file warning."""
+    _write_index(market, sha=market.sha, size=len(market.zip))
+    with respx.mock() as mock, TestClient(webapp.app) as c:
+        mock.get(URL).mock(return_value=httpx.Response(200, content=market.zip))
+        _index_install_and_consent(market, c)
+    doc = json.loads(market.doc.read_text(encoding="utf-8"))
+    doc["plugins"]["hello"]["source"] = {"origin": "somewhere-else", "sha256": ""}
+    market.doc.write_text(json.dumps(doc), encoding="utf-8")
+    Config.reload_from_env()
+    with TestClient(webapp.app) as c:
+        listed = _listed(c)
+        assert listed["origin"] == "unknown"
+        assert listed["needs_confirmation"] is True
+        assert listed["state"] == "consent_pending"
+        # The user confirms this code; it binds to exactly this Herkunft.
+        assert c.post("/api/plugins/hello/consent", json={"permissions": HELLO_PERMISSIONS}).status_code == 200
+        assert _listed(c)["state"] == "active"
+
+
+def test_reserved_permissions_are_marked_in_the_permission_rows():
+    """ADD-2: files/storage may be declared but grant nothing; the rows say so."""
+    from services.marketplace import permission_rows
+
+    rows = {r["key"]: r for r in permission_rows(["library.read", "files", "storage", "network"])}
+    assert rows["files"] == {"key": "files", "enforced": False, "reserved": True}
+    assert rows["storage"] == {"key": "storage", "enforced": False, "reserved": True}
+    assert rows["library.read"]["enforced"] and not rows["library.read"]["reserved"]
+    assert not rows["network"]["enforced"] and not rows["network"]["reserved"]

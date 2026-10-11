@@ -16,7 +16,7 @@ describe('Lizenz-Aktivierung', () => {
                 url: '/api/license/activate',
                 reply: { activated: true, key: '••••1234', activated_at: '2026-08-22T10:00:00' },
             },
-        ], 'license-tab');
+        ], 'about');
 
         // The buy link points at the checkout URL the server supplied.
         expect(

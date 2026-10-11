@@ -3,13 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import re
+import ssl
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
+import httpx
 import requests
 
 import ca_trust
+import llm_config
 from config import Config
+from services import llm_check
+from services.llm_check import ModelList
 
 
 class LLMClientError(Exception):
@@ -239,6 +245,75 @@ def embed_texts(texts: list[str], *, mode: str = "document") -> list[list[float]
     return vectors
 
 
+# =============================================================================
+# Model lists — the connection test (#209).
+#
+# One network path for every "which models does this connection offer?":
+# the settings page's model dropdowns (routers/llm.fetch_models, with its
+# cache and error codes), the Startup check and the Library Diagnosis
+# (check_roles). A GET on /models costs no tokens. httpx, because the tests
+# fake this boundary with respx.
+# =============================================================================
+
+MODEL_LIST_TIMEOUT = 10.0      # the settings page waits for a list it asked for
+STARTUP_CHECK_TIMEOUT = 5.0    # the check at startup / "Check again": a few seconds
+
+
+def _httpx_verify():
+    """httpx reads no ``REQUESTS_CA_BUNDLE``: hand it the merged trust store
+    (``ca_trust``) as a context, certifi when no house bundle is configured."""
+    bundle = ca_trust.ca_bundle()
+    return ssl.create_default_context(cafile=bundle) if bundle else True
+
+
+def fetch_model_list(base_url: str, api_key: str, *, timeout: float = MODEL_LIST_TIMEOUT) -> ModelList:
+    """``GET {base_url}/models`` — never raises: a failed probe is a result.
+
+    No ``Authorization`` header without a key (local providers have none)."""
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    url = f"{(base_url or '').strip().rstrip('/')}/models"
+    try:
+        resp = httpx.get(url, headers=headers, timeout=timeout,
+                         verify=_httpx_verify(), follow_redirects=True)
+    except Exception as exc:  # noqa: BLE001 - every failure is an answer here
+        text = str(exc)
+        if "CERTIFICATE_VERIFY_FAILED" in text or isinstance(exc, ssl.SSLError):
+            error = "certificate"
+        elif isinstance(exc, httpx.TimeoutException):
+            error = "timeout"
+        elif isinstance(exc, (httpx.ConnectError, httpx.NetworkError, httpx.ProtocolError)):
+            error = "connection"
+        else:
+            error = "failed"
+        return ModelList(error=error, message=text[:200])
+    if resp.status_code != 200:
+        return ModelList(http_status=resp.status_code, message=resp.text[:200])
+    try:
+        models = tuple(m["id"] for m in resp.json().get("data", []) if isinstance(m, dict) and m.get("id"))
+    except (ValueError, AttributeError, TypeError) as exc:
+        return ModelList(http_status=200, message=str(exc)[:200])
+    return ModelList(models=models, http_status=200)
+
+
+def check_roles(timeout: float = STARTUP_CHECK_TIMEOUT) -> dict:
+    """The Startup check (#209): ask every bound role's connection for its
+    model list — through ``Config.llm_endpoint(tier)``, once per connection,
+    in parallel — and classify the answers (``services.llm_check``).
+
+    Returns ``{tier: {status, detail_code, ...}}``. Nothing is persisted;
+    ``routers/llm.py`` keeps the result, the diagnosis derives its findings
+    from it."""
+    endpoints = {tier: Config.llm_endpoint(tier) for tier in llm_config.TIERS}
+    asked = llm_check.targets(endpoints)
+    answers: dict[str, ModelList] = {}
+    if asked:
+        with ThreadPoolExecutor(max_workers=len(asked)) as pool:
+            futures = {cid: pool.submit(fetch_model_list, base, key, timeout=timeout)
+                       for cid, (base, key) in asked.items()}
+            answers = {cid: f.result() for cid, f in futures.items()}
+    return llm_check.report(Config.LLM_DOCUMENT, Config.LLM_PROVIDERS, endpoints, answers, TASK_MODELS)
+
+
 class LLMClient:
     def __init__(self, url: str, model: str, api_key: str) -> None:
         self._url = url
@@ -420,9 +495,15 @@ class LLMClient:
                 return
             try:
                 chunk = json.loads(data_str)
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                content = delta.get("content", "")
-                if content:
-                    yield content
             except json.JSONDecodeError:
-                pass
+                continue
+            # Azure (z. B. KI Connect NRW) eroeffnet den Stream mit einem Chunk
+            # nur fuer die Filterergebnisse des Prompts, ``choices: []``; Usage-
+            # Chunks am Ende sehen genauso aus. Kein Text — ueberspringen.
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            if content:
+                yield content

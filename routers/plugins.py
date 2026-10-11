@@ -37,6 +37,7 @@ import plugin_loader
 import plugins_config
 import settings_store
 from config import Config
+from plugin_api import ManifestError, load_manifest
 from services import addon_catalog, addon_frontend, addon_lifecycle
 
 router = APIRouter()
@@ -174,6 +175,21 @@ def _require_bundle(candidate: addon_catalog.Candidate, addon_id: str) -> None:
         raise HTTPException(status_code=409, detail={"code": "error.plugins.notABundle", "params": {"id": addon_id}})
 
 
+def _declared_by(candidate: addon_catalog.Candidate, addon_id: str, version: str) -> list[str]:
+    """The Berechtigungen the Manifest in ``<id>/<version>/`` declares — what a
+    switch to that folder must have consent for (ADD-5: never the consent the
+    running version happens to hold). An unreadable Manifest, or one naming
+    another id or version than its folder, is no rollback target."""
+    try:
+        manifest = load_manifest(candidate.path.parent / version)
+    except ManifestError:
+        manifest = None
+    if manifest is None or manifest.id != addon_id or manifest.version != version:
+        raise HTTPException(status_code=409, detail={
+            "code": addon_lifecycle.ERR_NO_PREVIOUS, "params": {"id": addon_id}})
+    return sorted(p.value for p in manifest.permissions)
+
+
 @router.post("/api/plugins/{addon_id}/update/consent")
 async def consent_pending_update(addon_id: str, data: ConsentRequest):
     """Agree to the Berechtigungen a downloaded update adds. The old version
@@ -202,10 +218,12 @@ async def rollback_plugin(addon_id: str):
     except ValueError as exc:
         raise HTTPException(status_code=409, detail={"code": str(exc), "params": {"id": addon_id}})
     running = plugin_loader.is_loaded(addon_id)
-    # The predecessor ran before, so its Berechtigungen were agreed to — for
-    # its own Herkunft, which switch_version takes from ``previous_source``: a
+    # The predecessor's own Manifest decides what it needs — the consent may
+    # have been replaced for the running version since it last ran — and its
+    # own Herkunft, which switch_version takes from ``previous_source``: a
     # file that replaced the kept folder since then still needs confirmation.
-    addon_lifecycle.switch_version(doc, addon_id, target, sorted(addon_lifecycle.granted(entry)), running=running)
+    declared = _declared_by(candidate, addon_id, target)
+    addon_lifecycle.switch_version(doc, addon_id, target, declared, running=running)
     await _save_and_reload(doc)
     return {**_one(addon_id), "restart_required": running}
 

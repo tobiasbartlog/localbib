@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="{{ ui_language }}">
 <head>
     <meta charset="UTF-8">
@@ -65,14 +65,27 @@
          Key-Pfade aufblitzen lassen, bevor er da ist. Beide Sprachen liegen
          im Speicher, deshalb wirkt das Umschalten sofort. -->
     <script>window.LB_LANG = "{{ ui_language }}";</script>
+    <!-- Dark mode and thesis area are server settings (#208). The server renders
+         its values in ("" = none yet); the localStorage mirror only carries the
+         first paint of an install that has not handed its value over yet. Runs
+         before any stylesheet paints, so no flash of the wrong theme. -->
+    <script>
+        window.LB_PREFS = {{ prefs | tojson }};
+        (function () {
+            try {
+                var held = window.LB_PREFS.darkMode || localStorage.getItem('darkMode');
+                document.documentElement.setAttribute('data-theme', held === 'true' ? 'dark' : 'light');
+            } catch (e) { /* the SPA applies it again */ }
+        })();
+    </script>
     <!-- Add-on frontends (#187): what app.js loads before it mounts the router. -->
     <script>window.LB_ADDONS = {{ addons | tojson }};</script>
-    <script src="/static/locales/core.en.js?v=20260929b"></script>
-    <script src="/static/locales/core.de.js?v=20260929b"></script>
-    <link rel="stylesheet" href="/static/style.css?v=20260929b">
+    <script src="/static/locales/core.en.js?v=20261011wissensnetz5"></script>
+    <script src="/static/locales/core.de.js?v=20261011wissensnetz5"></script>
+    <link rel="stylesheet" href="/static/style.css?v=20261011wissensnetz5">
 </head>
 <body class="bg-bg text-ink font-sans min-h-screen">
     <div id="app"></div>
-    <script src="/static/app.js?v=20260929b"></script>
+    <script src="/static/app.js?v=20261011wissensnetz5"></script>
 </body>
 </html>

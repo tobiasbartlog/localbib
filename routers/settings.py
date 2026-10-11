@@ -23,12 +23,15 @@ by webapp.py at mount time so no router ever imports webapp.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+import detail_layout
+import llm_config
 import settings_store
 from context import registry
 from literature_manager import Config
@@ -56,7 +59,21 @@ ALLOWED_KEYS = {
     "WATCH_INTERVAL",
     "MAX_OCR_PAGES",
     "UNLOCK_PDFS",
+    # Look and sidebar of this installation (#208). The server is the truth;
+    # the browser's localStorage only mirrors it for a flicker-free first paint.
+    "DARK_MODE",
+    "THESIS_MODE",
+    # Which blocks the Item detail view shows and where (#230): compact JSON,
+    # normalized by detail_layout on write and on read.
+    "DETAIL_LAYOUT",
 }
+
+# Keys that never reach the SPA in plain text (SET-B9, "keys never reach the
+# SPA"): GET sends "" plus a ``<KEY>_HINT``; a PUT of that hint is no change.
+SECRET_KEYS = {"OPENALEX_API_KEY"}
+
+# Keys holding "true" / "false" and nothing else.
+BOOLEAN_KEYS = {"DARK_MODE", "THESIS_MODE"}
 
 # Keys config.py parses as an int (see ``Config._env_int``), with the
 # minimum each must satisfy. Validated here, at the write site, so a bad
@@ -84,6 +101,9 @@ class SettingsUpdate(BaseModel):
     WATCH_INTERVAL: Optional[str] = None
     MAX_OCR_PAGES: Optional[str] = None
     UNLOCK_PDFS: Optional[str] = None
+    DARK_MODE: Optional[str] = None
+    THESIS_MODE: Optional[str] = None
+    DETAIL_LAYOUT: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -92,13 +112,31 @@ class SettingsUpdate(BaseModel):
 
 @router.get("/api/settings")
 async def get_settings():
-    # Defaults für Keys die nicht in .env stehen
+    # Defaults für Keys die nicht in .env stehen. Der Link-Modus kommt als der
+    # wirksame Wert (#213) — sein Default steht in Config.reload_from_env.
     defaults = {
         "UNLOCK_PDFS": "true",
+        "LINK_MODE": Config.LINK_MODE,
     }
     settings = dict(defaults)
     settings.update(settings_store.read_env(_ENV_PATH, ALLOWED_KEYS))
+    # Always the layout in force, also without an entry (or with an unusable one).
+    settings["DETAIL_LAYOUT"] = detail_layout.dumps(
+        detail_layout.effective(settings.get("DETAIL_LAYOUT")))
+    for key in SECRET_KEYS:
+        current = _effective_secret(key)
+        settings[key] = ""
+        settings[key + "_HINT"] = llm_config.key_hint(current) if current else ""
     return settings
+
+
+def _effective_secret(key: str) -> str:
+    """The secret in use: the running value (``Config``, from the process
+    environment — where a real process-env value wins over the .env, SET-B5),
+    else the .env entry. The hint is built from this, and a PUT of that hint
+    is compared against it, so a key supplied by the environment alone is
+    shown as in use and kept."""
+    return getattr(Config, key, "") or settings_store.read_env(_ENV_PATH, {key}).get(key) or ""
 
 
 @router.get("/api/plugins/nav")
@@ -126,12 +164,29 @@ async def get_llm_providers():
     return {"providers": providers}
 
 
+def _clean_path_value(value: str) -> str:
+    """Whitespace and one pair of surrounding quotes off a pasted path
+    (Explorer's "Copy as path" yields ``"C:\\...\\Literatur"``)."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
 @router.put("/api/settings")
 async def update_settings(data: SettingsUpdate):
     updates: dict[str, Optional[str]] = {}
     for key in ALLOWED_KEYS:
         value = getattr(data, key, None)
         if value is None:
+            continue
+        if key in SECRET_KEYS:
+            current = _effective_secret(key)
+            cleaned = value.strip()
+            if current and cleaned == llm_config.key_hint(current):
+                continue  # the masked hint sent back: unchanged, keep the key
+            # "" removes the key — delete the line rather than write it empty.
+            updates[key] = cleaned or None
             continue
         if key in NUMERIC_KEYS:
             stripped = value.strip()
@@ -151,10 +206,56 @@ async def update_settings(data: SettingsUpdate):
                     detail={"code": "error.settings.invalidNumber", "params": {"key": key}},
                 )
             updates[key] = stripped
+        elif key in BOOLEAN_KEYS:
+            if value not in ("true", "false"):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "error.settings.invalidBoolean", "params": {"key": key}},
+                )
+            updates[key] = value
+        elif key == "DETAIL_LAYOUT":
+            try:
+                updates[key] = detail_layout.dumps(detail_layout.parse(value))
+            except detail_layout.InvalidLayout:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "error.settings.invalidLayout", "params": {"key": key}},
+                )
+        elif key == "LINK_MODE":
+            if value not in Config.LINK_MODES:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "error.settings.invalidChoice", "params": {"key": key}},
+                )
+            updates[key] = value
+        elif key == "LITERATUR_BASE_DIR":
+            cleaned = _clean_path_value(value)
+            # ~ and %VARS% are expanded at startup, so judge the expanded form.
+            expanded = os.path.expanduser(os.path.expandvars(cleaned))
+            if not cleaned or not os.path.isabs(expanded):
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "error.settings.baseDirNotAbsolute", "params": {"key": key}},
+                )
+            updates[key] = cleaned
         else:
             updates[key] = value
+    for key, value in updates.items():
+        # A lone surrogate cannot be written as UTF-8: refuse before any write.
+        if value is not None:
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "error.settings.invalidValue", "params": {"key": key}},
+                )
     settings_store.write_env(_ENV_PATH, updates)
     # Config zur Laufzeit aktualisieren — EIN Pfad fuer beide Settings-Writer
     # (.env hier, llm.json in routers/llm.py), damit nichts auseinanderdriftet.
     await settings_store.reload_runtime(_ENV_PATH)
-    return {"status": "ok"}
+    answer: dict = {"status": "ok"}
+    if "DETAIL_LAYOUT" in updates:
+        # The layout in force, so the editor needs no second GET.
+        answer["detail_layout"] = detail_layout.effective(updates["DETAIL_LAYOUT"])
+    return answer

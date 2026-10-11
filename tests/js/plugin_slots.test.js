@@ -2,9 +2,9 @@
 //
 // The real fixture Add-on of the contract package (`hello`) occupies the Item
 // list filter, the Item detail aside and the Research Chat context with its
-// own components, and its settings section — in its Marketplace slide-over
-// since #193 — through the core's generic renderer (fields declared in its
-// Manifest). A second Add-on written here
+// own components, and its settings section — on its page under Settings →
+// Add-ons since #207 — through the core's generic renderer (fields declared in
+// its Manifest). A second Add-on written here
 // (`solo`, English only) brings its own settings component; a third (`odd`)
 // names a slot that does not exist and is rejected.
 import { readFileSync } from 'node:fs';
@@ -12,7 +12,8 @@ import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
-    addonSwitch, bootApp, findByText, flush, marketplaceCard, openAddonDetail, openMarketplace, typeInto,
+    addonSwitch, bootApp, filterPill, filterPillActive, findByText, flush, marketplaceCard, openAddonDetail,
+    openFilterPill, openMarketplace, typeInto,
 } from './helpers.js';
 
 const FIXTURE = resolve(__dirname, '../../plugin_api/tests/fixtures/hello');
@@ -60,21 +61,16 @@ const PAPERS = [
 ];
 
 const papersCalls = (calls) => calls.filter((c) => c.method === 'GET' && c.url.startsWith('/api/papers?'));
-const filterButton = () => document.querySelector('.lb-toolbar-l button');
-const badge = () => filterButton().querySelector('.lb-pill-accent');
 
 function go(hash) {
     window.location.hash = hash;
     window.dispatchEvent(new HashChangeEvent('hashchange'));
 }
 
-async function openFilters() {
-    const btn = await vi.waitFor(() => {
-        const b = filterButton();
-        if (!b) throw new Error('item list not rendered');
-        return b;
+async function filterBar() {
+    await vi.waitFor(() => {
+        if (!document.querySelector('[data-testid="filter-bar"]')) throw new Error('item list not rendered');
     });
-    if (!document.querySelector('.lb-filter-bar')) btn.click();
     await flush();
 }
 
@@ -117,7 +113,7 @@ describe('Add-on slots', () => {
             { method: 'GET', url: '/api/plugins/frontend', reply: () => ({ addons: helloOn ? [HELLO, SOLO] : [SOLO] }) },
             { method: 'GET', url: '/api/plugins', reply: () => ({ plugins: [helloState(), soloState], core: {} }) },
             {
-                method: 'GET', url: '/api/marketplace',
+                method: 'GET', url: /^\/api\/marketplace(\?.*)?$/,
                 reply: () => ({
                     addons: [
                         marketplaceCard({ id: 'hello', name: 'Hello', installed_version: '0.1.0',
@@ -146,15 +142,22 @@ describe('Add-on slots', () => {
         expect(errors.mock.calls.some((c) => c.join(' ').includes('"toolbar"'))).toBe(true);
         expect(window.LocalBib.isActive('hello')).toBe(true);
 
-        // --- item-list-filter -------------------------------------------------
-        await openFilters();
+        // --- item-list-filter: its own pill, named after the Add-on ----------
+        await filterBar();
+        await vi.waitFor(() => {
+            if (!filterPill('addon-hello') || !filterPill('addon-hello').textContent.includes('Hello')) {
+                throw new Error('hello pill not named yet');
+            }
+        });
+        const pop = await openFilterPill('addon-hello');
         const select = await vi.waitFor(() => {
-            const s = document.querySelector('select.hello-filter-select');
+            const s = pop.querySelector('select.hello-filter-select');
             if (!s) throw new Error('hello filter not rendered');
             return s;
         });
+        expect(pop.querySelector('[data-addon-slot="hello.filter"]')).not.toBeNull();
         expect(findByText('.hello-filter', 'Greeting')).toBeTruthy();
-        expect(badge()).toBeNull();
+        expect(filterPillActive('addon-hello')).toBe(false);
         select.value = 'greeted';
         select.dispatchEvent(new Event('change'));
         await vi.waitFor(() => {
@@ -163,7 +166,9 @@ describe('Add-on slots', () => {
         });
         expect(papersCalls(calls).at(-1).url).toContain(`cite_keys=${encodeURIComponent('hello2024,hello2025')}&`);
         await flush();
-        expect(badge().textContent.trim()).toBe('1');
+        // A non-null selection is an active filter: the pill says so, with its label.
+        expect(filterPillActive('addon-hello')).toBe(true);
+        expect(filterPill('addon-hello').querySelector('.lb-fbar-pv').textContent.trim()).toBe('Greeted Items');
 
         // Reset clears the selection and fetches the unfiltered list.
         const before = papersCalls(calls).length;
@@ -173,8 +178,9 @@ describe('Add-on slots', () => {
         });
         expect(papersCalls(calls).at(-1).url).not.toContain('cite_keys');
         await flush();
-        expect(badge()).toBeNull();
-        expect(document.querySelector('select.hello-filter-select').value).toBe('');
+        expect(filterPillActive('addon-hello')).toBe(false);
+        const reopened = await openFilterPill('addon-hello');
+        expect(reopened.querySelector('select.hello-filter-select').value).toBe('');
 
         // --- item-detail-aside ------------------------------------------------
         go('#/paper/1');
@@ -225,27 +231,19 @@ describe('Add-on slots', () => {
         const on = await ask('second question');
         expect(on.extra_context).toEqual(['Greetings the user has sent so far.']);
 
-        // --- settings in the Marketplace slide-over (#193): generic for hello,
-        // own component for solo --------------------------------------------
-        // Settings itself carries no Add-on cards any more.
-        go('#/settings');
-        await vi.waitFor(() => {
-            if (!findByText('h2', 'Settings')) throw new Error('settings not rendered');
-        });
-        findByText('button', window.LB_I18N.en['settings.tabAppearance']).click();
-        await flush();
-        expect(document.querySelector('[data-testid="addons-section"]')).toBeNull();
-        expect(document.querySelector('[data-testid^="addon-settings-"]')).toBeNull();
+        // --- settings on the Add-on's page under Settings → Add-ons (#207):
+        // generic for hello, own component for solo --------------------------
+        // The Marketplace slide-over only links there.
+        await openMarketplace();
+        const over = await openAddonDetail('hello');
+        expect(over.querySelector('[data-testid^="addon-settings-"]')).toBeNull();
+        over.querySelector('[data-testid="marketplace-settings-link"]').click();
 
-        const helloSection = async () => {
-            await openMarketplace();
-            await openAddonDetail('hello');
-            return vi.waitFor(() => {
-                const el = document.querySelector('[data-testid="marketplace-slideover"] [data-testid="addon-settings-hello"]');
-                if (!el || !el.querySelector('[data-field="shout"]')) throw new Error('hello settings not rendered');
-                return el;
-            });
-        };
+        const helloSection = () => vi.waitFor(() => {
+            const el = document.querySelector('[data-settings-section="addons/hello"] [data-testid="addon-settings-hello"]');
+            if (!el || !el.querySelector('[data-field="shout"]')) throw new Error('hello settings not rendered');
+            return el;
+        });
         const section = await helloSection();
         const labels = [...section.querySelectorAll('label')].map((l) => l.textContent.trim());
         expect(labels).toEqual(['Salutation', 'Greeting service key', 'Greetings folder', 'Greet in capitals']);
@@ -277,60 +275,63 @@ describe('Add-on slots', () => {
         const again = calls.filter((c) => c.method === 'PUT' && c.url === '/api/plugins/hello/settings').at(-1);
         expect(again.body.values.api_key).toBeNull();
         expect(again.body.values.salutation).toBe('Ahoy');
-
-        // An Add-on's own settings component renders in its slide-over.
-        document.querySelector('[data-testid="marketplace-slideover-close"]').click();
+        // "Saved" stands until the next edit, not until the next save (SPA-13).
+        await vi.waitFor(() => { if (!section.querySelector('.lb-set-saved')) throw new Error('no saved mark'); });
+        typeInto(field('salutation'), 'Ahoy there');
         await flush();
-        const solo = await openAddonDetail('solo');
+        expect(section.querySelector('.lb-set-saved')).toBeNull();
+
+        // An Add-on's own settings component renders on its page.
+        document.querySelector('[data-testid="settings-nav-addon-solo"]').click();
         await vi.waitFor(() => {
-            if (!solo.querySelector('.solo-settings')) throw new Error('solo settings not rendered');
+            if (!document.querySelector('[data-testid="addon-settings-solo"] .solo-settings')) throw new Error('solo settings not rendered');
         });
         expect(findByText('.solo-settings', 'Solo speaks English only calm (solo)')).toBeTruthy();
-        document.querySelector('[data-testid="marketplace-slideover-close"]').click();
-        await flush();
 
         // Slot texts follow the UI language; an Add-on without it falls back
         // to its default_language instead of showing key paths.
-        go('#/settings');
-        await vi.waitFor(() => {
-            if (!findByText('h2', 'Settings')) throw new Error('settings not rendered');
+        go('#/settings/general');
+        const langDe = await vi.waitFor(() => {
+            const el = document.querySelector('[data-testid="settings-language-de"]');
+            if (!el) throw new Error('settings not rendered');
+            return el;
         });
-        findByText('button', window.LB_I18N.en['settings.tabAppearance']).click();
-        await flush();
-        const langSelect = [...document.querySelectorAll('select')].find((s) => s.querySelector('option[value="de"]'));
-        langSelect.value = 'de';
-        langSelect.dispatchEvent(new Event('change'));
+        langDe.click();
         await vi.waitFor(() => {
-            if (!findByText('h2', 'Einstellungen')) throw new Error('UI not German yet');
+            if (!findByText('.lb-set-group', 'Einstellungen')) throw new Error('UI not German yet');
         });
+        go('#/settings/addons/hello');
         await helloSection();
         await vi.waitFor(() => {
             const first = document.querySelector('[data-testid="addon-settings-hello"] label');
             if (!first || first.textContent.trim() !== 'Anrede') throw new Error('labels not German yet');
         });
-        document.querySelector('[data-testid="marketplace-slideover-close"]').click();
-        await flush();
-        await openAddonDetail('solo');
+        go('#/settings/addons/solo');
         await vi.waitFor(() => {
-            if (!document.querySelector('.solo-settings')) throw new Error('solo settings not rendered');
+            if (!document.querySelector('[data-testid="addon-settings-solo"] .solo-settings')) throw new Error('solo settings not rendered');
         });
         expect(document.querySelector('.solo-settings').textContent).toContain('Solo speaks English only');
         expect(document.body.textContent).not.toContain('⟦');
-        document.querySelector('[data-testid="marketplace-slideover-close"]').click();
-        await flush();
 
         // --- switched off on the card: filter, aside and section are gone -----
+        await openMarketplace();
         (await addonSwitch('hello')).click();
         await vi.waitFor(() => {
             if (window.LocalBib.isActive('hello')) throw new Error('hello still active');
         });
         await flush();
+        go('#/settings/general');
+        await vi.waitFor(() => {
+            if (!document.querySelector('[data-testid="settings-nav-addon-solo"]')) throw new Error('add-on entries not loaded');
+        });
+        expect(document.querySelector('[data-testid="settings-nav-addon-hello"]')).toBeNull();
         expect(document.querySelector('[data-testid="addon-settings-hello"]')).toBeNull();
         go('#/');
-        await openFilters();
+        await filterBar();
         await flush();
+        expect(filterPill('addon-hello')).toBeNull();
         expect(document.querySelector('select.hello-filter-select')).toBeNull();
-        expect(badge()).toBeNull();
+        expect(document.querySelector('.lb-fbar-pw.is-active')).toBeNull();
         expect(papersCalls(calls).at(-1).url).not.toContain('cite_keys');
         errors.mockRestore();
     });

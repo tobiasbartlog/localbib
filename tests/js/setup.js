@@ -7,6 +7,8 @@ import DOMPurify from 'dompurify';
 import { marked } from 'marked';
 import * as Vue from 'vue';
 import * as VueRouter from 'vue-router';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { TextDecoder as NodeTextDecoder, TextEncoder as NodeTextEncoder } from 'node:util';
 
 globalThis.Vue = Vue;
@@ -67,14 +69,42 @@ window.LB_SCRIPT_LOADER = async (url) => {
     new Function(source)();
 };
 
+// PDF preview (#229): jsdom cannot run PDF.js (no canvas, no worker, no
+// import() of a URL). The SPA reaches PDF.js through one adapter only, so this
+// fake stands in for it - `open(url, { page })`, `goTo(page, rect)`, `zoom()`
+// and the page-change message - and records what the SPA asked for in
+// `window.LB_PDF_VIEWER.log`. Pretends every PDF has twelve pages.
+const pdfViewerLog = { opened: [], jumps: [], zooms: [] };
+window.LB_PDF_VIEWER = (host, handlers = {}) => {
+    const say = (page) => handlers.onPageChange && handlers.onPageChange({ page, pages: 12 });
+    return {
+        async open(url, opts = {}) {
+            pdfViewerLog.opened.push({ url, page: opts.page || 1 });
+            say(opts.page || 1);
+            return { pages: 12 };
+        },
+        goTo(page, rect) {
+            pdfViewerLog.jumps.push({ page, rect });
+            say(page);
+        },
+        zoom(step) { pdfViewerLog.zooms.push(step); },
+        destroy() {},
+    };
+};
+window.LB_PDF_VIEWER.log = pdfViewerLog;
+
 // jsdom's alert/confirm raise "not implemented" — default to silent OK;
 // individual tests override with vi.fn() to assert on the dialog.
 window.alert = () => {};
 window.confirm = () => true;
 
-// Benign stub for CDN libraries the smoke-tested views never exercise
-// (citation network is out of smoke scope).
-globalThis.d3 = {};
+// d3 v7: the real library, pinned in package.json to the exact version the CDN
+// URL in index.html serves (d3.v7.min.js = 7.9.0), so the knowledge network
+// is drawn in the smokes and its nodes can be asserted (#241). It is the
+// package's own UMD bundle - the file that CDN URL delivers - evaluated the
+// way the page's <script> runs it, so it installs `globalThis.d3`; one file
+// instead of thirty ES modules keeps every smoke's setup quick.
+new Function(readFileSync(resolve(__dirname, '../../node_modules/d3/dist/d3.min.js'), 'utf8'))();
 
 // CodeMirror 5: callable (the manuscript editor mounts into a host element)
 // and with .fromTextArea (the notes editor upgrades a textarea). The stub

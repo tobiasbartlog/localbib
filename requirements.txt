@@ -17,5 +17,11 @@ python-dotenv>=1.0.0   # .env Datei laden
 jinja2>=3.1.0          # HTML Templates
 python-multipart>=0.0.6  # File-Uploads (Citavi/RIS Import, Icon Upload)
 
+# Windows .exe: tray icon instead of a console (#214, ADR-0023). Only the
+# Windows build uses them (starter.py imports them lazily), so other platforms
+# skip them - pystray would pull a macOS/X11 stack there for nothing.
+pystray>=0.19.5; sys_platform == "win32"   # LGPL-3.0, compatible with the AGPL
+Pillow>=10.0; sys_platform == "win32"      # the icon image pystray draws
+
 # Optional (Windows-Verknüpfungen)
 # pywin32>=306          # Nur auf Windows, für .lnk Shortcuts

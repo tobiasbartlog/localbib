@@ -1,6 +1,7 @@
 /.env
 /llm.json
 /plugins.json
+logs/
 /ToDO.txt
 
 # Claude Code internal worktrees
@@ -25,3 +26,7 @@ node_modules/
 
 # operator wizards write their captured values next to themselves
 scripts/.env
+
+# Impeccable skill: its launcher downloads this binary on first run (~19 MB per
+# harness copy), so it is a cache, not source
+**/skills/impeccable/scripts/bin/

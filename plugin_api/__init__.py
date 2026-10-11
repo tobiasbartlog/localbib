@@ -20,7 +20,7 @@ in-process with the AGPL core, AGPL-compatible licensing is recommended.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, Union, runtime_checkable
 
 from plugin_api.manifest import (
     GATED_SERVICES,
@@ -47,6 +47,19 @@ from plugin_api.manifest import (
 # version they are built against via ``PluginManifest.api_version``
 # (``api_version`` in ``plugin.json``). See CHANGELOG.md for 1 -> 2.
 API_VERSION = 2
+
+# ``LibraryApi.on_change`` events about Collections (contract 2.1):
+# ``{"type": "collection", "action": <one of these>, "collection_id": int}``.
+COLLECTION_EVENT = "collection"
+COLLECTION_EVENT_ACTIONS = (
+    "created",          # a new Collection
+    "renamed",          # its name changed
+    "updated",          # its description changed
+    "archived",
+    "restored",         # back from the archive
+    "deleted",          # tombstoned: still readable, membership frozen
+    "members_changed",  # Items added or removed (also when a deleted Item leaves it)
+)
 
 
 # =============================================================================
@@ -81,6 +94,26 @@ class LibraryApi(Protocol):
     The handle exists with ``library.read``; every method but
     :meth:`create_by_doi` reads. ``get_full_text`` may legitimately return
     ``None`` (discovery A5): plugins must degrade to abstract-only.
+
+    **Collections** (contract 2.1, additive): hand-curated lists of Items.
+    Reading them needs nothing beyond ``library.read``. A Collection is the
+    dict ``{"id": int, "name": str, "description": str, "archived": bool,
+    "archived_at": str | None, "deleted": bool, "deleted_at": str | None,
+    "created_at": str, "updated_at": str, "item_count": int}`` (timestamps
+    ``"YYYY-MM-DD HH:MM:SS"``, UTC). Deleting a Collection leaves a
+    *tombstone*: the user never sees it again, but these methods still return
+    it (``deleted`` True) with its last membership frozen, so an Add-on that
+    was not running at the time can catch up. Guard the methods with
+    ``getattr(library, "list_collections", None)`` if you support hosts
+    older than 2.1.
+
+    **Change events**: :meth:`on_change` delivers plain dicts. Collection
+    events are ``{"type": "collection", "action": a, "collection_id": int}``
+    with ``a`` in :data:`COLLECTION_EVENT_ACTIONS`; an event says *that*
+    something changed — read the new state back. Callbacks run on the
+    writer's thread right after its commit: keep them quick (record,
+    schedule, debounce), expect bursts (an import announces each Item it
+    adds) and ignore types you do not know. Unsubscribe in ``deactivate()``.
     """
 
     def create_by_doi(
@@ -111,7 +144,15 @@ class LibraryApi(Protocol):
         if you support older hosts."""
         ...
 
-    def get_reference(self, citekey: str) -> Optional[dict]: ...
+    def get_reference(self, citekey: str) -> Optional[dict]:
+        """One Item by its stored Cite Key, or ``None``:
+        ``{citekey, id, title, authors, year, journal, doi, abstract, has_pdf,
+        volume, issue, pages}``. ``id`` is the Item id (the core's Item route
+        is ``/paper/{id}``), ``has_pdf`` says whether the Item's PDF is in the
+        library; ``volume``/``issue``/``pages`` are ``None`` when the Item's
+        stored metadata does not know them. The last four are additive in
+        contract 2.3.0 — read them with ``.get``."""
+        ...
 
     def search_references(self, query: str, limit: int = 20) -> list[dict]: ...
 
@@ -133,7 +174,30 @@ class LibraryApi(Protocol):
         when the host predates it (``getattr(..., None)``)."""
         ...
 
-    def on_change(self, callback: Callable[[dict], None]) -> Callable[[], None]: ...
+    def list_collections(self) -> list[dict]:
+        """Every Collection — active, archived and tombstoned — by name."""
+        ...
+
+    def get_collection(self, collection_id: int) -> Optional[dict]:
+        """One Collection (tombstones included); ``None`` if the id is unknown."""
+        ...
+
+    def get_collection_refs(self, collection_id: int) -> list[str]:
+        """The Collection's Items as stored Cite Keys — the keys
+        :meth:`get_reference` and :meth:`export_bibtex` use — in a stable
+        order (oldest addition first). A tombstone answers its frozen
+        membership; an unknown id answers ``[]``."""
+        ...
+
+    def export_collection_bibtex(self, collection_id: int) -> str:
+        """The Collection's Items as one ``.bib`` string, entries keyed by
+        the same Cite Keys. An unknown id or an empty Collection answers
+        a single newline."""
+        ...
+
+    def on_change(self, callback: Callable[[dict], None]) -> Callable[[], None]:
+        """Subscribe to library change events; returns the unsubscriber."""
+        ...
 
 
 class LlmApi(Protocol):
@@ -191,10 +255,26 @@ class CoreSettings:
     base_dir: str                # the library base folder
 
 
+def setting_value(value: Any) -> Union[str, bool, None]:
+    """The value ``SettingsApi.set`` stores for ``value`` (2.2.0).
+
+    ``str``, ``bool`` and ``None`` are stored as they are; ``int`` and
+    ``float`` become their ``str`` (what the core always kept on disk);
+    anything else (list, dict, ...) raises ``TypeError``. The core and the
+    ``plugin_api.testing`` fake both apply exactly this rule."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    raise TypeError(f"setting values are str, bool or None, not {type(value).__name__}")
+
+
 class SettingsApi(Protocol):
     """Settings in the plugin's own namespace, plus the core read set.
 
     ``get``/``set`` need no permission and only ever see the plugin's own keys.
+    ``set`` stores ``str``, ``bool`` and ``None``; ``int``/``float`` become
+    ``str``; anything else raises ``TypeError`` (:func:`setting_value`).
     ``core()`` returns :class:`CoreSettings` when the plugin declared
     ``settings.core`` and ``None`` otherwise.
     """
@@ -210,9 +290,10 @@ class PluginApi(Protocol):
     """The object handed to a plugin's ``activate()``. Abschnitt 5: ``PluginApi``.
 
     ``ui``/``routes`` are always present. The gated services (``library``,
-    ``llm``, ``files``, ``storage`` — see ``GATED_SERVICES``) are handed over
-    only when the manifest declares the matching Berechtigung and are ``None``
-    otherwise; they may also be ``None`` when the host has no such service
+    ``llm`` — see ``GATED_SERVICES``) are handed over only when the manifest
+    declares the matching Berechtigung and are ``None`` otherwise. ``files``
+    and ``storage`` are reserved: declaring them is valid, but they grant
+    nothing yet and are always ``None``; they may also be ``None`` when the host has no such service
     (e.g. no embeddings endpoint). Plugins must degrade gracefully.
     ``settings`` is the plugin-scoped store; its ``core()`` answers only with
     ``settings.core`` declared. ``plugin_api.testing.make_api`` builds this
@@ -252,6 +333,8 @@ class LocalBibPlugin(Protocol):
 
 __all__ = [
     "API_VERSION",
+    "COLLECTION_EVENT",
+    "COLLECTION_EVENT_ACTIONS",
     "MANIFEST_FILENAME",
     "PluginManifest",
     "NavItem",
@@ -261,6 +344,7 @@ __all__ = [
     "PermissionInfo",
     "PERMISSIONS",
     "GATED_SERVICES",
+    "setting_value",
     "SLOTS",
     "SETTING_TYPES",
     "ManifestError",

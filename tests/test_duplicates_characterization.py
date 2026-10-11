@@ -787,7 +787,9 @@ class TestMergeDuplicates:
     # --- PDF file deletion ---
 
     def test_del_pdf_file_deleted_from_disk(self, client, db):
-        keep_id = _seed_paper(db, filename="filedel_keep.pdf", with_file=False)
+        # The dropped PDF is only deleted when the keeper's own file exists
+        # (LIB-B4 residual); a missing keeper file takes the dropped one over.
+        keep_id = _seed_paper(db, filename="filedel_keep.pdf", with_file=True)
         del_id = _seed_paper(db, filename="filedel_del.pdf", with_file=True)
         del_filepath = Path(Config.ALL_DIR) / "filedel_del.pdf"
         assert del_filepath.exists()

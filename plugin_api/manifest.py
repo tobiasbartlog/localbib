@@ -53,11 +53,15 @@ class PermissionInfo:
     when the core cannot check it and it is the author's declaration only.
     ``service`` names the ``PluginApi`` attribute the permission unlocks
     (``None`` for a permission that unlocks no service).
+    ``reserved`` is True for a Berechtigung that may be declared but grants
+    nothing yet (``files``, ``storage``): the core has no host service for it,
+    so the matching ``PluginApi`` attribute is always ``None``.
     """
 
     permission: Permission
     enforced: bool
     service: Optional[str]
+    reserved: bool = False
 
 
 PERMISSIONS: Mapping[Permission, PermissionInfo] = {
@@ -71,8 +75,10 @@ PERMISSIONS: Mapping[Permission, PermissionInfo] = {
     Permission.SETTINGS_CORE: PermissionInfo(Permission.SETTINGS_CORE, True, None),
     # In-process code can always open a socket.
     Permission.NETWORK: PermissionInfo(Permission.NETWORK, False, None),
-    Permission.FILES: PermissionInfo(Permission.FILES, True, "files"),
-    Permission.STORAGE: PermissionInfo(Permission.STORAGE, True, "storage"),
+    # Reserved (2.2.0): declaring them stays valid, they grant nothing yet -
+    # ``api.files`` / ``api.storage`` are always None, in the core and the fakes.
+    Permission.FILES: PermissionInfo(Permission.FILES, False, None, reserved=True),
+    Permission.STORAGE: PermissionInfo(Permission.STORAGE, False, None, reserved=True),
 }
 
 #: The ``PluginApi`` services that exist only when their permission is declared.

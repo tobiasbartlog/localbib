@@ -212,6 +212,55 @@ def test_rollback_to_a_kept_version_a_file_replaced_needs_its_own_confirmation(l
     assert _stored(life)["plugins"]["hello"]["source"]["origin"] == "index"
 
 
+def test_rollback_asks_for_what_the_predecessor_itself_declares(life):
+    """ADD-5: the rollback recorded the *current* consent as the pending
+    version's Berechtigungen. After a consent replacement for 0.2.0 dropped
+    ``network``, rolling back to 0.1.0 (which declares it) showed nothing
+    missing, and after the restart 0.1.0 sat in ``consent_pending``."""
+    with_network = sorted(HELLO_PERMISSIONS + ["network"])
+    _publish(life, _variant(life.root, "0.1.0", extra_permissions=["network"]), _variant(life.root, "0.2.0"))
+    with TestClient(webapp.app) as c:
+        _install(c, life, "0.1.0")
+        assert c.post("/api/plugins/hello/consent", json={"permissions": with_network}).status_code == 200
+        assert c.post("/api/plugins/hello/enable").json()["state"] == "active"
+        _install(c, life, "0.2.0")
+    with TestClient(webapp.app) as c:
+        assert (_hello(c)["version"], _hello(c)["state"]) == ("0.2.0", "active")
+        # A consent replacement for 0.2.0: exactly what it declares, no network.
+        assert c.post("/api/plugins/hello/consent", json={"permissions": HELLO_PERMISSIONS}).status_code == 200
+        assert _stored(life)["plugins"]["hello"]["consent"]["permissions"] == HELLO_PERMISSIONS
+
+        back = c.post("/api/plugins/hello/rollback").json()
+        assert back["restart_required"] is True
+        assert back["pending_update"]["version"] == "0.1.0"
+        assert back["pending_update"]["missing"] == ["network"]
+        assert back["pending_update"]["confirm"] is True
+        assert _card(c)["pending_update"]["missing"] == ["network"]
+    with TestClient(webapp.app) as c:  # unagreed: 0.2.0 runs on, the rollback waits
+        hello = _hello(c)
+        assert (hello["version"], hello["state"]) == ("0.2.0", "active")
+        assert hello["pending_update"]["missing"] == ["network"]
+        agreed = c.post("/api/plugins/hello/update/consent", json={"permissions": ["network"]})
+        assert agreed.status_code == 200
+    with TestClient(webapp.app) as c:
+        hello = _hello(c)
+        assert (hello["version"], hello["state"]) == ("0.1.0", "active")
+        assert _running_from("0.1.0")
+
+
+def test_rollback_to_a_predecessor_without_a_readable_manifest_is_refused(life):
+    _publish(life, HELLO, _variant(life.root, "0.2.0"))
+    with TestClient(webapp.app) as c:
+        _install_active(c, life, "0.1.0")
+        _install(c, life, "0.2.0")
+    (life.bundles / "hello" / "0.1.0" / "plugin.json").write_text("{broken", encoding="utf-8")
+    with TestClient(webapp.app) as c:
+        resp = c.post("/api/plugins/hello/rollback")
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["code"] == "error.plugins.noPreviousVersion"
+        assert _hello(c)["pending_update"] is None
+
+
 def test_rollback_without_predecessor_is_refused(life):
     _publish(life, HELLO)
     with TestClient(webapp.app) as c:
@@ -543,11 +592,64 @@ def test_placing_the_kept_version_forgets_or_replaces_its_herkunft():
     assert addon_lifecycle.record_placed(doc, "a", "0.9.0", FILE) is False
 
 
+def test_placing_a_file_labels_ahead_every_folder_the_core_could_load():
+    """ADD-7: the write-ahead before the move. A file over the running version's
+    folder, over a pending update's, or as the first install takes the file's
+    own Herkunft; the running consent is untouched, so it no longer binds."""
+    doc = _index_running(pending_update={"version": "0.4.0", "permissions": ["llm"], "origin": "index",
+                                         "sha256": "", "agreed": ["llm"]})
+    entry = doc["plugins"]["a"]
+    assert addon_lifecycle.record_placing(doc, "a", "0.4.0", FILE, permissions=["network"]) is True
+    assert entry["pending_update"] == {"version": "0.4.0", "permissions": ["network"], "origin": "file",
+                                       "sha256": FILE["sha256"], "agreed": None}
+    assert addon_lifecycle.pending_needs_confirmation(entry) is True
+    assert entry["source"] == INDEX  # 0.3.0's folder is not touched by this install
+
+    assert addon_lifecycle.record_placing(doc, "a", "0.3.0", FILE) is True
+    assert entry["source"] == FILE and entry["consent"]["origin"] == "index"
+    assert plugins_config.confirmation_needed(entry["consent"], plugins_config.source_provenance(entry), ["llm"])
+    assert addon_lifecycle.record_placing(doc, "a", "0.3.0", FILE) is False  # already recorded
+
+    fresh = plugins_config.empty_document()
+    assert addon_lifecycle.record_placing(fresh, "b", "1.0.0", FILE) is True
+    assert fresh["plugins"]["b"]["source"] == FILE
+
+
+def test_placing_from_the_index_only_forgets_the_predecessor():
+    doc = _index_running(source=dict(FILE), consent={**plugins_config.empty_consent(), "permissions": ["llm"],
+                                                     "origin": "file", "sha256": FILE["sha256"]})
+    before = json.loads(json.dumps(doc))
+    assert addon_lifecycle.record_placing(doc, "a", "0.3.0", INDEX) is False
+    assert doc == before
+    assert addon_lifecycle.record_placing(doc, "a", "0.2.0", INDEX) is True
+    assert addon_lifecycle.previous_provenance(doc["plugins"]["a"]) is None
+
+
+def test_placing_a_file_binds_a_legacy_consent_first():
+    doc = _doc(version="1.0.0", enabled=True, consent={"version": "1.0.0", "permissions": ["llm"]})
+    assert addon_lifecycle.record_placing(doc, "a", "1.0.0", FILE) is True
+    entry = doc["plugins"]["a"]
+    assert entry["consent"]["origin"] == "index" and entry["source"] == FILE
+    assert addon_lifecycle.granted_for(entry, plugins_config.source_provenance(entry)) == set()
+
+
+def test_placing_a_new_version_beside_the_installed_one_labels_nothing_it_does_not_load():
+    doc = _index_running()
+    assert addon_lifecycle.record_placing(doc, "a", "0.9.0", FILE) is False
+    assert doc["plugins"]["a"]["source"] == INDEX
+    # ...unless the installed version's folder is gone, so the core would load the new one.
+    assert addon_lifecycle.record_placing(doc, "a", "0.9.0", FILE, current_on_disk=False) is True
+    assert doc["plugins"]["a"]["source"] == FILE
+
+
 def test_the_predecessors_herkunft_survives_a_save():
     doc = _index_running(previous_source=dict(FILE))
     assert plugins_config.normalize(doc)["plugins"]["a"]["previous_source"] == FILE
     doc["plugins"]["a"]["previous_source"] = {"origin": "bogus"}
-    assert plugins_config.normalize(doc)["plugins"]["a"]["previous_source"] == {"origin": "", "sha256": ""}
+    # An unrecognised Herkunft stays unknown (fails closed): no rollback target.
+    normalized = plugins_config.normalize(doc)["plugins"]["a"]
+    assert normalized["previous_source"] == {"origin": "unknown", "sha256": ""}
+    assert addon_lifecycle.previous_provenance(normalized) is None
 
 
 def test_prune_keeps_exactly_one_predecessor_and_unknown_addons():

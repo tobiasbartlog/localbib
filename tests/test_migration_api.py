@@ -191,21 +191,56 @@ class TestCommit:
         # Unknown source fields stay readable.
         assert json.loads(row["raw_metadata"])["groups"] == "Diss/Kapitel 2"
 
-    def test_the_collection_becomes_a_category_path_assigned_by_import(self, client, db, export):
+    def test_the_collection_becomes_a_collection_not_a_category(self, client, db, export):
+        """#203: an export's collection arrives as a core Collection (the
+        nested path as one flat name) holding the item — no category path."""
+        done = _commit(client, export)
+        assert done["collections_created"] == 1
+        listed = client.get("/api/collections").json()
+        assert [c["name"] for c in listed] == ["Diss / Kapitel 2"]
+        papers = client.get(f"/api/papers?collection_id={listed[0]['id']}").json()
+        assert [p["title"] for p in papers] == ["A Study of Migrated Things"]
+        conn = db._connect()
+        try:
+            assert conn.execute("SELECT COUNT(*) c FROM categories").fetchone()["c"] == 0
+        finally:
+            conn.close()
+
+    def test_a_matched_item_joins_the_collection_too(self, client, db, export):
+        existing = db.add_paper({
+            "file_hash": "h-existing", "filename": "", "original_filename": "x",
+            "title": "A Study of Migrated Things", "authors": "Smith, Jane",
+            "year": 2020, "doi": "10.1234/migrated", "isbn": "", "abstract": "",
+            "journal": "", "publisher": "", "raw_metadata": "", "ocr_text": "",
+        })
+        done = _commit(client, export, attach_pdfs="none")
+        assert done["matched"] == 1
+        cid = client.get("/api/collections").json()[0]["id"]
+        papers = client.get(f"/api/papers?collection_id={cid}").json()
+        assert [p["id"] for p in papers] == [existing]
+
+    def test_categories_migrated_earlier_stay_untouched(self, client, db, export):
+        """Data migrated before #203 (collections as categories) is not
+        reinterpreted: the old category and its assignment survive a new run."""
+        old = db.add_paper({
+            "file_hash": "h-old", "filename": "", "original_filename": "o",
+            "title": "Something Else Entirely", "authors": "Old, A.",
+            "year": 2001, "doi": "", "isbn": "", "abstract": "",
+            "journal": "", "publisher": "", "raw_metadata": "", "ocr_text": "",
+        })
+        cat = db.get_or_create_category_path(["Diss", "Kapitel 2"])
+        db.assign_category(old, cat, confidence=1.0, assigned_by="import")
         _commit(client, export)
         conn = db._connect()
         try:
-            parent = conn.execute(
-                "SELECT id FROM categories WHERE name = 'Diss'").fetchone()
-            child = conn.execute(
-                "SELECT id, parent_id FROM categories WHERE name = 'Kapitel 2'").fetchone()
-            assignment = conn.execute(
-                "SELECT assigned_by FROM paper_categories WHERE category_id = ?",
-                (child["id"],)).fetchone()
+            cats = conn.execute("SELECT COUNT(*) c FROM categories").fetchone()["c"]
+            kept = conn.execute(
+                "SELECT COUNT(*) c FROM paper_categories WHERE paper_id = ?", (old,)
+            ).fetchone()["c"]
         finally:
             conn.close()
-        assert child["parent_id"] == parent["id"]
-        assert assignment["assigned_by"] == "import"
+        assert (cats, kept) == (2, 1)
+        assert [c["name"] for c in client.get("/api/collections").json()] == ["Diss / Kapitel 2"]
 
     def test_options_off_means_nothing_is_carried_over(self, client, db, export):
         _commit(client, export, import_tags=False, import_notes=False,
@@ -222,6 +257,7 @@ class TestCommit:
         assert (row["tags"], row["notes"], row["date_added"]) == ("", "", "")
         assert row["filename"] == ""
         assert categories["c"] == 0
+        assert client.get("/api/collections").json() == []
 
     def test_keep_cite_keys_off_generates_one(self, client, db, export):
         _commit(client, export, keep_cite_keys=False)
@@ -475,7 +511,8 @@ class TestZoteroRdfSource:
         assert data["new"] == 4
         assert data["attachments_found"] == 2
         assert data["attachments_missing"] == 0
-        assert data["collections"] == [["Diss", "Kapitel 2"], ["Diss"]]
+        # Every membership counts now (#203), not just an item's first one.
+        assert data["collections"] == [["Diss", "Kapitel 2"], ["Zu lesen"], ["Diss"]]
         assert data["tags"] == ["machine learning", "ethics", "migration"]
 
     def test_the_export_folder_is_accepted_like_the_rdf_file(self, client, db):
@@ -514,21 +551,55 @@ class TestZoteroRdfSource:
         assert row["notes"].startswith("Read before chapter 2.")
         assert row["date_added"] == "2014-07-01 09:15:00"
 
-    def test_the_collection_tree_is_created_nested(self, client, db):
-        self._commit(client)
+    def test_every_collection_arrives_as_a_collection(self, client, db):
+        """#203: Zotero collections become Collections; a nested one is named
+        by its path, and an item in several collections is in each of them."""
+        done = self._commit(client)
+        assert done["collections_created"] == 3
+        by_name = {c["name"]: c for c in client.get("/api/collections").json()}
+        assert set(by_name) == {"Diss / Kapitel 2", "Zu lesen", "Diss"}
+
+        def keys(name):
+            papers = client.get(
+                f"/api/papers?collection_id={by_name[name]['id']}").json()
+            return sorted(p["cite_key"] for p in papers)
+
+        assert keys("Diss / Kapitel 2") == ["smith2020"]
+        assert keys("Zu lesen") == ["smith2020"]
+        assert keys("Diss") == ["muller2018"]
         conn = db._connect()
         try:
-            parent = conn.execute(
-                "SELECT id FROM categories WHERE name = 'Diss'").fetchone()
-            child = conn.execute(
-                "SELECT id, parent_id FROM categories WHERE name = 'Kapitel 2'").fetchone()
-            assigned = conn.execute(
-                "SELECT assigned_by FROM paper_categories WHERE category_id = ?",
-                (child["id"],)).fetchone()
+            assert conn.execute("SELECT COUNT(*) c FROM categories").fetchone()["c"] == 0
         finally:
             conn.close()
-        assert child["parent_id"] == parent["id"]
-        assert assigned["assigned_by"] == "import"
+
+    def test_undo_deletes_the_collections_of_the_run(self, client, db):
+        """Undo takes the run's Collections back as tombstones — gone from
+        every list, like a Collection the reader deletes."""
+        done = self._commit(client)
+        undo = client.post("/api/migration/undo", json={"run_id": done["run_id"]}).json()
+        assert undo["collections_deleted"] == 3
+        assert client.get("/api/collections?archived=all").json() == []
+        conn = db._connect()
+        try:
+            tombstones = conn.execute(
+                "SELECT COUNT(*) c FROM collections WHERE deleted_at IS NOT NULL"
+            ).fetchone()["c"]
+        finally:
+            conn.close()
+        assert tombstones == 3
+
+    def test_each_run_creates_its_own_collections(self, client, db):
+        """A second run never fills the first run's Collections, so undoing
+        one run cannot touch what the other made."""
+        first = self._commit(client)
+        second = self._commit(client)
+        client.post("/api/migration/undo", json={"run_id": second["run_id"]})
+        listed = client.get("/api/collections").json()
+        assert len(listed) == 3
+        # The first run's Collections still hold its items (smith2020 sits in two).
+        assert first["collections_created"] == 3
+        assert sum(c["item_count"] for c in listed) == 3
 
     def test_undo_takes_the_whole_run_back(self, client, db):
         done = self._commit(client)
@@ -710,6 +781,60 @@ class TestPdfFolderSource:
         assert rows[library["title_paper"]]
         assert rows[library["doi_paper"]] == ""
         assert os.path.exists(os.path.join(Config.ALL_DIR, rows[library["title_paper"]]))
+
+    def test_a_disconnect_mid_commit_still_leaves_an_undoable_run(
+            self, client, db, library):
+        """Regression (LIB-B3): the run used to be recorded after the loop only.
+        A client that disconnects between two files closes the generator; the
+        files attached so far must still be booked, or undo can never detach
+        them."""
+        import asyncio
+
+        import routers.migration as migration_router
+
+        table = self._analyze(client, library)
+        pairs = [migration_router.PdfFolderMatchIn(
+            pdf_path=m["pdf_path"], paper_id=m["paper_id"])
+            for m in table["matches"] if m["pdf_name"] in ("a.pdf", "b.pdf")]
+        assert len(pairs) == 2
+        payload = migration_router.CommitRequest(
+            source="pdf_folder", path=library["folder"], matches=pairs)
+        response = migration_router._commit_pdf_folder(
+            migration_router.ADAPTERS["pdf_folder"], payload)
+
+        async def run():
+            gen = response.body_iterator
+            try:
+                # start frame, item-1 progress, item-1 attach: file 1 is
+                # attached by the third frame, file 2 never started.
+                for _ in range(3):
+                    await gen.__anext__()
+            finally:
+                await gen.aclose()
+
+        asyncio.run(run())
+
+        conn = db._connect()
+        try:
+            attached = [r["id"] for r in conn.execute(
+                "SELECT id FROM papers WHERE filename != ''")]
+            run_row = conn.execute(
+                "SELECT run_id, attached_paper_ids FROM migration_runs "
+                "ORDER BY rowid DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        assert len(attached) == 1
+        booked = json.loads(run_row["attached_paper_ids"])
+        assert [b["paper_id"] if isinstance(b, dict) else b for b in booked] == attached
+
+        client.post("/api/migration/undo", json={"run_id": run_row["run_id"]})
+        conn = db._connect()
+        try:
+            left = conn.execute(
+                "SELECT COUNT(*) c FROM papers WHERE filename != ''").fetchone()["c"]
+        finally:
+            conn.close()
+        assert left == 0
 
     def test_the_attached_pdf_gets_the_real_hash_and_its_text(self, client, db, library):
         import hashlib as _hashlib

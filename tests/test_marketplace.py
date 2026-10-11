@@ -209,6 +209,30 @@ def test_open_falls_back_to_cache_when_the_network_fails_even_if_it_is_fresh(mar
     assert {c["id"] for c in data["addons"]} == {"demo1"}
 
 
+def test_settings_read_serves_a_fresh_cache_without_a_request(market):
+    """``?refresh=false`` (the Settings frame's Add-on list, #207) keeps the
+    once-a-day window: a cache written seconds ago is served unchanged, so
+    opening Settings never waits on GitHub."""
+    _write_stale_cache(market / "marketplace", _index(_addon("demo1")), age_seconds=5)
+
+    with patch("marketplace_client.requests.get", side_effect=AssertionError("must not fetch")) as mock_get:
+        data = TestClient(webapp.app).get("/api/marketplace?refresh=false").json()
+
+    mock_get.assert_not_called()
+    assert data["offline"] is False
+    assert {c["id"] for c in data["addons"]} == {"demo1"}
+
+
+def test_settings_read_still_fetches_without_a_fresh_cache(market):
+    """Without a cache younger than a day, ``?refresh=false`` asks the network
+    like any first open would."""
+    with patch("marketplace_client.requests.get", return_value=_resp(_index(_addon("demo2")))) as mock_get:
+        data = TestClient(webapp.app).get("/api/marketplace?refresh=false").json()
+
+    assert mock_get.called
+    assert {c["id"] for c in data["addons"]} == {"demo2"}
+
+
 def test_refresh_if_stale_still_skips_a_fetch_within_a_day(market):
     """``refresh_if_stale`` (the version-check's piggyback) keeps the
     once-a-day gate -- unlike opening the Marketplace, it must not hit the

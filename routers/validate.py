@@ -43,6 +43,7 @@ import metadata_validation
 import validation_policy
 from context import get_conn
 from fastapi import APIRouter, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from literature_manager import (
     Config,
     Database,
@@ -386,7 +387,7 @@ async def generate_abstract(paper_id: int):
                     logging.info(f"📄 Abstract generiert (LLM) fuer Paper {paper_id}")
 
     if not abstract:
-        return {"status": "error", "message": "Kein Abstract gefunden oder generiert. Pruefe ob DOI/PDF vorhanden und LLM konfiguriert ist."}
+        return {"status": "error", "message": "error.abstract_not_found"}
 
     # In DB speichern
     conn = _get_conn()
@@ -427,7 +428,7 @@ async def ocr_paper(paper_id: int, pages: int = 10):
     if not ocr_text.strip():
         return {
             "status": "no_text",
-            "message": "OCR konnte keinen Text extrahieren. Tesseract installiert?",
+            "message": "error.ocr_no_text",
             "chars": 0,
         }
 
@@ -521,7 +522,7 @@ async def ocr_paper(paper_id: int, pages: int = 10):
                         finally:
                             conn.close()
                         db = _get_db()
-                        _rebuild_all_symlinks(db)
+                        await run_in_threadpool(_rebuild_all_symlinks, db)
                     except OSError as e:
                         logging.warning(f"Rename failed: {e}")
 

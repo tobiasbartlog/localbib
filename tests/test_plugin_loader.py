@@ -430,6 +430,45 @@ def test_hello_settings_land_in_its_namespace_of_plugins_json(addons):
         assert stored["api_key"] == "hk-0123456789ab" and stored["shout"] is False
 
 
+SETTER_CODE = '''
+from plugin_api import PluginManifest
+
+
+class Setter:
+    manifest = PluginManifest(id="setter", name="Setter", version="0.1.0")
+
+    async def activate(self, api):
+        count = int(api.settings.get("activations") or "0")
+        api.settings.set("activations", str(count + 1))
+
+    async def deactivate(self):
+        pass
+
+
+plugin = Setter()
+'''
+
+
+def test_settings_set_during_activate_survives_the_sync(addons):
+    """ADD-3: the loader recorded the outcome of a load by saving the snapshot
+    it took before the Add-on ran, which dropped whatever ``SettingsApi.set``
+    wrote from ``activate()``. The loader now patches only its own fields."""
+    settings = [{"key": "activations", "type": "string", "label": "setter.settings.activations"}]
+    _make_addon(addons.bundles / "setter" / "0.1.0", "setter", SETTER_CODE, settings=settings)
+    _write_doc(addons, {"setter": _on([], settings={"kept": "yes"})})
+
+    with TestClient(webapp.app) as c:  # the start-up sync
+        assert _state(c, "setter")["state"] == "active"
+        stored = _read_doc(addons)["plugins"]["setter"]
+        assert stored["settings"] == {"kept": "yes", "activations": "1"}
+        assert stored["error"] is None and _read_doc(addons)["boot_marker"] == ""
+
+        c.post("/api/plugins/setter/disable")
+        assert c.post("/api/plugins/setter/enable").json()["state"] == "active"  # a runtime sync
+        assert c.get("/api/plugins/setter/settings").json()["values"] == {"activations": "2"}
+    assert _read_doc(addons)["plugins"]["setter"]["settings"] == {"kept": "yes", "activations": "2"}
+
+
 def test_unknown_addon_is_a_404_code(addons):
     with TestClient(webapp.app) as c:
         resp = c.post("/api/plugins/nothing_here/enable")
@@ -450,3 +489,13 @@ def test_version_check_reports_contract_and_python_tag(client, monkeypatch):
     assert python_tag().startswith(f"cp{sys.version_info[0]}{sys.version_info[1]}-")
 
 
+
+
+def test_reserved_permissions_hand_over_nothing():
+    """ADD-2: a Bundle declaring files/storage still gets None for both."""
+    from plugin_api import PluginManifest
+
+    manifest = PluginManifest(id="resv", name="Reserved", version="1.0.0",
+                              permissions=["library.read", "files", "storage"])
+    services = plugin_loader._services_for("resv", manifest)
+    assert services.get("files") is None and services.get("storage") is None

@@ -25,6 +25,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from context import get_conn
@@ -124,7 +125,7 @@ async def get_category_tree():
 async def create_category(data: CategoryCreate):
     db = _get_db()
     cat_id = db.add_category(data.name, data.parent_id, data.description, data.keywords)
-    _rebuild_category_folders(db)
+    await run_in_threadpool(_rebuild_category_folders, db)
     return {"id": cat_id, "status": "ok"}
 
 
@@ -182,7 +183,7 @@ async def update_category(category_id: int, data: CategoryUpdate):
         conn.close()
 
     db = _get_db()
-    _rebuild_category_folders(db)
+    await run_in_threadpool(_rebuild_category_folders, db)
     return {"status": "ok"}
 
 
@@ -207,8 +208,8 @@ async def delete_category(category_id: int):
         conn.close()
 
     db = _get_db()
-    _rebuild_category_folders(db)
-    _rebuild_all_symlinks(db)
+    await run_in_threadpool(_rebuild_category_folders, db)
+    await run_in_threadpool(_rebuild_all_symlinks, db)
     return {"status": "ok"}
 
 

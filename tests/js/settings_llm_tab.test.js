@@ -1,7 +1,8 @@
-// Settings -> LLM tab: roles on top (connection + model per role), the
-// connection cards below, one Save for the whole tab (PUT /api/llm/config).
-// Keys never come from the server (has_key/key_hint only); a card whose key
-// was not touched sends api_key: null ("unchanged"). Loading a saved
+// Settings -> AI models: roles as cards on top (connection + model + status
+// label per role), the connections as a list below, one Save for the whole
+// section (PUT /api/llm/config) in the bar that appears with the first change.
+// Keys never come from the server (has_key/key_hint only); a connection whose
+// key was not touched sends api_key: null ("unchanged"). Loading a saved
 // connection's models goes by id, so the key does not travel through the SPA.
 import { describe, it, expect, vi } from 'vitest';
 import { bootSettings, findByText, flush, typeInto } from './helpers.js';
@@ -19,7 +20,9 @@ const CONFIG = {
     status: { reasoning: true, fast: true, embedding: false, connections: 2 },
 };
 
-describe('settings: LLM tab', () => {
+const status = (tier) => document.querySelector(`[data-testid="llm-role-status-${tier}"]`).getAttribute('data-status');
+
+describe('settings: AI models', () => {
     it('renders roles + connections, loads models by id and saves the document', async () => {
         const calls = await bootSettings([
             { method: 'GET', url: '/api/llm/config', reply: CONFIG },
@@ -30,12 +33,12 @@ describe('settings: LLM tab', () => {
                     : { models: ['gpt-4o', 'gpt-4o-mini'], error: null }),
             },
             { method: 'PUT', url: '/api/llm/config', reply: { ...CONFIG, status: { ...CONFIG.status, embedding: true } } },
-        ], 'llm-tab');
+        ], 'ai-models');
 
         const panel = document.querySelector('[data-testid="llm-panel"]');
         expect(panel).toBeTruthy();
 
-        // Three roles, each with the connection dropdown listing both connections.
+        // Three role cards, each with the connection dropdown listing both connections.
         for (const tier of ['reasoning', 'fast', 'embedding']) {
             const row = panel.querySelector(`[data-testid="llm-role-${tier}"]`);
             expect(row).toBeTruthy();
@@ -43,20 +46,30 @@ describe('settings: LLM tab', () => {
             expect(options).toEqual(['', 'oai', 'local']);
         }
         // Readiness comes from the server status, not from a client guess.
-        expect(findByText('[data-testid="llm-role-reasoning"] span', 'ready')).toBeTruthy();
-        expect(findByText('[data-testid="llm-role-embedding"] span', 'not ready')).toBeTruthy();
+        expect(status('reasoning')).toBe('ready');
+        expect(status('embedding')).toBe('off');
+        expect(findByText('[data-testid="llm-role-reasoning"] span', 'Ready')).toBeTruthy();
+        expect(findByText('[data-testid="llm-role-embedding"] span', 'Off')).toBeTruthy();
 
-        // Connection cards: the key is masked, the keyless one says so.
+        // The connection list: name, bound roles, address and key hint.
         const oai = panel.querySelector('[data-testid="llm-connection-oai"]');
+        expect(oai.querySelector('[data-testid="llm-conn-summary"]').textContent).toContain('api.openai.com');
+        expect(oai.querySelector('[data-testid="llm-conn-summary"]').textContent).toContain('sk-…1234');
+        expect(findByText('[data-testid="llm-connection-oai"] span', 'Reasoning')).toBeTruthy();
+        const local = panel.querySelector('[data-testid="llm-connection-local"]');
+        expect(local.querySelector('[data-testid="llm-conn-summary"]').textContent)
+            .toBe('http://localhost:11434/v1 · no key');
+        // The form opens with "Edit": the key is masked, the keyless one says so.
+        expect(oai.querySelector('[data-testid="llm-conn-api-key"]')).toBeNull();
+        oai.querySelector('[data-testid="llm-conn-edit"]').click();
+        local.querySelector('[data-testid="llm-conn-edit"]').click();
+        await flush();
         const keyInput = oai.querySelector('[data-testid="llm-conn-api-key"]');
         expect(keyInput.value).toBe('');
         expect(keyInput.getAttribute('placeholder')).toContain('sk-…1234');
-        const local = panel.querySelector('[data-testid="llm-connection-local"]');
         expect(local.querySelector('[data-testid="llm-conn-api-key"]').getAttribute('placeholder')).toContain('no key');
-
-        // A bound connection cannot be removed; the hint names the roles.
+        // A bound connection cannot be removed.
         expect(oai.querySelector('[data-testid="llm-conn-remove"]').disabled).toBe(true);
-        expect(findByText('[data-testid="llm-connection-oai"] span', 'Reasoning')).toBeTruthy();
 
         // Bind the embedding role to Ollama: the model list is fetched BY ID
         // (no key in the request) and the model dropdown lists embed models first.
@@ -76,8 +89,9 @@ describe('settings: LLM tab', () => {
         modelSelect.value = 'nomic-embed-text';
         modelSelect.dispatchEvent(new Event('change'));
         await flush();
+        expect(status('embedding')).toBe('changed');
 
-        // Save the whole tab: untouched keys go as null, the roles as edited.
+        // Save the whole section: untouched keys go as null, the roles as edited.
         panel.querySelector('[data-testid="llm-save"]').click();
         await flush(); await flush();
         const put = calls.find((c) => c.method === 'PUT' && c.url === '/api/llm/config');
@@ -88,12 +102,12 @@ describe('settings: LLM tab', () => {
         ]);
         expect(put.body.roles.embedding).toEqual({ connection_id: 'local', model: 'nomic-embed-text' });
         expect(put.body.roles.reasoning).toEqual({ connection_id: 'oai', model: 'gpt-4o' });
-        // The response's status drives the badge.
+        // The response's status drives the label.
         await flush();
-        expect(findByText('[data-testid="llm-role-embedding"] span', 'ready')).toBeTruthy();
+        expect(status('embedding')).toBe('ready');
 
-        // A new connection starts as a draft: its models are probed with the
-        // typed key, and it can be removed while unbound.
+        // A new connection starts as a draft with its form open: its models
+        // are probed with the typed key, and it can be removed while unbound.
         panel.querySelector('[data-testid="llm-add-connection"]').click();
         await flush();
         const cards = panel.querySelectorAll('[data-testid^="llm-connection-"]');
@@ -106,5 +120,6 @@ describe('settings: LLM tab', () => {
         expect(draftProbe.body).toMatchObject({ provider: 'openai', api_key: 'sk-new' });
         expect(draftProbe.body.connection_id).toBeUndefined();
         expect(draft.querySelector('[data-testid="llm-conn-remove"]').disabled).toBe(false);
+        expect(draft.querySelector('[data-testid="llm-conn-summary"]').textContent).toContain('new key');
     });
 });

@@ -6,7 +6,7 @@
 // translation, and neither may drift from the other. A key added on one side
 // and forgotten on the other fails here, not in front of a buyer.
 import { describe, expect, it } from 'vitest';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import '../../static/locales/core.en.js';
@@ -68,6 +68,25 @@ describe('i18n catalogs', () => {
         }
         expect(en['license.legacyNote']).toMatch(/free/i);
         expect(de['license.legacyNote']).toMatch(/kostenlos/i);
+    });
+
+    // The tray icon of the Windows .exe is drawn by Python, which reads its
+    // `tray.*` texts straight from these files, line by line (ADR-0018
+    // addendum, #214) - so they are covered by the checks above, and each
+    // must sit on one `"key": "value",` line for that reader to see it.
+    it('carry the tray texts of the .exe, one readable line each', () => {
+        const tray = Object.keys(en).filter((k) => k.startsWith('tray.'));
+        expect(tray.length).toBeGreaterThan(0);
+        for (const name of ['core.en.js', 'core.de.js']) {
+            const text = readFileSync(resolve(__dirname, '../../static/locales', name), 'utf8');
+            const lines = new Set(
+                text.split('\n')
+                    .map((l) => l.match(/^\s*"(tray\.[^"]+)"\s*:\s*"(?:[^"\\]|\\.)*",?\s*$/))
+                    .filter(Boolean)
+                    .map((m) => m[1]),
+            );
+            expect(tray.filter((k) => !lines.has(k))).toEqual([]);
+        }
     });
 
     // Catalogs are split per namespace: an Add-on Bundle brings its own locale

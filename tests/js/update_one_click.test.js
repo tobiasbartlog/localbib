@@ -26,7 +26,7 @@ describe('Update-Hinweis mit Ein-Klick-Weg', () => {
             {
                 method: 'POST',
                 url: '/api/update/install',
-                reply: { status: 'installing', version: '99.0.0', message: 'Update wird installiert — LocalBib startet gleich neu.' },
+                reply: { status: 'installing', version: '99.0.0', message: 'update.installing' },
             },
         ]);
 
@@ -47,9 +47,9 @@ describe('Update-Hinweis mit Ein-Klick-Weg', () => {
         expect(calls.some((c) => c.method === 'POST' && c.url === '/api/update/install')).toBe(true);
         const message = await vi.waitFor(() => {
             const el = document.querySelector('[data-testid="update-message"]');
-            if (!el || !el.textContent.includes('installiert')) throw new Error('Keine Rueckmeldung');
+            if (!el || !el.textContent.includes('Installing')) throw new Error('Keine Rueckmeldung');
             return el;
         });
-        expect(message.textContent).toContain('LocalBib startet gleich neu');
+        expect(message.textContent).toContain('Installing update — LocalBib will restart shortly.');
     });
 });

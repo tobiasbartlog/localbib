@@ -148,6 +148,92 @@ def test_installer_installs_the_64bit_bundle_in_64bit_mode() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Start with Windows (#214, ADR-0023) - one HKCU entry for app and installer
+# ---------------------------------------------------------------------------
+
+def _section(text: str, name: str) -> str:
+    """The body of an Inno ``[name]`` section (its header starts a line)."""
+    header = re.search(rf"^\[{name}\]\s*$", text, flags=re.M)
+    assert header, f"no [{name}] section"
+    rest = text[header.end():]
+    match = re.search(r"^\[\w+\]\s*$", rest, flags=re.M)
+    return rest[: match.start()] if match else rest
+
+
+def _pascal_procedure(code: str, name: str) -> str:
+    start = code.index(f"procedure {name}(")
+    return code[start: code.index("\nend;", start)]
+
+
+def test_installer_offers_start_with_windows_off_by_default() -> None:
+    tasks = [line for line in _section(_read(ISS), "Tasks").splitlines()
+             if line.startswith('Name: "autostart"')]
+    assert len(tasks) == 1
+    assert "Flags: unchecked" in tasks[0]
+    assert "german.AutostartTask=Mit Windows starten" in _read(ISS)
+
+
+def test_installer_and_app_use_the_same_registry_entry() -> None:
+    """Settings, tray menu and installer show one state only if all three
+    read and write the very same value (autostart.py is the app's side)."""
+    import autostart
+
+    iss = _read(ISS)
+    assert f'#define AutostartRunKey "{autostart.RUN_KEY}"' in iss
+    assert f'#define AutostartApprovedKey "{autostart.APPROVED_KEY}"' in iss
+    assert f'#define AutostartValue "{autostart.VALUE_NAME}"' in iss
+    assert f'#define AutostartArg "{autostart.AUTOSTART_ARG}"' in iss
+
+
+def test_the_task_writes_the_run_value_with_the_autostart_argument() -> None:
+    code = _section(_read(ISS), "Code")
+    post_install = _pascal_procedure(code, "CurStepChanged")
+    assert "WizardIsTaskSelected('autostart')" in post_install
+    assert "RegWriteStringValue(HKCU, '{#AutostartRunKey}', '{#AutostartValue}'" in post_install
+    assert "ExpandConstant('{app}\\{#MyAppExeName}') + '\" {#AutostartArg}'" in post_install
+    # Switching on lifts a Task Manager "disabled", exactly like the app.
+    assert "RegDeleteValue(HKCU, '{#AutostartApprovedKey}', '{#AutostartValue}')" in post_install
+
+
+def test_a_silent_update_leaves_the_users_choice_alone() -> None:
+    """The one-click update runs Setup silently: nobody saw the task, so the
+    value the user set in the app must survive it."""
+    post_install = _pascal_procedure(_section(_read(ISS), "Code"), "CurStepChanged")
+    assert "not WizardSilent()" in post_install
+
+
+def test_the_task_shows_the_real_state_on_a_reinstall() -> None:
+    code = _section(_read(ISS), "Code")
+    assert "RegValueExists(HKCU, '{#AutostartRunKey}', '{#AutostartValue}')" in code
+    assert "WizardSelectTasks('autostart')" in code
+    assert "WizardSelectTasks('!autostart')" in code
+
+
+def test_uninstall_removes_the_autostart_value() -> None:
+    """However the value got there (task, Settings, tray menu), nothing stays."""
+    uninstall = _pascal_procedure(_section(_read(ISS), "Code"), "CurUninstallStepChanged")
+    assert "usUninstall" in uninstall
+    assert "RegDeleteValue(HKCU, '{#AutostartRunKey}', '{#AutostartValue}')" in uninstall
+    assert "RegDeleteValue(HKCU, '{#AutostartApprovedKey}', '{#AutostartValue}')" in uninstall
+
+
+@pytest.mark.parametrize("package", ["pystray", "Pillow"])
+def test_the_tray_dependencies_are_core_requirements(package: str) -> None:
+    """The tray icon is core, not an Add-on: its packages belong in the file
+    the public export ships, never in the plugin file."""
+    def names(path: Path) -> set[str]:
+        out = set()
+        for line in _read(path).splitlines():
+            requirement = line.split("#", 1)[0].strip()
+            if requirement:
+                out.add(re.split(r"[<>=!~;\[ ]", requirement, maxsplit=1)[0].lower())
+        return out
+
+    assert package.lower() in names(REPO_ROOT / "requirements.txt")
+    assert package.lower() not in names(REPO_ROOT / "requirements-plugins.txt")
+
+
+# ---------------------------------------------------------------------------
 # Release workflow — regression guards for the pieces #146 removed
 # ---------------------------------------------------------------------------
 

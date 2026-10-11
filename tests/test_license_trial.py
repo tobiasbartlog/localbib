@@ -14,7 +14,7 @@ the expensive failure mode:
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from pathlib import Path
 
@@ -57,7 +57,8 @@ def frozen(monkeypatch):
 
 def _anchor(days_ago: float) -> None:
     """Stamp the first run `days_ago` days in the past."""
-    stamp = datetime.utcnow() - timedelta(days=days_ago)
+    # Stored format is a naive UTC ISO string (see services/license_state._parse).
+    stamp = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days_ago)
     webapp.db.set_app_setting("license_first_run_at", stamp.isoformat())
 
 

@@ -23,6 +23,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Iterable, Optional
 
 import citation_graph_builder as cgb
 from citation_graph_builder import Graph
@@ -152,6 +153,42 @@ def _load_supporting_data(conn: sqlite3.Connection) -> dict:
         "pdf_ref_counts": pdf_ref_counts,
         "paper_categories_map": paper_categories_map,
     }
+
+
+def _restrict_to_seeds(doi_papers: list[dict], aux: dict, seeds: set[int]) -> list[dict]:
+    """Scope a build to ``seeds`` (a Collection's Items, #202).
+
+    Only seeds become own nodes. A PDF reference from a seed to a Library Item
+    *outside* the seeds turns into an unmatched reference carrying that Item's
+    metadata, so it shows up as an external neighbour — exactly what can be
+    taken into the Collection with one click. Mutates ``aux`` in place and
+    returns the seed DOI papers."""
+    full_map = aux["all_papers_map"]
+    aux["all_papers_map"] = {pid: p for pid, p in full_map.items() if pid in seeds}
+    matched, unmatched = [], [r for r in aux["pdf_refs_unmatched"]
+                              if r["source_paper_id"] in seeds]
+    for r in aux["pdf_refs_matched"]:
+        if r["source_paper_id"] not in seeds:
+            continue
+        if r["matched_paper_id"] in seeds:
+            matched.append(r)
+            continue
+        target = full_map.get(r["matched_paper_id"]) or {}
+        title = target.get("title") or r.get("title") or ""
+        if title:
+            unmatched.append({
+                "source_paper_id": r["source_paper_id"],
+                "title": title,
+                "authors": target.get("authors") or r.get("authors") or "",
+                "year": target.get("year") or r.get("year"),
+                "journal": r.get("journal") or "",
+                "doi": target.get("doi") or r.get("doi") or "",
+                "ref_id": None,
+            })
+    aux["pdf_refs_matched"] = matched
+    aux["pdf_refs_unmatched"] = unmatched
+    aux["pdf_ref_counts"] = {pid: n for pid, n in aux["pdf_ref_counts"].items() if pid in seeds}
+    return [p for p in doi_papers if p["id"] in seeds]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,14 +335,22 @@ def build_network(
     conn: sqlite3.Connection,
     oa_client: OpenAlexClient,
     depth: int,
+    seed_ids: Optional[Iterable[int]] = None,
 ) -> NetworkResult:
     """Build the citation network for all DOI-bearing papers in the library.
+
+    ``seed_ids`` (a Collection's Items, #202) limits the own nodes to those
+    Items; ``None`` keeps the library-wide build unchanged.
 
     Returns a ``NetworkResult`` with the wire-format payload and a list of
     DB updates the endpoint should persist (DOI back-writes + OpenAlex
     metadata refreshes).
     """
     doi_papers = _load_doi_papers(conn)
+    # Loaded before the OpenAlex calls so a scoped build can narrow both.
+    aux = _load_supporting_data(conn)
+    if seed_ids is not None:
+        doi_papers = _restrict_to_seeds(doi_papers, aux, set(seed_ids))
     my_dois = {p["_doi"] for p in doi_papers}
 
     # --- Step 1: own-paper OpenAlex lookup (DOI batch + title fallback) ----
@@ -321,8 +366,7 @@ def build_network(
                 cited_by_count=oa.get("cited_by_count", 0),
             ))
 
-    # --- Step 3: load supporting data --------------------------------------
-    aux = _load_supporting_data(conn)
+    # --- Step 3: supporting data (loaded above) ----------------------------
     all_papers_map: dict[int, dict] = aux["all_papers_map"]
     pdf_refs_matched: list[dict] = aux["pdf_refs_matched"]
     pdf_refs_unmatched: list[dict] = aux["pdf_refs_unmatched"]

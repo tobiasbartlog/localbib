@@ -73,6 +73,18 @@ def extract_arxiv_id_from_text(text: str) -> Optional[str]:
     return None
 
 
+_ARXIV_VERSION = re.compile(r"v\d+$", re.IGNORECASE)
+
+
+def canonical_arxiv_doi(doi: str) -> Optional[str]:
+    """Die versionslose Form einer arXiv-DOI mit Versionsendung
+    (``10.48550/arXiv.1803.10122v4`` → ``…10122``), sonst ``None``."""
+    doi = (doi or "").strip()
+    if not doi.lower().startswith("10.48550/arxiv.") or not _ARXIV_VERSION.search(doi):
+        return None
+    return _ARXIV_VERSION.sub("", doi)
+
+
 def resolve_doi_from_arxiv(arxiv_id: str) -> Optional[str]:
     """Loest eine arXiv-ID zu einer DOI auf.
 
@@ -80,8 +92,9 @@ def resolve_doi_from_arxiv(arxiv_id: str) -> Optional[str]:
     OpenAlex und den meisten Datenbanken indexiert wird. Faellt zurueck auf
     die in der arXiv API hinterlegte DOI (oft Zenodo), falls vorhanden.
     """
-    # Strategie 1: arXiv DataCite DOI (von OpenAlex indexiert)
-    arxiv_doi = f"10.48550/arXiv.{arxiv_id}"
+    # Strategie 1: arXiv DataCite DOI (von OpenAlex indexiert). Die DOI
+    # benennt das Werk, nicht eine Fassung: ``v2`` gehoert nicht hinein.
+    arxiv_doi = f"10.48550/arXiv.{_ARXIV_VERSION.sub('', arxiv_id)}"
     logging.info(f"   arXiv {arxiv_id} → DataCite DOI: {arxiv_doi}")
     return arxiv_doi
 

@@ -85,9 +85,12 @@ describe('Dark Mode: Tailwind-Palette', () => {
     });
 
     it('zeichnet das Wissensnetz aus Tokens statt aus festen Hexwerten', () => {
-        // Der Trennring der Fremdknoten ist die Seitenfarbe; fest verdrahtet
-        // war er ein weisser Leuchtring im Dark Mode.
-        expect(APP).toContain("lbToken('--lb-bg', '#fafaf7')");
+        // Der Trennring der Fremdknoten ist die Blattfarbe; fest verdrahtet
+        // war er ein weisser Leuchtring im Dark Mode. Seit #242 traegt das
+        // Netz Token-Verweise (`var(--lb-…)`) als Inline-Stil, also folgt es
+        // dem Theme von selbst.
+        expect(APP).toContain("stroke = 'var(--lb-bg-elev)'");
+        expect(APP).toContain("'color-mix(in oklab, var(--lb-ink-2) '");
         const literals = [...APP.matchAll(/['"]#[0-9a-fA-F]{3,8}['"]/g)]
             .filter((m) => {
                 const line = APP.slice(APP.lastIndexOf('\n', m.index) + 1, APP.indexOf('\n', m.index));

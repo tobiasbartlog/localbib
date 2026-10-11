@@ -116,15 +116,17 @@ def installed_in_index(entry: Mapping[str, Any], installed_version: str) -> bool
 
 
 def permission_rows(keys: Iterable[Any]) -> list[dict]:
-    """Berechtigungen as ``{key, enforced}`` rows (durchgesetzt/erklaert), in
-    the order given; unknown keys are dropped."""
+    """Berechtigungen as ``{key, enforced, reserved}`` rows (durchgesetzt/
+    erklaert; ``reserved``: declared but grants nothing yet), in the order
+    given; unknown keys are dropped."""
     rows = []
     for raw in keys or []:
         try:
             perm = Permission(raw)
         except ValueError:
             continue
-        rows.append({"key": perm.value, "enforced": PERMISSIONS[perm].enforced})
+        info = PERMISSIONS[perm]
+        rows.append({"key": perm.value, "enforced": info.enforced, "reserved": info.reserved})
     return rows
 
 

@@ -34,6 +34,8 @@ from pydantic import BaseModel
 import bibtex_import as bibtex_import_core  # noqa: E402
 
 import ca_trust
+import collection_membership as membership
+import library_events as events
 import paper_ingest
 from cite_key_generator import dedupe as _dedupe_cite_key
 from context import get_conn
@@ -50,6 +52,7 @@ from literature_manager import (
 )
 from openalex_client import OpenAlexClient
 from paper_matcher import match as match_ref
+from services import library_collections as svc_collections
 
 router = APIRouter()
 
@@ -91,6 +94,10 @@ class BibtexCommitEntry(BaseModel):
 class BibtexCommitRequest(BaseModel):
     entries: List[BibtexCommitEntry]
     source_name: str = ""  # concrete origin (the uploaded .bib filename), stored as import_source
+    # Target Collection (#203): an existing one, or a new one by name. Both
+    # unset = no Collection, the commit behaves exactly as before.
+    collection_id: Optional[int] = None
+    new_collection_name: Optional[str] = None
 
 
 class OaCheckItem(BaseModel):
@@ -343,7 +350,19 @@ async def bibtex_import_preview(
 async def bibtex_import_commit(payload: BibtexCommitRequest):
     """Legt die ausgewaehlten Eintraege als Papers ohne PDF an (Muster:
     RIS-Import). Gematchte Eintraege werden nicht dupliziert; zurueck kommt
-    pro Eintrag der Cite Key fuer die refs der Veroeffentlichung."""
+    pro Eintrag der Cite Key fuer die refs der Veroeffentlichung.
+
+    Mit Zielsammlung (#203) landen alle Eintraege dieses Imports — neu
+    angelegte wie vorhandene — in der Sammlung; siehe ``_assign_to_target``."""
+    # Validate the target before the first write: a bad id or an empty name
+    # must not leave half an import behind.
+    conn = _get_conn()
+    try:
+        target = membership.check_target(
+            conn, payload.collection_id, payload.new_collection_name)
+    finally:
+        conn.close()
+
     results = []
     for entry in payload.entries:
         try:
@@ -434,6 +453,43 @@ async def bibtex_import_commit(payload: BibtexCommitRequest):
         "errors": sum(1 for r in results if r["status"] == "error"),
         "enriched": enriched,
         "results": results,
+        "collection": _assign_to_target(target, results),
+    }
+
+
+def _assign_to_target(target, results: list) -> dict | None:
+    """Put every Item of this import into the target Collection and report
+    the re-import diff (PRD #200, user stories 20-24).
+
+    ``not_cited`` lists members the Collection already had that this import
+    does not carry — the manuscript no longer cites them. It is a suggestion
+    only: nothing is removed here; the SPA removes what the user ticks via
+    ``DELETE /api/collections/{id}/items``."""
+    if target is None:
+        return None
+    imported = [r["paper_id"] for r in results if r.get("paper_id")]
+    conn = _get_conn()
+    try:
+        before = svc_collections.member_ids(conn, target.id) if target.id else []
+        membership.open_target(conn, target)
+        added = membership.add_items(conn, target.id, imported) if imported else {
+            "added_ids": [], "already_ids": []}
+        conn.commit()
+        gone = svc_collections.membership_diff(before, imported)["gone"]
+        not_cited = membership.item_briefs(conn, gone)
+    finally:
+        conn.close()
+    if target.created:
+        events.collection_changed(events.CREATED, target.id)
+    if added["added_ids"]:
+        events.collection_changed(events.MEMBERS_CHANGED, target.id)
+    return {
+        "id": target.id,
+        "name": target.name,
+        "created": target.created,
+        "added_ids": added["added_ids"],
+        "already_ids": added["already_ids"],
+        "not_cited": not_cited,
     }
 
 
@@ -613,7 +669,7 @@ async def fetch_oa_pdf(paper_id: int, payload: FetchOaPdfRequest):
         resp = httpx.get(
             url, timeout=60, follow_redirects=True,
             headers={"User-Agent": Config.user_agent("LocalBib")},
-            verify=ca_trust.ca_bundle() or True,  # httpx ignores REQUESTS_CA_BUNDLE
+            verify=ca_trust.httpx_verify(),  # httpx ignores REQUESTS_CA_BUNDLE
         )
         resp.raise_for_status()
         data = resp.content

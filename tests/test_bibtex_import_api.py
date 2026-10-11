@@ -176,8 +176,8 @@ def test_commit_enriches_created_paper_with_abstract(client, db):
     from unittest.mock import patch
 
     with patch.object(
-        webapp.metadata_validation, "fetch_crossref_abstract",
-        return_value="Ein Abstract aus CrossRef.",
+        paper_ingest, "fetch_crossref_metadata",
+        return_value={"abstract": "Ein Abstract aus CrossRef."},
     ), patch.object(paper_ingest, "OpenAlexClient") as OA:
         OA.return_value.fetch_works_by_doi.return_value = []
         resp = client.post("/api/import/bibtex/commit", json={"entries": [{

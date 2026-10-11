@@ -33,15 +33,19 @@ Functions:
                                 ``reindex_chunks`` run. Same degrade-never-raise
                                 contract; idempotent (skips chunks already
                                 embedded with the configured model).
-  * ``reindex_papers``       — full paper-level run for the Maintenance
-                                endpoint; resumable/idempotent (skips paper_ids
-                                already indexed with the currently configured
-                                model).
+  * ``reindex_papers``       — full paper-level run; resumable/idempotent
+                                (skips paper_ids already indexed with the
+                                currently configured model).
   * ``reindex_chunks``       — full chunk-level run (Phase 3, #102); same
                                 resumable/idempotent contract, one row per
                                 ``paper_chunks`` entry.
+  * ``plan_paper_index`` / ``embed_paper_batch`` and ``plan_chunk_index`` /
+    ``embed_chunk_batch``    — the same runs cut into packages, so the
+                                recompute stream (#213) reports progress and
+                                can stop between two packages.
+  * ``purge_stale_vectors``  — drops vectors of any other model.
   * ``embedding_status``     — n indexed / m total, model, dimension — for
-                                both papers and chunks.
+                                both papers and chunks — and ``stale`` (#213).
   * ``semantic_paper_ids``   — query -> cosine-ranked ``paper_id``s, or
                                 ``None`` when semantic ranking cannot run at
                                 all (no model / no index / embed HTTP
@@ -183,8 +187,62 @@ def _embed_pending_chunks(conn, pending: list, model: str) -> tuple:
     return indexed, errors, dim
 
 
+def _stored_dim(conn, table: str, model: str) -> int:
+    """Dimension eines gespeicherten Vektors des Modells (0 = keiner)."""
+    row = conn.execute(f"SELECT dim FROM {table} WHERE model = ? LIMIT 1", (model,)).fetchone()
+    return row["dim"] if row else 0
+
+
+def plan_chunk_index(model: str) -> dict:
+    """Was ein Chunk-Lauf mit ``model`` embedden wuerde, ohne etwas zu schicken.
+
+    Returns ``{"pending": [(chunk_id, text)], "skipped": int, "total": int}`` —
+    Chunks, deren Vektor schon von ``model`` stammt, zaehlen als ``skipped``.
+    Grundlage von ``reindex_chunks`` und des gestreamten Neuberechnens (#213),
+    das die Liste in Paketen abarbeitet und dazwischen Fortschritt meldet.
+    """
+    conn = _get_conn()
+    try:
+        chunks = [
+            dict(c)
+            for c in conn.execute(
+                """SELECT pc.id AS chunk_id, pc.chunk_text AS chunk_text,
+                          p.title AS title, p.year AS year, p.journal AS journal
+                   FROM paper_chunks pc
+                   JOIN papers p ON p.id = pc.paper_id
+                   ORDER BY pc.id"""
+            ).fetchall()
+        ]
+        already_indexed = {
+            r["chunk_id"]: r["model"]
+            for r in conn.execute("SELECT chunk_id, model FROM chunk_embeddings").fetchall()
+        }
+    finally:
+        conn.close()
+
+    pending: list[tuple[int, str]] = []
+    skipped = 0
+    for c in chunks:
+        if already_indexed.get(c["chunk_id"]) == model:
+            skipped += 1
+            continue
+        pending.append((c["chunk_id"], _chunk_document_text(c, c["chunk_text"])))
+    return {"pending": pending, "skipped": skipped, "total": len(chunks)}
+
+
+def embed_chunk_batch(batch: list, model: str) -> tuple:
+    """Embedded ein Paket ``(chunk_id, text)`` aus ``plan_chunk_index`` und
+    speichert es. Returns ``(indexed, errors, dim)``; wirft nie fuer einen
+    fehlgeschlagenen Embedding-Aufruf."""
+    conn = _get_conn()
+    try:
+        return _embed_pending_chunks(conn, batch, model)
+    finally:
+        conn.close()
+
+
 def reindex_chunks() -> dict:
-    """Vollindex-Lauf ueber alle Chunks (Phase 3, #102; Maintenance-Endpunkt).
+    """Vollindex-Lauf ueber alle Chunks (Phase 3, #102).
 
     Wiederaufnehmbar/idempotent wie ``reindex_papers``: Chunks, deren
     gespeicherter Vektor bereits vom aktuell konfigurierten Modell stammt,
@@ -204,52 +262,24 @@ def reindex_chunks() -> dict:
     if not model:
         return {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
 
-    conn = _get_conn()
-    try:
-        chunks = [
-            dict(c)
-            for c in conn.execute(
-                """SELECT pc.id AS chunk_id, pc.chunk_text AS chunk_text,
-                          p.title AS title, p.year AS year, p.journal AS journal
-                   FROM paper_chunks pc
-                   JOIN papers p ON p.id = pc.paper_id
-                   ORDER BY pc.id"""
-            ).fetchall()
-        ]
-        already_indexed = {
-            r["chunk_id"]: r["model"]
-            for r in conn.execute("SELECT chunk_id, model FROM chunk_embeddings").fetchall()
-        }
-
-        pending: list[tuple[int, str]] = []
-        skipped = 0
-        for c in chunks:
-            if already_indexed.get(c["chunk_id"]) == model:
-                skipped += 1
-                continue
-            text = _chunk_document_text(c, c["chunk_text"])
-            pending.append((c["chunk_id"], text))
-
-        indexed, errors, dim = _embed_pending_chunks(conn, pending, model)
-
-        if dim == 0:
-            # Nichts neu indexiert in diesem Lauf -- Dimension aus einem
-            # bestehenden Vektor des aktuellen Modells fuer die Statusanzeige holen.
-            dim_row = conn.execute(
-                "SELECT dim FROM chunk_embeddings WHERE model = ? LIMIT 1", (model,)
-            ).fetchone()
-            dim = dim_row["dim"] if dim_row else 0
-
-        return {
-            "indexed": indexed,
-            "skipped": skipped,
-            "errors": errors,
-            "total": len(chunks),
-            "model": model,
-            "dim": dim,
-        }
-    finally:
-        conn.close()
+    plan = plan_chunk_index(model)
+    indexed, errors, dim = embed_chunk_batch(plan["pending"], model)
+    if dim == 0:
+        # Nichts neu indexiert in diesem Lauf -- Dimension aus einem
+        # bestehenden Vektor des aktuellen Modells fuer die Statusanzeige holen.
+        conn = _get_conn()
+        try:
+            dim = _stored_dim(conn, "chunk_embeddings", model)
+        finally:
+            conn.close()
+    return {
+        "indexed": indexed,
+        "skipped": plan["skipped"],
+        "errors": errors,
+        "total": plan["total"],
+        "model": model,
+        "dim": dim,
+    }
 
 
 def embed_paper_to_db(paper_id: int) -> bool:
@@ -383,6 +413,43 @@ def reindex_papers() -> dict:
     if not model:
         return {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
 
+    plan = plan_paper_index(model)
+    pending = plan["pending"]
+    indexed = 0
+    errors = 0
+    dim = 0
+    for i in range(0, len(pending), INDEX_BATCH_SIZE):
+        n, failed, batch_dim = embed_paper_batch(pending[i : i + INDEX_BATCH_SIZE], model)
+        indexed += n
+        errors += failed
+        dim = batch_dim or dim
+
+    if dim == 0:
+        # Nichts neu indexiert in diesem Lauf — Dimension aus einem
+        # bestehenden Vektor des aktuellen Modells fuer die Statusanzeige holen.
+        conn = _get_conn()
+        try:
+            dim = _stored_dim(conn, "paper_embeddings", model)
+        finally:
+            conn.close()
+
+    return {
+        "indexed": indexed,
+        "skipped": plan["skipped"],
+        "errors": errors,
+        "total": plan["total"],
+        "model": model,
+        "dim": dim,
+    }
+
+
+def plan_paper_index(model: str) -> dict:
+    """Was ein Paper-Lauf mit ``model`` embedden wuerde, ohne etwas zu schicken.
+
+    Returns ``{"pending": [(paper_id, text)], "skipped": int, "total": int}``.
+    ``skipped`` zaehlt Paper, die schon einen Vektor von ``model`` haben, und
+    solche ohne embed-baren Text (weder Titel noch Abstract).
+    """
     conn = _get_conn()
     try:
         papers = [
@@ -393,7 +460,6 @@ def reindex_papers() -> dict:
             r["paper_id"]: r["model"]
             for r in conn.execute("SELECT paper_id, model FROM paper_embeddings").fetchall()
         }
-
         pending: list[tuple[int, str]] = []
         skipped = 0
         for p in papers:
@@ -405,47 +471,71 @@ def reindex_papers() -> dict:
                 skipped += 1
                 continue
             pending.append((p["id"], text))
-
-        indexed = 0
-        errors = 0
-        dim = 0
-        for i in range(0, len(pending), INDEX_BATCH_SIZE):
-            batch = pending[i : i + INDEX_BATCH_SIZE]
-            texts = [t for _, t in batch]
-            try:
-                vectors = embed_texts(texts, mode="document")
-            except Exception as e:
-                logging.warning(f"Embedding-Batch fehlgeschlagen ({len(batch)} Paper): {e}")
-                errors += len(batch)
-                continue
-            for (paper_id, _text), vector in zip(batch, vectors):
-                dim = len(vector)
-                conn.execute(
-                    "INSERT OR REPLACE INTO paper_embeddings (paper_id, model, dim, vector) "
-                    "VALUES (?, ?, ?, ?)",
-                    (paper_id, model, dim, pack_vector(vector)),
-                )
-                indexed += 1
-            conn.commit()
-
-        if dim == 0:
-            # Nichts neu indexiert in diesem Lauf — Dimension aus einem
-            # bestehenden Vektor des aktuellen Modells fuer die Statusanzeige holen.
-            dim_row = conn.execute(
-                "SELECT dim FROM paper_embeddings WHERE model = ? LIMIT 1", (model,)
-            ).fetchone()
-            dim = dim_row["dim"] if dim_row else 0
-
-        return {
-            "indexed": indexed,
-            "skipped": skipped,
-            "errors": errors,
-            "total": len(papers),
-            "model": model,
-            "dim": dim,
-        }
+        return {"pending": pending, "skipped": skipped, "total": len(papers)}
     finally:
         conn.close()
+
+
+def embed_paper_batch(batch: list, model: str) -> tuple:
+    """Embedded ein Paket ``(paper_id, text)`` aus ``plan_paper_index`` mit
+    EINEM ``embed_texts``-Aufruf und speichert es. Ein fehlgeschlagener Aufruf
+    wird geloggt und als ``errors`` gezaehlt, nie geworfen.
+    Returns ``(indexed, errors, dim)``."""
+    if not batch:
+        return 0, 0, 0
+    try:
+        vectors = embed_texts([t for _, t in batch], mode="document")
+    except Exception as e:
+        logging.warning(f"Embedding-Batch fehlgeschlagen ({len(batch)} Paper): {e}")
+        return 0, len(batch), 0
+    conn = _get_conn()
+    try:
+        indexed = 0
+        dim = 0
+        for (paper_id, _text), vector in zip(batch, vectors):
+            dim = len(vector)
+            conn.execute(
+                "INSERT OR REPLACE INTO paper_embeddings (paper_id, model, dim, vector) "
+                "VALUES (?, ?, ?, ?)",
+                (paper_id, model, dim, pack_vector(vector)),
+            )
+            indexed += 1
+        conn.commit()
+        return indexed, 0, dim
+    finally:
+        conn.close()
+
+
+def purge_stale_vectors(model: str) -> int:
+    """Entfernt Vektoren, die nicht von ``model`` stammen (Paper- und
+    Chunk-Ebene). Sie werden nie mit Vektoren eines anderen Modells verglichen
+    (PRD Entscheidung 7) und halten nur den Hinweis "veraltet" am Leben. Das
+    Neuberechnen (#213) ruft dies erst nach einem fehlerfreien Lauf auf.
+    Returns die Zahl der entfernten Vektoren."""
+    if not model:
+        return 0
+    conn = _get_conn()
+    try:
+        removed = conn.execute("DELETE FROM paper_embeddings WHERE model != ?", (model,)).rowcount
+        removed += conn.execute("DELETE FROM chunk_embeddings WHERE model != ?", (model,)).rowcount
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
+
+
+def _stale_model(conn, model: str) -> str:
+    """Das Modell, von dem die meisten Vektoren stammen, die NICHT von
+    ``model`` sind — oder "" wenn es keine gibt."""
+    row = conn.execute(
+        """SELECT model, COUNT(*) AS n FROM (
+               SELECT model FROM paper_embeddings WHERE model != ?
+               UNION ALL
+               SELECT model FROM chunk_embeddings WHERE model != ?
+           ) GROUP BY model ORDER BY n DESC, model LIMIT 1""",
+        (model, model),
+    ).fetchone()
+    return row["model"] if row else ""
 
 
 def embedding_status() -> dict:
@@ -455,7 +545,12 @@ def embedding_status() -> dict:
     andere Dimension haben, falls das Modell wechselt, waehrend ein
     Chunk-Reindex noch aussteht; dafuer gibt es keine eigene Chunk-Dimension im
     Response, die Chunk-Zaehler allein reichen fuer den Fortschrittsbalken).
-    Funktioniert auch ohne konfiguriertes Modell (n=0)."""
+    Funktioniert auch ohne konfiguriertes Modell (n=0).
+
+    ``stale`` (#213): es gibt Vektoren eines anderen als des gebundenen
+    Modells — der Index passt nicht mehr zum Modell; ``stale_model`` nennt das
+    haeufigste davon. Ohne gebundenes Modell ist nichts veraltet (die
+    semantische Suche ist dann aus)."""
     model = Config.embed_model()
     conn = _get_conn()
     try:
@@ -465,17 +560,16 @@ def embedding_status() -> dict:
             indexed = conn.execute(
                 "SELECT COUNT(*) AS n FROM paper_embeddings WHERE model = ?", (model,)
             ).fetchone()["n"]
-            dim_row = conn.execute(
-                "SELECT dim FROM paper_embeddings WHERE model = ? LIMIT 1", (model,)
-            ).fetchone()
-            dim = dim_row["dim"] if dim_row else 0
+            dim = _stored_dim(conn, "paper_embeddings", model)
             chunks_indexed = conn.execute(
                 "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE model = ?", (model,)
             ).fetchone()["n"]
+            stale_model = _stale_model(conn, model)
         else:
             indexed = 0
             dim = 0
             chunks_indexed = 0
+            stale_model = ""
         return {
             "indexed": indexed,
             "total": total,
@@ -483,6 +577,8 @@ def embedding_status() -> dict:
             "dim": dim,
             "chunks_indexed": chunks_indexed,
             "chunks_total": chunks_total,
+            "stale": bool(stale_model),
+            "stale_model": stale_model,
         }
     finally:
         conn.close()

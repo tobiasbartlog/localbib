@@ -13,7 +13,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localbib-plugin-api"
-version = "2.0.0"
+version = "2.3.0"
 description = "The Add-on Contract of LocalBib: protocols, manifest schema and test fakes for Add-on authors."
 readme = "README.md"
 license = "MIT"

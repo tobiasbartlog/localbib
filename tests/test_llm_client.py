@@ -262,6 +262,29 @@ class TestStream:
             tokens = list(_client().stream([]))
         assert tokens == []
 
+    def test_skips_chunks_without_choices(self):
+        # Azure (KI Connect NRW) eroeffnet den Stream mit einem Chunk, der nur
+        # die Filterergebnisse des Prompts traegt; Usage-Chunks am Ende haben
+        # ebenfalls ``choices: []``. Beides ist kein Text, kein Abbruch.
+        prompt_filter = {
+            "choices": [],
+            "prompt_filter_results": [
+                {"prompt_index": 0, "content_filter_results": {}}
+            ],
+        }
+        usage = {"choices": [], "usage": {"total_tokens": 3}}
+        lines = (
+            [f"data: {json.dumps(prompt_filter)}".encode()]
+            + self._sse_lines(["Hi", "!"], done=False)
+            + [f"data: {json.dumps(usage)}".encode(), b"data: [DONE]"]
+        )
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.iter_lines.return_value = lines
+        with patch("llm_client.requests.post", return_value=resp):
+            tokens = list(_client().stream([]))
+        assert tokens == ["Hi", "!"]
+
 
 class TestParseJson:
     def test_plain_dict(self):

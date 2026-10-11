@@ -2,7 +2,8 @@
 
 Serves:
   POST /api/analysis/thesis           (thesis PDF analysis, no DB writes)
-  POST /api/analysis/build            (citation network via OpenAlex + network_orchestrator)
+  POST /api/analysis/build            (citation network via OpenAlex + network_orchestrator;
+                                       ?collection_id= seeds it with one Collection, #202)
   POST /api/analysis/update-citations (refresh OpenAlex metadata for DOI-bearing papers)
   GET  /api/analysis/node-abstract    (fetch abstract by DOI or OpenAlex ID)
   POST /api/analysis/chat             (LLM Q&A over selected papers, SSE stream)
@@ -42,6 +43,7 @@ from literature_manager import Config, extract_text_from_pdf
 from llm_client import LLMClientError, llm_for
 from openalex_client import OpenAlexClient
 from pydantic import BaseModel
+from services import library_collections
 
 router = APIRouter()
 
@@ -242,18 +244,33 @@ async def analyze_thesis(file: UploadFile = File(...)):
 
 
 @router.post("/api/analysis/build")
-async def build_citation_network(depth: int = Query(1, ge=1, le=5)):
+async def build_citation_network(
+    depth: int = Query(1, ge=1, le=5),
+    collection_id: int | None = Query(None),
+):
     """Baut ein Zitationsnetzwerk via OpenAlex API auf.
     depth=1: direkte Referenzen, bis depth=5: fuenf Ebenen tief.
 
+    ``collection_id`` (#202): the seeds are that Collection's Items instead
+    of the whole Library; the payload names the scope. Resolved first, so an
+    unknown or tombstoned Collection is a 404, never an empty network.
+
     Thin wrapper around network_orchestrator.build_network() — all
     business logic lives in the orchestrator module since refactor #24."""
-    oa_client = OpenAlexClient(_oa_mailto())
     conn = _get_conn()
     try:
-        result = network_orchestrator.build_network(conn, oa_client, depth)
+        seeds = None
+        scope = {"type": "library"}
+        if collection_id is not None:
+            collection = library_collections.get_collection(conn, collection_id)
+            if not collection:
+                raise HTTPException(status_code=404, detail="error.collection_not_found")
+            seeds = library_collections.member_ids(conn, collection_id)
+            scope = {"type": "collection", "id": collection["id"], "name": collection["name"]}
+        oa_client = OpenAlexClient(_oa_mailto())
+        result = network_orchestrator.build_network(conn, oa_client, depth, seed_ids=seeds)
         network_orchestrator.persist_updates(conn, result.paper_updates)
-        return result.payload
+        return {**result.payload, "scope": scope}
     finally:
         conn.close()
 
@@ -409,11 +426,14 @@ Answer in {Config.ui_language_name()}, unless the user asks in a different langu
                 yield f"data: {json.dumps({'content': token})}\n\n"
             yield "data: [DONE]\n\n"
         except LLMClientError as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            error = {"code": "error.chat_failed", "params": {"message": str(e)}}
+            yield f"data: {json.dumps({'error': error})}\n\n"
             yield "data: [DONE]\n\n"
-        except Exception as e:
-            logging.error(f"Chat streaming error: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        except Exception:
+            # Ein Programmfehler gehoert ins Log (mit Traceback), nicht als
+            # Python-Satz in den Chat (ADR-0018: der Server sendet Codes).
+            logging.exception("Chat streaming error")
+            yield f"data: {json.dumps({'error': {'code': 'error.chat_interrupted'}})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream",

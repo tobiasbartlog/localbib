@@ -34,12 +34,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 
 from fastapi import HTTPException
 
 import bibtex_import as bibtex_import_core
 import ca_trust
-import metadata_validation
+import cite_key_generator
 from context import get_conn
 from import_indexing import index_paper_after_import
 from literature_manager import (
@@ -84,10 +85,41 @@ def fetch_openalex_works(dois: list[str]) -> dict:
         return {}
 
 
+def _crossref_record(doi: str) -> dict:
+    """The CrossRef record of a DOI (title, authors, year, journal, abstract
+    …) or ``{}`` — one request per Item, and it never raises."""
+    if not doi:
+        return {}
+    try:
+        return fetch_crossref_metadata(doi) or {}
+    except Exception as e:
+        logging.warning("CrossRef-Abruf fuer %s fehlgeschlagen: %s", doi, e)
+        return {}
+
+
+def _text(value) -> str:
+    return str(value or "").strip()
+
+
+def _names(value) -> str:
+    """An author string that names someone, else "": one made of commas,
+    semicolons and spaces only is no author list (#227)."""
+    text = _text(value)
+    return text if re.sub(r"[\s,;]+", "", text) else ""
+
+
 def enrich_imported_papers(created: list[dict], works: dict | None = None) -> int:
-    """Nicht-destruktive Anreicherung frisch importierter Papers: Abstract via
-    CrossRef (Fallback OpenAlex) sowie fehlende Jahr/Autoren via OpenAlex.
-    Nur leere Felder werden gefuellt. Gibt die Zahl angereicherter Papers.
+    """Nicht-destruktive Anreicherung frisch importierter Papers. Nur leere
+    Felder werden gefuellt, ein mitgegebener Wert nie ueberschrieben:
+
+    - Titel, Jahr, Autoren zuerst aus dem OpenAlex-Batch (schon geholt),
+    - Abstract zuerst aus CrossRef, sonst OpenAlex,
+    - was OpenAlex nicht kennt (DataCite-/Zenodo-DOIs, OpenAlex nicht
+      erreichbar) samt Venue aus demselben CrossRef-Datensatz — so bekommt
+      ein Paper aus einer reinen DOI-Liste (#227) seinen Titel.
+
+    CrossRef wird hoechstens einmal je Paper gefragt, und nur, wenn noch ein
+    Feld fehlt. Gibt die Zahl angereicherter Papers.
 
     ``created`` rows carry ``paper_id`` and ``doi``. ``works`` is an optional
     pre-fetched OpenAlex batch (``fetch_openalex_works``) so a caller that
@@ -107,31 +139,39 @@ def enrich_imported_papers(created: list[dict], works: dict | None = None) -> in
         conn = get_conn()
         try:
             row = conn.execute(
-                "SELECT abstract, year, authors FROM papers WHERE id = ?", (pid,)
+                "SELECT title, abstract, year, authors, journal FROM papers WHERE id = ?", (pid,)
             ).fetchone()
         finally:
             conn.close()
         if not row:
             continue
+        have = dict(row)
         updates: dict = {}
-        if not (row["abstract"] or "").strip():
-            abstract = ""
-            if doi:
-                try:
-                    abstract = metadata_validation.fetch_crossref_abstract(
-                        doi, fetch=lambda d: fetch_crossref_metadata(d)
-                    ) or ""
-                except Exception:
-                    abstract = ""
-            if not abstract and work and (work.abstract or "").strip():
-                abstract = work.abstract
+        if work:
+            if not _text(have["title"]) and _text(work.title):
+                updates["title"] = _text(work.title)
+            if not have["year"] and work.year:
+                updates["year"] = work.year
+            if not _names(have["authors"]) and _names("; ".join(work.authors)):
+                updates["authors"] = _names("; ".join(work.authors))
+        known = {**have, **updates}
+        missing = [f for f in ("abstract", "title", "journal") if not _text(known[f])]
+        if not _names(known["authors"]):
+            missing.append("authors")
+        record = _crossref_record(doi) if missing or not known["year"] else {}
+        if not _text(have["abstract"]):
+            abstract = _text(record.get("abstract")) or (_text(work.abstract) if work else "")
             if abstract:
                 updates["abstract"] = abstract[:5000]
-        if work:
-            if not row["year"] and work.year:
-                updates["year"] = work.year
-            if not (row["authors"] or "").strip() and work.authors:
-                updates["authors"] = "; ".join(work.authors)
+        for field in ("title", "journal"):
+            if not _text(known[field]) and _text(record.get(field)):
+                updates[field] = _text(record.get(field))
+        # CrossRef's authors come in the core's one CrossRef format
+        # (crossref.format_crossref_authors); a list without a name writes nothing.
+        if "authors" in missing and _names(record.get("authors")):
+            updates["authors"] = _names(record.get("authors"))
+        if not known["year"] and record.get("year"):
+            updates["year"] = record["year"]
         if updates:
             sets = ", ".join(f"{k} = ?" for k in updates)
             conn = get_conn()
@@ -154,15 +194,15 @@ def attach_pdf_to_paper(paper_id: int, data: bytes, original_name: str,
     Metadaten bleiben unangetastet (CONTEXT.md "PDF Download"); die
     LLM-Kategorisierung macht der Aufrufer."""
     if not data[:1024].lstrip().startswith(b"%PDF"):
-        raise HTTPException(status_code=422, detail="Datei ist kein PDF")
+        raise HTTPException(status_code=422, detail="error.not_a_pdf")
 
     conn = get_conn()
     try:
         row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Paper nicht gefunden")
+            raise HTTPException(status_code=404, detail="error.item_not_found")
         if row["filename"]:
-            raise HTTPException(status_code=409, detail="Paper hat bereits ein PDF")
+            raise HTTPException(status_code=409, detail="error.item_has_pdf")
         real_hash = hashlib.sha256(data).hexdigest()
         other = conn.execute(
             "SELECT id, title FROM papers WHERE file_hash = ? AND id != ?",
@@ -171,7 +211,8 @@ def attach_pdf_to_paper(paper_id: int, data: bytes, original_name: str,
         if other:
             raise HTTPException(
                 status_code=409,
-                detail=f"Dieses PDF gehoert bereits zu Paper {other['id']}: {other['title']}",
+                detail={"code": "error.pdf_belongs_to_item",
+                        "params": {"id": other["id"], "title": other["title"] or ""}},
             )
         paper = dict(row)
     finally:
@@ -302,7 +343,7 @@ def try_fetch_oa_pdf(paper_id: int, url: str) -> bool:
         resp = httpx.get(
             url, timeout=60, follow_redirects=True,
             headers={"User-Agent": Config.user_agent("LocalBib")},
-            verify=ca_trust.ca_bundle() or True,
+            verify=ca_trust.httpx_verify(),
         )
         resp.raise_for_status()
         data = resp.content
@@ -371,6 +412,44 @@ def _pdf_state(has_pdf: bool) -> str:
     return "fetched" if has_pdf else "none"
 
 
+# The key ``add_paper`` gives an Item created with neither authors nor year.
+_PLACEHOLDER_KEY = cite_key_generator.base_key("", None)  # "UnknownXXXX"
+
+
+def _rekey_placeholder(result: dict, item: dict) -> None:
+    """An Item this intake created with neither authors nor year got the
+    placeholder key (``UnknownXXXX``…). Once enrichment found authors or a
+    year, the key is generated again — once, exactly as ``add_paper`` does
+    for any new Item (``cite_key_generator.generate`` over the stored authors
+    and year). A key built from given authors or a given year, one that
+    changed meanwhile, and every Item that existed before stay untouched."""
+    if _join_authors(item.get("authors")) or item.get("year"):
+        return
+    if not (result.get("citekey") or "").startswith(_PLACEHOLDER_KEY):
+        return
+    pid = result["paper_id"]
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT authors, year, cite_key FROM papers WHERE id = ?", (pid,)).fetchone()
+        if not row or row["cite_key"] != result["citekey"]:
+            return
+        authors, year = row["authors"] or "", row["year"]
+        if cite_key_generator.base_key(authors, year) == _PLACEHOLDER_KEY:
+            return  # enrichment found neither
+        taken = {r["cite_key"] for r in conn.execute(
+            "SELECT cite_key FROM papers WHERE cite_key != '' AND id != ?", (pid,))}
+        key = cite_key_generator.generate(authors, year, taken)
+        conn.execute("UPDATE papers SET cite_key = ? WHERE id = ? AND cite_key = ?",
+                     (key, pid, row["cite_key"]))
+        conn.commit()
+    except Exception as e:  # the old key stays; the Item is created either way
+        logging.warning("Cite Key fuer Paper %s nicht neu erzeugt: %s", pid, e)
+        return
+    finally:
+        conn.close()
+    result["citekey"] = key
+
+
 def create_or_find_by_doi(item: dict) -> dict:
     """Dedup + ``add_paper`` for one item; no network. ``item`` holds ``doi``
     and optionally ``title``, ``authors`` (list or "; "-joined string),
@@ -428,6 +507,16 @@ def intake_by_doi(items: list[dict]) -> list[dict]:
         return results
     works = fetch_openalex_works([r["doi"] for r in created])
     enrich_imported_papers(created, works=works)
+    final_keys = {}
+    for item, r in zip(items, results):
+        if r["created"]:
+            _rekey_placeholder(r, item)
+            final_keys[r["paper_id"]] = r["citekey"]
+    # The same DOI twice in one list: the later entry found this Item while
+    # it still had its placeholder — every entry reports the final key.
+    for r in results:
+        if r.get("paper_id") in final_keys:
+            r["citekey"] = final_keys[r["paper_id"]]
     for r in created:
         work = works.get(r["doi"])
         url = work.oa_pdf_url if work else ""

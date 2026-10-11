@@ -21,6 +21,7 @@ describe('LLM-off hint after skipping onboarding', () => {
 
         const hint = document.querySelector('[data-testid="llm-off-hint"]');
         expect(hint).toBeTruthy();
-        expect(hint.querySelector('a').getAttribute('href')).toContain('/settings');
+        // Straight to the AI models section, by its address (#207).
+        expect(hint.querySelector('a').getAttribute('href')).toBe('#/settings/ai-models');
     });
 });

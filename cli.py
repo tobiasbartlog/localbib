@@ -2,6 +2,7 @@
 """CLI-Befehle und Entry-Point für den Literatur-Manager."""
 
 import os
+import threading
 import re
 import logging
 import argparse
@@ -10,7 +11,7 @@ from pathlib import Path
 from config import Config, setup_logging
 from database import Database
 from pipeline import process_paper
-from filenames import create_symlinks
+from filenames import clear_category_folders, create_symlinks
 from watcher import start_watcher
 
 
@@ -236,8 +237,18 @@ def cmd_stats(args):
 
 # --- Hilfsfunktionen ---
 
+#: Serialises the rebuilds: the routers run them in the threadpool (LIB-B9),
+#: and two interleaved runs could clear the folders under each other.
+_REBUILD_LOCK = threading.RLock()
+
+
 def _rebuild_category_folders(db: Database):
     """Erstellt Ordnerstruktur aus Kategorien."""
+    with _REBUILD_LOCK:
+        _make_category_folders(db)
+
+
+def _make_category_folders(db: Database):
     categories = db.get_categories()
     cat_map = {c["id"]: c for c in categories}
 
@@ -258,26 +269,13 @@ def _rebuild_category_folders(db: Database):
 
 def _rebuild_all_symlinks(db: Database):
     """Löscht alle Dateien und veraltete Ordner, baut Kategorie-Ordner neu auf."""
-    if os.path.isdir(Config.CATEGORIES_DIR):
-        for root, dirs, files in os.walk(Config.CATEGORIES_DIR):
-            for fname in files:
-                try:
-                    os.remove(os.path.join(root, fname))
-                except OSError as e:
-                    logging.warning(f"Konnte Datei nicht entfernen: {fname}: {e}")
-        for root, dirs, files in os.walk(Config.CATEGORIES_DIR, topdown=False):
-            if root == Config.CATEGORIES_DIR:
-                continue
-            try:
-                os.rmdir(root)
-            except OSError:
-                pass
-
-    os.makedirs(Config.CATEGORIES_DIR, exist_ok=True)
-    _rebuild_category_folders(db)
-    papers = db.get_all_papers()
-    for p in papers:
-        create_symlinks(db, p["id"], p["filename"])
+    with _REBUILD_LOCK:
+        clear_category_folders()
+        os.makedirs(Config.CATEGORIES_DIR, exist_ok=True)
+        _make_category_folders(db)
+        papers = db.get_all_papers()
+        for p in papers:
+            create_symlinks(db, p["id"], p["filename"])
 
 
 # =============================================================================

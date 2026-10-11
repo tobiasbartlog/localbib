@@ -9,10 +9,10 @@ field is written where it is applied, in :func:`_to_item`.
 
 Three decisions worth naming up here:
 
-* **An item lives in many collections, a category path is one chain.** The
-  first collection an item appears in becomes ``collection_path``; the others
-  are kept under ``zotero:otherCollections`` in ``raw``, so nothing is lost and
-  the wizard still shows one predictable tree.
+* **An item lives in many collections.** All of them are in
+  ``collection_paths`` and each becomes a Collection (#203); the first is also
+  ``collection_path`` (one predictable chain for the preview), and the others
+  are kept under ``zotero:otherCollections`` in ``raw`` as well.
 * **Zotero has no cite key.** ``key`` is therefore *derived* (first author's
   surname + year, uniquified) rather than carrying an ``rdf:about`` URI into
   the library's ``cite_key`` column. The URI stays in ``raw``.
@@ -166,6 +166,7 @@ def _to_item(el, index: dict, paths: dict, base_dir: str, used: set) -> Migratio
         # A manual tag is plain text, an automatic one sits in a z:AutomaticTag.
         tags=_dedupe(_value(node) for node in _children(el, "subject")),
         collection_path=list(item_paths[0]) if item_paths else [],
+        collection_paths=[list(p) for p in item_paths],
         notes=_notes(el, index),
         date_added=_field(el, "dateSubmitted") or None,
         attachments=attachments,

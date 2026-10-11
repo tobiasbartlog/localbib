@@ -1,8 +1,9 @@
 """Tests for embedding_index.py (#98): paper-level embedding indexer.
 
 Covers the neutral module directly (pack/unpack, substitute-abstract text
-assembly, embed_paper_to_db, reindex_papers, embedding_status) plus the two
-Maintenance endpoints that expose it. ``llm_client.embed_texts`` is mocked —
+assembly, embed_paper_to_db, reindex_papers, embedding_status) plus the status
+endpoint that exposes it (the index runs themselves are a step of the
+recompute, see test_maintenance_recompute.py). ``llm_client.embed_texts`` is mocked —
 no real HTTP calls.
 """
 from __future__ import annotations
@@ -482,6 +483,7 @@ class TestEmbeddingStatus:
         assert status == {
             "indexed": 0, "total": 1, "model": "", "dim": 0,
             "chunks_indexed": 0, "chunks_total": 0,
+            "stale": False, "stale_model": "",
         }
 
     def test_reports_n_of_m_and_dim(self, db, seed_paper, monkeypatch):
@@ -492,6 +494,7 @@ class TestEmbeddingStatus:
         assert status == {
             "indexed": 1, "total": 1, "model": "test-embed-model", "dim": 4,
             "chunks_indexed": 0, "chunks_total": 0,
+            "stale": False, "stale_model": "",
         }
 
     def test_reports_chunk_counts(self, db, seed_paper, monkeypatch):
@@ -533,6 +536,7 @@ class TestMaintenanceEmbeddingEndpoints:
         assert body == {
             "indexed": 1, "total": 1, "model": "test-embed-model", "dim": 2,
             "chunks_indexed": 0, "chunks_total": 0,
+            "stale": False, "stale_model": "",
         }
 
     def test_status_endpoint_without_model(self, client, db, seed_paper, monkeypatch):
@@ -542,42 +546,55 @@ class TestMaintenanceEmbeddingEndpoints:
         assert resp.json() == {
             "indexed": 0, "total": 1, "model": "", "dim": 0,
             "chunks_indexed": 0, "chunks_total": 0,
+            "stale": False, "stale_model": "",
         }
 
-    def test_reindex_endpoint(self, client, db, seed_paper, monkeypatch):
-        configure_llm(monkeypatch, embedding="test-embed-model")
-        with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
-            resp = client.post("/api/maintenance/embeddings/reindex")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["indexed"] == 1
-        assert body["total"] == 1
-        assert body["model"] == "test-embed-model"
-        assert body["dim"] == 2
+    def test_the_index_runs_are_no_endpoints_any_more(self, client, db):
+        """#213: the search index is rebuilt by POST /api/maintenance/recompute
+        (step ``search_index``); the two single runs are gone."""
+        for url in ("/api/maintenance/embeddings/reindex", "/api/maintenance/embeddings/reindex-chunks"):
+            assert client.post(url).status_code in (404, 405)
 
-    def test_reindex_endpoint_without_model_degrades(self, client, db, seed_paper, monkeypatch):
-        configure_llm(monkeypatch, embedding="")
-        resp = client.post("/api/maintenance/embeddings/reindex")
-        assert resp.status_code == 200
-        assert resp.json() == {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
 
-    def test_reindex_chunks_endpoint(self, client, db, seed_paper, monkeypatch):
-        configure_llm(monkeypatch, embedding="test-embed-model")
+# ---------------------------------------------------------------------------
+# "stale" (#213): vectors of another model than the bound one
+# ---------------------------------------------------------------------------
+
+class TestStale:
+    def test_vectors_of_another_model_make_the_index_stale(self, client, db, seed_paper, monkeypatch):
+        configure_llm(monkeypatch, embedding="old-model")
         _insert_chunk(db, seed_paper, "Ein Chunk.")
         with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
-            resp = client.post("/api/maintenance/embeddings/reindex-chunks")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["indexed"] == 1
-        assert body["total"] == 1
-        assert body["model"] == "test-embed-model"
-        assert body["dim"] == 2
+            embedding_index.embed_paper_to_db(seed_paper)
+            embedding_index.embed_chunks_for_paper(seed_paper)
+        assert client.get("/api/maintenance/embeddings/status").json()["stale"] is False
 
-    def test_reindex_chunks_endpoint_without_model_degrades(self, client, db, seed_paper, monkeypatch):
+        configure_llm(monkeypatch, embedding="new-model")
+        body = client.get("/api/maintenance/embeddings/status").json()
+        assert body["stale"] is True
+        assert body["stale_model"] == "old-model"
+        # The counters only count the bound model's vectors.
+        assert body["indexed"] == 0 and body["chunks_indexed"] == 0
+
+    def test_without_a_bound_model_nothing_is_stale(self, client, db, seed_paper, monkeypatch):
+        configure_llm(monkeypatch, embedding="old-model")
+        with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
+            embedding_index.embed_paper_to_db(seed_paper)
         configure_llm(monkeypatch, embedding="")
-        resp = client.post("/api/maintenance/embeddings/reindex-chunks")
-        assert resp.status_code == 200
-        assert resp.json() == {"indexed": 0, "skipped": 0, "errors": 0, "total": 0, "model": "", "dim": 0}
+        assert client.get("/api/maintenance/embeddings/status").json()["stale"] is False
+
+    def test_purge_drops_only_other_models(self, db, seed_paper, monkeypatch):
+        configure_llm(monkeypatch, embedding="old-model")
+        _insert_chunk(db, seed_paper, "Ein Chunk.")
+        with patch.object(embedding_index, "embed_texts", return_value=[[0.1, 0.2]]):
+            embedding_index.embed_chunks_for_paper(seed_paper)
+        configure_llm(monkeypatch, embedding="new-model")
+        with patch.object(embedding_index, "embed_texts", return_value=[[0.3, 0.4]]):
+            embedding_index.embed_paper_to_db(seed_paper)
+        assert embedding_index.purge_stale_vectors("new-model") == 1
+        status = embedding_index.embedding_status()
+        assert status["stale"] is False
+        assert status["indexed"] == 1
 
 
 # ---------------------------------------------------------------------------

@@ -129,7 +129,7 @@ def test_crossref_returns_nothing_emits_no_data_message():
     # DOI is kept (only an implausible CrossRef title clears it).
     assert result.metadata["doi"] == "10.1/x"
     crossref_events = [e for e in events if e["step"] == "crossref"]
-    assert crossref_events and "keine Daten" in crossref_events[-1]["message"]
+    assert crossref_events and crossref_events[-1]["message"] == "import.step.crossrefEmpty"
 
 
 def test_isbn_and_year_fallbacks_fill_empty_fields():
@@ -181,3 +181,19 @@ def test_no_failure_recorded_when_llm_answers():
         _events, result = _drain(sip.run_pipeline("/tmp/x.pdf", "x.pdf", do_doi=False, do_validate=True))
     assert result.llm_failures == []
     assert result.metadata["title"] == "Better Title"
+
+
+def test_every_progress_message_is_a_code_never_a_sentence():
+    """LIB-B8: the backend sends codes (with params), the SPA translates."""
+    import re as _re
+
+    with patch.object(sip, "extract_text_from_pdf", return_value="Title\nbody"), \
+         patch.object(sip, "discover_doi", return_value="10.1/x"), \
+         patch.object(sip, "fetch_crossref_metadata", return_value={"title": "Totally Different"}):
+        events, _result = _drain(
+            sip.run_pipeline("/tmp/x.pdf", "x.pdf", do_doi=True, do_validate=False)
+        )
+    for e in events:
+        msg = e["message"]
+        code = msg["code"] if isinstance(msg, dict) else msg
+        assert _re.fullmatch(r"import\.step\.[A-Za-z.]+", code), msg

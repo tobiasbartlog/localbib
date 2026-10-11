@@ -38,7 +38,7 @@ describe('settings: LLM model combobox', () => {
                     ? { models: ['llama3', 'nomic-embed-text'], error: null }
                     : { models: MANY, error: null }),
             },
-        ], 'llm-tab');
+        ], 'ai-models');
         const panel = document.querySelector('[data-testid="llm-panel"]');
 
         // Models are loaded from the connection card, not on tab open.

@@ -88,6 +88,7 @@ def _to_item(entry: dict, verbatim: dict, base_dir: str) -> MigrationItem:
         publisher=entry.get("publisher", ""),
         tags=split_tags(_first(lowered, TAG_FIELDS)),
         collection_path=split_collection(_first(lowered, GROUP_FIELDS)),
+        collection_paths=split_collections(_first(lowered, GROUP_FIELDS)),
         notes=_clean_note(_first(lowered, NOTE_FIELDS)),
         date_added=_first(lowered, DATE_ADDED_FIELDS) or None,
         attachments=attachments,
@@ -125,6 +126,19 @@ def split_collection(value: str) -> list[str]:
             first = part.strip()
             break
     return [s.strip() for s in first.split("/") if s.strip()]
+
+
+def split_collections(value: str) -> list[list[str]]:
+    """``groups`` field → every collection path, in field order (#203).
+
+    A Collection is not a category chain: an Item may sit in many, so every
+    group the tool wrote becomes one path — ``Diss/Kap 2, Andere`` is two."""
+    paths: list[list[str]] = []
+    for part in _SEPARATOR_RE.split(value or ""):
+        path = [s.strip() for s in part.strip().split("/") if s.strip()]
+        if path and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def _first(lowered: dict, names: tuple[str, ...]) -> str:

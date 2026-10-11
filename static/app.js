@@ -122,8 +122,198 @@ function applyDarkMode(enabled) {
     document.documentElement.setAttribute('data-theme', enabled ? 'dark' : 'light');
 }
 
+// --- Look and sidebar of this installation (#208) ----------------------------
+// Dark mode and the thesis area are SERVER settings (DARK_MODE / THESIS_MODE in
+// the .env): the server is the truth and survives another browser or port. The
+// browser's localStorage only mirrors them so the first paint needs no round
+// trip - index.html applies the same mirror before Vue mounts.
+function lsGet(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+function lsSet(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) { /* no storage: fine */ }
+}
+
+const UI_PREF_KEYS = { darkMode: 'DARK_MODE', thesisMode: 'THESIS_MODE' };
+
+// The detail layout (#230): which block of an Item's detail view sits where.
+// The server normalizes it (detail_layout.py) and always serves the one in
+// force, with the default and the limits (window.LB_PREFS.detailLayoutRules);
+// the fallback below only stands in where the server said nothing usable
+// (tests, an old page).
+const DETAIL_TAB_KEY = 'lbDetailTab';
+const FALLBACK_DETAIL_LAYOUT = Object.freeze({
+    v: 1,
+    main: ['abstract', 'annotations'],
+    tabs: [
+        { name: '', blocks: ['metadata', 'customFields', 'categories', 'collections'] },
+        { name: '', blocks: ['references'] },
+        { name: '', blocks: ['notes'] },
+    ],
+    hidden: [],
+});
+function layoutUsable(raw) {
+    const list = (x) => Array.isArray(x) && x.every((b) => typeof b === 'string');
+    return !!(raw && typeof raw === 'object' && list(raw.main) && list(raw.hidden)
+        && Array.isArray(raw.tabs)
+        && raw.tabs.every((tab) => tab && typeof tab === 'object' && list(tab.blocks) && tab.blocks.length));
+}
+// { default, max_tabs, max_name } as the server sent them, else the fallback.
+function detailRules() {
+    const sent = (window.LB_PREFS || {}).detailLayoutRules || {};
+    const count = (n, fallback) => (Number.isInteger(n) && n > 0 ? n : fallback);
+    return {
+        default: layoutUsable(sent.default) ? sent.default : FALLBACK_DETAIL_LAYOUT,
+        max_tabs: count(sent.max_tabs, 4),
+        max_name: count(sent.max_name, 24),
+    };
+}
+function detailLayoutOr(raw) {
+    const usable = layoutUsable(raw);
+    const layout = usable ? raw : detailRules().default;
+    return {
+        v: 1,
+        main: [...layout.main],
+        tabs: layout.tabs.map((tab) => ({ name: typeof tab.name === 'string' ? tab.name : '', blocks: [...tab.blocks] })),
+        hidden: [...layout.hidden],
+    };
+}
+
+// The server renders its own values into the page (window.LB_PREFS); without
+// them (first run after the update, tests) the browser mirror decides.
+const uiPrefs = reactive({
+    darkMode: ((window.LB_PREFS || {}).darkMode || lsGet('darkMode')) === 'true',
+    thesisMode: ((window.LB_PREFS || {}).thesisMode || lsGet('thesisMode')) === 'true',
+    detailLayout: detailLayoutOr((window.LB_PREFS || {}).detailLayout),
+});
+
+// Takes a layout over as the one in force (an open detail view follows at once).
+function showDetailLayout(layout) {
+    uiPrefs.detailLayout = detailLayoutOr(layout);
+}
+
+// Writes the layout through the settings endpoint; the server's normalized
+// answer (`detail_layout` in the PUT reply) is what ends up shown. Put back
+// (and thrown) when the server refuses. Each edit takes a ticket: only the
+// newest one may adopt an answer or roll back, so a slow reply never undoes a
+// later edit (the next edit is computed from what is on screen).
+let detailLayoutTicket = 0;
+let detailLayoutSaving = 0;   // saves still waiting for their answer (a sync must not overwrite those)
+async function setDetailLayout(layout) {
+    const ticket = ++detailLayoutTicket;
+    const before = uiPrefs.detailLayout;
+    showDetailLayout(layout);
+    detailLayoutSaving++;
+    try {
+        const answer = await api('/api/settings', { method: 'PUT', body: JSON.stringify({ DETAIL_LAYOUT: JSON.stringify(layout) }) });
+        if (ticket === detailLayoutTicket && answer && layoutUsable(answer.detail_layout)) showDetailLayout(answer.detail_layout);
+    } catch (e) {
+        if (ticket === detailLayoutTicket) uiPrefs.detailLayout = before;
+        throw e;
+    } finally {
+        detailLayoutSaving--;
+    }
+}
+
+// The editor's move rules (Settings -> Appearance), one place for dragging and
+// the ··· menu. `target` is { zone: 'main' | 'hidden' | 'tab' | 'newtab', tab?,
+// before? }: the block lands in front of `before`, else at the end of the zone.
+// Returns a new layout the server's normalize() leaves unchanged (a tab that
+// ran empty is gone with its name, at most 4 tabs, names are the tab's, not the
+// block's), or null where nothing would change.
+function layoutMove(layout, id, target) {
+    if (!id || target.before === id) return null;
+    const next = detailLayoutOr(layout);
+    const known = next.main.includes(id) || next.hidden.includes(id) || next.tabs.some((tab) => tab.blocks.includes(id));
+    if (!known) return null;
+    const drop = (list) => { const i = list.indexOf(id); if (i >= 0) list.splice(i, 1); };
+    drop(next.main);
+    drop(next.hidden);
+    next.tabs.forEach((tab) => drop(tab.blocks));
+    const put = (list) => {
+        const i = target.before ? list.indexOf(target.before) : -1;
+        if (i >= 0) list.splice(i, 0, id); else list.push(id);
+    };
+    if (target.zone === 'main') put(next.main);
+    else if (target.zone === 'hidden') put(next.hidden);
+    else if (target.zone === 'tab') {
+        if (!next.tabs[target.tab]) return null;
+        put(next.tabs[target.tab].blocks);
+    } else if (target.zone === 'newtab') next.tabs.push({ name: '', blocks: [id] });
+    else return null;
+    next.tabs = next.tabs.filter((tab) => tab.blocks.length);
+    if (next.tabs.length > detailRules().max_tabs) return null;
+    return next;
+}
+
+// One step up/down (left/right in Hidden) inside the zone the block is in.
+function layoutShift(layout, id, dir) {
+    const next = detailLayoutOr(layout);
+    const lists = [next.main, next.hidden, ...next.tabs.map((tab) => tab.blocks)];
+    const list = lists.find((l) => l.includes(id));
+    if (!list) return null;
+    const i = list.indexOf(id);
+    const j = i + dir;
+    if (j < 0 || j >= list.length) return null;
+    list[i] = list[j];
+    list[j] = id;
+    return next;
+}
+
 // Sofort anwenden (vor Vue-Mount), damit kein Flash of Light Mode
-applyDarkMode(localStorage.getItem('darkMode') === 'true');
+applyDarkMode(uiPrefs.darkMode);
+
+function showUiPref(name, value) {
+    uiPrefs[name] = value;
+    lsSet(name, String(value));
+    if (name === 'darkMode') applyDarkMode(value);
+}
+
+// Writes one preference through the settings endpoint. Shown at once, put back
+// (and thrown) when the server refuses - the sidebar switch and the settings
+// page share this one path, so they always show the same state.
+async function setUiPref(name, value) {
+    const before = uiPrefs[name];
+    showUiPref(name, value);
+    try {
+        await api('/api/settings', {
+            method: 'PUT',
+            body: JSON.stringify({ [UI_PREF_KEYS[name]]: String(value) }),
+        });
+    } catch (e) {
+        showUiPref(name, before);
+        throw e;
+    }
+}
+
+// Once per page load: take over what the server holds; where it holds nothing
+// yet, hand it the value this browser already had (one-time adoption).
+async function syncUiPrefs() {
+    let server;
+    try {
+        server = await api('/api/settings');
+    } catch (e) {
+        return;
+    }
+    if (typeof server.DETAIL_LAYOUT === 'string' && !detailLayoutSaving) {
+        try { showDetailLayout(JSON.parse(server.DETAIL_LAYOUT)); } catch (e) { /* the first paint's stays */ }
+    }
+    const adopt = {};
+    for (const name of Object.keys(UI_PREF_KEYS)) {
+        const held = server[UI_PREF_KEYS[name]];
+        if (held === 'true' || held === 'false') {
+            showUiPref(name, held === 'true');
+            continue;
+        }
+        const local = lsGet(name);
+        if (local === 'true' || local === 'false') adopt[UI_PREF_KEYS[name]] = local;
+    }
+    if (Object.keys(adopt).length) {
+        try {
+            await api('/api/settings', { method: 'PUT', body: JSON.stringify(adopt) });
+        } catch (e) { /* retried on the next load */ }
+    }
+}
 
 // =============================================================================
 // API Helper
@@ -189,26 +379,6 @@ function renderMarkdownSafe(text) {
         .replace(/`(.+?)`/g, '<code class="lb-md-code">$1</code>');
 }
 
-// Favicon: dieselben Vorgaben wie im <head> von index.html. Seit das
-// LocalBib-Icon mitgeliefert wird, ist der Tab nie leer — ein eigenes Icon
-// (Einstellungen > Darstellung) ersetzt es, das Entfernen stellt es wieder her.
-// Darum hier ersetzen statt, wie frueher, den Link ersatzlos loeschen.
-const DEFAULT_FAVICONS = [
-    { href: '/static/icons/localbib-32.png', sizes: '32x32' },
-    { href: '/static/icons/localbib.png', sizes: '256x256' },
-];
-
-function setFavicon(href) {
-    document.querySelectorAll("link[rel~='icon']").forEach(el => el.remove());
-    for (const entry of (href ? [{ href }] : DEFAULT_FAVICONS)) {
-        const link = document.createElement('link');
-        link.rel = 'icon';
-        link.href = entry.href;
-        if (entry.sizes) link.sizes = entry.sizes;
-        document.head.appendChild(link);
-    }
-}
-
 // =============================================================================
 // SVG Icons (inline)
 // =============================================================================
@@ -253,6 +423,21 @@ const icons = {
 // CategoryNode Component (rekursiv) — editorial .lb-cat-row style
 // =============================================================================
 
+// Items dragged from the library list onto a sidebar category (#199). Our own
+// MIME type, so a category only reacts to item drags and the global PDF drop
+// (App.onGlobalDrop, which looks for 'Files') never sees them.
+const ITEM_DRAG_MIME = 'application/x-localbib-papers';
+const ITEM_DRAG_EVENT = 'lb-item-drag';
+const ITEMS_CATEGORIZED_EVENT = 'lb-items-categorized';
+// A drop onto a sidebar collection changed its members: an open collection
+// view reloads its list.
+const ITEMS_COLLECTED_EVENT = 'lb-items-collected';
+
+function isItemDrag(e) {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    return !!types && Array.from(types).includes(ITEM_DRAG_MIME);
+}
+
 const CategoryNode = {
     name: 'CategoryNode',
     props: {
@@ -260,12 +445,17 @@ const CategoryNode = {
         editMode: { type: Boolean, default: false },
         depth: { type: Number, default: 0 },
     },
-    emits: ['edit', 'delete'],
+    emits: ['edit', 'delete', 'items-dropped'],
     template: `
         <button class="lb-cat-row"
-                :class="{ 'is-active': isActive }"
+                :class="{ 'is-active': isActive, 'is-drop-target': dropTarget }"
                 :style="{ paddingLeft: (10 + depth * 14) + 'px' }"
-                @click="navigate">
+                :data-category-id="node.id"
+                @click="navigate"
+                @dragenter="onDragOver"
+                @dragover="onDragOver"
+                @dragleave="dropTarget = false"
+                @drop="onDrop">
             <span v-if="depth > 0" class="lb-cat-tick" aria-hidden="true">·</span>
             <span class="lb-cat-name">{{ node.name }}</span>
             <span v-if="!editMode && node.paper_count"
@@ -284,10 +474,19 @@ const CategoryNode = {
                        :edit-mode="editMode"
                        :depth="depth + 1"
                        @edit="$emit('edit', $event)"
-                       @delete="$emit('delete', $event)" />
+                       @delete="$emit('delete', $event)"
+                       @items-dropped="$emit('items-dropped', $event)" />
     `,
     data() {
-        return { icons };
+        return { icons, dropTarget: false };
+    },
+    mounted() {
+        // A drag cancelled with Esc fires no dragleave here; its end clears the highlight.
+        this._dragEndHandler = () => { this.dropTarget = false; };
+        window.addEventListener(ITEM_DRAG_EVENT, this._dragEndHandler);
+    },
+    unmounted() {
+        window.removeEventListener(ITEM_DRAG_EVENT, this._dragEndHandler);
     },
     computed: {
         isActive() {
@@ -300,7 +499,25 @@ const CategoryNode = {
             if (!this.editMode) {
                 this.$router.push({ name: 'category', params: { id: this.node.id } });
             }
-        }
+        },
+        onDragOver(e) {
+            if (this.editMode || !isItemDrag(e)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = 'copy';
+            this.dropTarget = true;
+        },
+        onDrop(e) {
+            if (this.editMode || !isItemDrag(e)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.dropTarget = false;
+            let ids = [];
+            try { ids = JSON.parse(e.dataTransfer.getData(ITEM_DRAG_MIME)); } catch (err) { return; }
+            if (Array.isArray(ids) && ids.length) {
+                this.$emit('items-dropped', { category: this.node, paperIds: ids });
+            }
+        },
     }
 };
 
@@ -330,18 +547,58 @@ const ONBOARDING_MIGRATION_SOURCES = [
     { id: 'bibtex', labelKey: 'migrate.onboarding.otherFile' },
 ];
 
+// The LLM document the onboarding saves: `current` (GET /api/llm/config, null
+// on a first run) with the dialog's one connection as "default". PUT replaces
+// the whole document, so everything else is carried over: every other
+// connection with `api_key: null` ("keep the stored key" - GET never returns
+// one), and every bound role as it is; only an unbound role is pointed at
+// "default". On a first run the document is empty and this is exactly the old
+// "one connection, bound to all three roles".
+// The "default" connection itself: a typed key replaces the stored one. With
+// no key typed, the same provider keeps its key, label and base URL; another
+// provider starts without a key, so an old key never travels to a new host,
+// and the roles bound to "default" lose their model: the old provider's model
+// names mean nothing to the new one (the AI-models tab picks new ones).
+function onboardingLlmDocument(current, connection) {
+    const saved = (current && current.connections) || [];
+    const before = saved.find((c) => c.id === 'default');
+    const same = !!before && before.provider === connection.provider;
+    const providerChanged = !!before && !same;
+    const conn = {
+        id: 'default',
+        label: same ? before.label : connection.label,
+        provider: connection.provider,
+        base_url: connection.base_url || (same ? before.base_url || '' : ''),
+        api_key: connection.api_key || (same ? null : ''),
+    };
+    const connections = saved.map((c) => (c.id === 'default' ? conn : {
+        id: c.id, label: c.label, provider: c.provider, base_url: c.base_url, api_key: null,
+    }));
+    if (!before) connections.push(conn);
+    const savedRoles = (current && current.roles) || {};
+    const roles = {};
+    for (const tier of ['reasoning', 'fast', 'embedding']) {
+        const held = savedRoles[tier] || {};
+        const stale = providerChanged && held.connection_id === 'default';
+        roles[tier] = held.connection_id
+            ? { connection_id: held.connection_id, model: stale ? '' : (held.model || '') }
+            : { connection_id: 'default', model: '' };
+    }
+    return { connections, roles };
+}
+
 const Sidebar = {
     components: { CategoryNode },
     props: {
         licenseActivated: { type: Boolean, default: false },
     },
     template: `
-        <aside class="lb-sidebar" :class="{ 'is-collapsed': collapsed }">
+        <aside class="lb-sidebar" :class="{ 'is-collapsed': collapsed }"
+               @dragenter="onItemDragEnter" @dragleave="onItemDragLeave">
             <!-- Brand -->
             <div class="lb-brand">
                 <div class="lb-logo">
-                    <img v-if="customIcon" :src="customIcon" style="width:24px;height:24px;border-radius:4px" />
-                    <span v-else class="lb-logo-mark" aria-hidden="true">[</span>
+                    <span class="lb-logo-mark" aria-hidden="true">[</span>
                     <span class="lb-logo-name">LocalBib</span>
                 </div>
                 <button class="lb-collapse" @click="toggleCollapsed"
@@ -404,6 +661,40 @@ const Sidebar = {
                 </router-link>
             </nav>
 
+            <!-- Sammlungen (#201): active ones, the archive behind a toggle, "+" for a new one -->
+            <div class="lb-section">
+                <span class="lb-section-label">{{ $t('collections.heading') }}</span>
+                <button class="lb-section-add" @click="openNewCollection" :title="$t('collections.new')"
+                        data-testid="collection-new">+</button>
+            </div>
+            <div class="lb-list lb-colls" data-testid="sidebar-collections">
+                <div v-if="!collections.length" class="lb-colls-empty">{{ $t('collections.empty') }}</div>
+                <!-- Active collections take dropped items like the categories
+                     (#199); archived ones below do not. -->
+                <button v-for="c in collections" :key="c.id" class="lb-cat-row"
+                        :class="{ 'is-active': isCollectionActive(c), 'is-drop-target': collectionDropTarget === c.id }"
+                        :data-collection-id="c.id"
+                        @click="$router.push({ name: 'collection', params: { id: c.id } })"
+                        @dragover="onCollectionDragOver($event, c)"
+                        @dragleave="onCollectionDragLeave(c)"
+                        @drop="onCollectionDrop($event, c)">
+                    <span class="lb-cat-name">{{ c.name }}</span>
+                    <span v-if="c.item_count" class="lb-cat-count">{{ c.item_count }}</span>
+                </button>
+                <button v-if="archivedCollections.length" class="lb-colls-archive"
+                        data-testid="collections-archive-toggle" @click="showArchived = !showArchived">
+                    {{ $t('collections.archiveToggle', { n: archivedCollections.length }) }}
+                </button>
+                <template v-if="showArchived">
+                    <button v-for="c in archivedCollections" :key="'a' + c.id" class="lb-cat-row is-archived"
+                            :class="{ 'is-active': isCollectionActive(c) }" :data-collection-id="c.id"
+                            @click="$router.push({ name: 'collection', params: { id: c.id } })">
+                        <span class="lb-cat-name">{{ c.name }}</span>
+                        <span v-if="c.item_count" class="lb-cat-count">{{ c.item_count }}</span>
+                    </button>
+                </template>
+            </div>
+
             <!-- Kategorien -->
             <div class="lb-section">
                 <span class="lb-section-label">{{ $t('sidebar.categories') }}</span>
@@ -423,7 +714,16 @@ const Sidebar = {
                 <category-node v-for="root in tree" :key="root.id" :node="root"
                                :edit-mode="categoryEditMode"
                                @edit="startEditCategory"
-                               @delete="deleteCategory" />
+                               @delete="deleteCategory"
+                               @items-dropped="assignDroppedItems" />
+            </div>
+
+            <!-- Drop onto a category (#199): what happened, with undo for exactly
+                 the pairs this drop created. -->
+            <div v-if="dropToast" class="toast lb-drop-toast" role="status" data-testid="drop-toast">
+                <span>{{ dropToast.text }}</span>
+                <button v-if="dropToast.added.length" class="lb-drop-toast-undo"
+                        @click="undoDrop" data-testid="drop-toast-undo">{{ $t('dragAssign.undo') }}</button>
             </div>
 
             <!-- Footer -->
@@ -433,13 +733,44 @@ const Sidebar = {
                     <span>{{ $tn('common.categoryCount', stats.category_count || 0) }}</span>
                 </div>
                 <div class="lb-foot-row">
-                    <button class="lb-foot-btn" @click="toggleTheme"
+                    <button class="lb-foot-btn" data-testid="sidebar-theme-toggle" @click="toggleTheme"
                             :title="darkMode ? $t('theme.toLight') : $t('theme.toDark')">
                         <span v-html="darkMode ? icons.sun : icons.moon" style="width:14px;height:14px"></span>
                     </button>
                     <button class="lb-foot-btn" @click="shutdownServer" :title="$t('app.shutdown')">
                         <span v-html="icons.power" style="width:14px;height:14px"></span>
                     </button>
+                </div>
+            </div>
+
+            <!-- New Collection Modal (#201) -->
+            <div v-if="newColl" class="fixed inset-0 bg-black/30 flex items-center justify-center z-50"
+                 @click.self="newColl = null">
+                <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md" data-testid="collection-new-dialog">
+                    <h4 class="text-base font-semibold text-gray-900 mb-4">{{ $t('collections.new') }}</h4>
+                    <div class="space-y-3">
+                        <div>
+                            <label class="block text-xs text-gray-500 mb-1">{{ $t('common.name') }}</label>
+                            <input v-model="newColl.name" :placeholder="$t('collections.namePlaceholder')"
+                                   data-testid="collection-new-name" @keyup.enter="createCollection"
+                                   class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
+                        </div>
+                        <div>
+                            <label class="block text-xs text-gray-500 mb-1">{{ $t('common.description') }}</label>
+                            <textarea v-model="newColl.description" rows="2" :placeholder="$t('collections.descriptionPlaceholder')"
+                                      class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent focus:border-accent outline-none"></textarea>
+                        </div>
+                        <p v-if="newColl.error" class="text-xs" style="color: var(--lb-danger);">{{ newColl.error }}</p>
+                    </div>
+                    <div class="flex justify-end gap-2 mt-5">
+                        <button @click="newColl = null" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800 transition-colors">
+                            {{ $t('common.cancel') }}
+                        </button>
+                        <button @click="createCollection" :disabled="!newColl.name.trim()" data-testid="collection-new-create"
+                                class="bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                            {{ $t('common.create') }}
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -542,16 +873,23 @@ const Sidebar = {
             newCat: { name: '', parent_id: null, description: '', keywords: '' },
             editCat: null,
             llmLoading: false,
-            customIcon: null,
-            thesisMode: localStorage.getItem('thesisMode') === 'true',
             pluginNavItems: [],
-            darkMode: localStorage.getItem('darkMode') === 'true',
             // Collapsed = icon rail (64px). Persisted so a focus-mode choice
             // (e.g. while working in a wide plugin view) survives reloads.
-            collapsed: localStorage.getItem('lbSidebarCollapsed') === '1',
+            collapsed: lsGet('lbSidebarCollapsed') === '1',
             // True while the fold was done *for* the reader (focus mode, #161)
             // rather than *by* them. Only such a fold is undone again.
             autoCollapsed: false,
+            // True while an item drag unfolded the rail (#199); the drag's end
+            // folds it again, so the reader's choice is never overwritten.
+            dragExpanded: false,
+            dropToast: null,
+            collectionDropTarget: null,
+            // Collections (#201)
+            collections: [],
+            archivedCollections: [],
+            showArchived: false,
+            newColl: null,
         };
     },
     async created() {
@@ -571,11 +909,19 @@ const Sidebar = {
             }
         };
         window.addEventListener('lb-focus-mode', this._focusModeHandler);
+        this._itemDragHandler = (e) => { if (!(e.detail && e.detail.active)) this.endItemDrag(); };
+        window.addEventListener(ITEM_DRAG_EVENT, this._itemDragHandler);
     },
     unmounted() {
         if (this._focusModeHandler) window.removeEventListener('lb-focus-mode', this._focusModeHandler);
+        window.removeEventListener(ITEM_DRAG_EVENT, this._itemDragHandler);
+        clearTimeout(this._expandTimer);
+        clearTimeout(this._toastTimer);
     },
     computed: {
+        // Server settings (#208), shared with Settings -> General.
+        darkMode() { return uiPrefs.darkMode; },
+        thesisMode() { return uiPrefs.thesisMode; },
         // Add-on items only with a registered view behind them (#187): an
         // Add-on whose script failed keeps its server nav item but no page.
         visiblePluginNavItems() {
@@ -593,9 +939,145 @@ const Sidebar = {
                 localStorage.setItem('lbSidebarCollapsed', this.collapsed ? '1' : '0');
             } catch (e) { /* private mode: the toggle still works, it just won't persist */ }
         },
+        // Hover-to-expand (#199): an item drag resting ~600 ms on the folded
+        // rail unfolds it, so the categories become reachable as drop targets.
+        // Enter/leave fire for every child crossed (and relatedTarget is often
+        // null on drag events), so a depth counter tells "still over the rail".
+        onItemDragEnter(e) {
+            if (!isItemDrag(e)) return;
+            this._dragDepth = (this._dragDepth || 0) + 1;
+            if (!this.collapsed || this._expandTimer) return;
+            this._expandTimer = setTimeout(() => {
+                this._expandTimer = null;
+                if (this.collapsed) {
+                    this.collapsed = false;
+                    this.dragExpanded = true;
+                }
+            }, 600);
+        },
+        onItemDragLeave(e) {
+            if (!isItemDrag(e)) return;
+            this._dragDepth = Math.max(0, (this._dragDepth || 0) - 1);
+            if (this._dragDepth) return;
+            clearTimeout(this._expandTimer);
+            this._expandTimer = null;
+        },
+        endItemDrag() {
+            this.collectionDropTarget = null;
+            clearTimeout(this._expandTimer);
+            this._expandTimer = null;
+            this._dragDepth = 0;
+            if (this.dragExpanded) this.collapsed = true;
+            this.dragExpanded = false;
+        },
+        async assignDroppedItems({ category, paperIds }) {
+            this.endItemDrag();
+            const body = JSON.stringify({ paper_ids: paperIds, category_id: category.id });
+            let res;
+            try {
+                res = await api('/api/papers/categories', { method: 'POST', body });
+            } catch (e) {
+                this.showDropError(e);
+                return;
+            }
+            const added = res.added_ids || [];
+            const already = res.already_ids || [];
+            const text = already.length
+                ? t('dragAssign.addedSome', { added: added.length, already: already.length, category: category.name })
+                : tn('dragAssign.added', added.length, { category: category.name });
+            this.showDropToast({ text, added, category });
+            this.announceCategorized(category, added, []);
+        },
+        // --- Drop onto a collection: same gesture, same toast, own undo -----
+        onCollectionDragOver(e, c) {
+            if (!isItemDrag(e)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = 'copy';
+            this.collectionDropTarget = c.id;
+        },
+        onCollectionDragLeave(c) {
+            if (this.collectionDropTarget === c.id) this.collectionDropTarget = null;
+        },
+        onCollectionDrop(e, c) {
+            if (!isItemDrag(e)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.collectionDropTarget = null;
+            let ids = [];
+            try { ids = JSON.parse(e.dataTransfer.getData(ITEM_DRAG_MIME)); } catch (err) { return; }
+            if (Array.isArray(ids) && ids.length) this.addDroppedToCollection(c, ids);
+        },
+        async addDroppedToCollection(collection, paperIds) {
+            this.endItemDrag();
+            let res;
+            try {
+                res = await api(`/api/collections/${collection.id}/items`, {
+                    method: 'POST', body: JSON.stringify({ paper_ids: paperIds }),
+                });
+            } catch (e) {
+                this.showDropError(e);
+                return;
+            }
+            const added = res.added_ids || [];
+            const already = res.already_ids || [];
+            const text = already.length
+                ? t('dragAssign.collectionAddedSome', { added: added.length, already: already.length, collection: collection.name })
+                : tn('dragAssign.collectionAdded', added.length, { collection: collection.name });
+            this.showDropToast({ text, added, collection });
+            if (added.length) this.announceCollected(collection);
+        },
+        async undoDrop() {
+            const toast = this.dropToast;
+            if (!toast || !toast.added.length) return;
+            this.dropToast = null;
+            clearTimeout(this._toastTimer);
+            if (toast.collection) {
+                // Exactly the items this drop added; the ones already there stay.
+                try {
+                    await api(`/api/collections/${toast.collection.id}/items`, {
+                        method: 'DELETE', body: JSON.stringify({ paper_ids: toast.added }),
+                    });
+                    this.announceCollected(toast.collection);
+                } catch (e) {
+                    this.showDropError(e);
+                }
+                return;
+            }
+            try {
+                const res = await api('/api/papers/categories/remove', {
+                    method: 'POST',
+                    body: JSON.stringify({ paper_ids: toast.added, category_id: toast.category.id }),
+                });
+                this.announceCategorized(toast.category, [], res.removed_ids || []);
+            } catch (e) {
+                this.showDropError(e);
+            }
+        },
+        showDropToast(toast) {
+            clearTimeout(this._toastTimer);
+            this.dropToast = toast;
+            // Long enough to read and reach "Undo"; a new drop replaces it.
+            this._toastTimer = setTimeout(() => { this.dropToast = null; }, 8000);
+        },
+        showDropError(e) {
+            this.showDropToast({ text: t('error.generic', { message: e.message }), added: [] });
+        },
+        // Counts in the sidebar, an open view of that collection.
+        announceCollected(collection) {
+            window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            window.dispatchEvent(new CustomEvent(ITEMS_COLLECTED_EVENT, { detail: { collectionId: collection.id } }));
+        },
+        // Counts in the sidebar, category tags in the list.
+        announceCategorized(category, added, removed) {
+            if (!added.length && !removed.length) return;
+            window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            window.dispatchEvent(new CustomEvent(ITEMS_CATEGORIZED_EVENT, {
+                detail: { categoryId: category.id, name: category.name, added, removed },
+            }));
+        },
         async load() {
             this.loading = true;
-            this.thesisMode = localStorage.getItem('thesisMode') === 'true';
             try {
                 const [tree, stats, categories] = await Promise.all([
                     api('/api/categories/tree'),
@@ -609,13 +1091,15 @@ const Sidebar = {
                 console.error('Sidebar load error:', e);
             }
             this.loading = false;
-            // Custom Icon laden. Auch der Tab bekommt es hier — sonst zeigte er
-            // nach einem Reload wieder das mitgelieferte LocalBib-Icon.
+            // Own request: a failing collections call must not cost the categories.
             try {
-                const iconData = await api('/api/appearance/icon');
-                this.customIcon = iconData.path;
-                if (iconData.path) setFavicon(iconData.path);
-            } catch (e) {}
+                const all = await api('/api/collections?archived=all');
+                this.collections = all.filter(c => !c.archived);
+                this.archivedCollections = all.filter(c => c.archived);
+            } catch (e) {
+                this.collections = [];
+                this.archivedCollections = [];
+            }
             // Add-on nav items (ADR-0021): what the loaded Bundles registered.
             // Their routes come from the Add-on registrations (applyAddons).
             try {
@@ -623,6 +1107,27 @@ const Sidebar = {
                 this.pluginNavItems = data.items || [];
             } catch (e) {
                 this.pluginNavItems = [];
+            }
+        },
+        isCollectionActive(c) {
+            return this.$route.name === 'collection' && parseInt(this.$route.params.id) === c.id;
+        },
+        openNewCollection() {
+            this.newColl = { name: '', description: '', error: '' };
+        },
+        async createCollection() {
+            const draft = this.newColl;
+            if (!draft || !draft.name.trim()) return;
+            try {
+                const created = await api('/api/collections', {
+                    method: 'POST',
+                    body: JSON.stringify({ name: draft.name, description: draft.description }),
+                });
+                this.newColl = null;
+                await this.load();
+                this.$router.push({ name: 'collection', params: { id: created.id } });
+            } catch (e) {
+                draft.error = e.message;
             }
         },
         async createCategory() {
@@ -660,7 +1165,7 @@ const Sidebar = {
             }
         },
         async deleteCategory(node) {
-            if (!confirm(`Kategorie "${node.name}" wirklich loeschen? Unterkategorien werden ebenfalls entfernt.`)) return;
+            if (!confirm(t('categories.deleteConfirm', { name: node.name }) + ' ' + t('categories.deleteChildrenToo'))) return;
             try {
                 await api(`/api/categories/${node.id}`, { method: 'DELETE' });
                 await this.load();
@@ -683,10 +1188,10 @@ const Sidebar = {
             }
             this.llmLoading = false;
         },
+        // The same server setting as Settings -> General (setUiPref puts the
+        // switch back when the save fails).
         toggleTheme() {
-            this.darkMode = !this.darkMode;
-            localStorage.setItem('darkMode', String(this.darkMode));
-            applyDarkMode(this.darkMode);
+            setUiPref('darkMode', !uiPrefs.darkMode).catch(() => {});
         },
         async shutdownServer() {
             if (!confirm(t('app.shutdownConfirm'))) return;
@@ -706,19 +1211,1245 @@ const Sidebar = {
 // PaperList Component
 // =============================================================================
 
+// Refresh Review (routers/refresh_review.py): the library refresh as a
+// preview the user ticks row by row. Nothing is written before "apply", and
+// whatever removes data (a category taken away, a filled field emptied) is
+// painted red and flags its item, so it cannot slip through a "select all".
+// With `paperIds` it covers only those items (the list's selection menu);
+// without, the whole library (Settings → Maintenance).
+const RefreshReview = {
+    // `bare`: the host (Settings → Refresh, block 1) supplies the heading.
+    props: { paperIds: { type: Array, default: null }, scopeLabel: { type: String, default: '' }, bare: { type: Boolean, default: false } },
+    emits: ['applied'],
+    template: `
+        <div :class="paperIds || bare ? '' : 'mb-5 pb-5 border-b border-gray-100'" data-testid="refresh-review">
+            <p v-if="!bare" class="text-sm font-medium text-gray-700 mb-1">{{ $t('refreshReview.heading') }}</p>
+            <p v-if="scopeLabel" class="lb-scope-label mb-1" data-testid="refresh-review-scope">{{ scopeLabel }}</p>
+            <p v-if="paperIds || !bare" class="text-xs text-gray-400 mb-3">
+                <template v-if="paperIds">{{ $t('refreshReview.forSelection', { count: paperIds.length }) }}</template>
+                {{ $t('refreshReview.hint') }}
+            </p>
+            <div class="flex flex-col gap-1.5 mb-3">
+                <label v-for="s in scopeList" :key="s" class="inline-flex items-center gap-2 text-sm text-gray-700">
+                    <input type="checkbox" v-model="scopes[s]" :disabled="running" :data-scope="s"
+                           class="w-4 h-4 rounded border-gray-300 text-accent focus:ring-accent" />
+                    {{ $t('refreshReview.scope.' + s) }}
+                </label>
+            </div>
+            <div class="mb-3">
+                <label class="inline-flex items-center gap-2 text-sm font-medium text-gray-700">
+                    <input type="checkbox" v-model="onlyGaps" :disabled="running" data-testid="refresh-review-only-gaps"
+                           class="w-4 h-4 rounded border-gray-300 text-accent focus:ring-accent" />
+                    {{ $t('refreshReview.onlyGaps') }}
+                </label>
+                <p class="text-xs text-gray-400 mt-1" data-testid="refresh-review-gaps-help">
+                    {{ $t(onlyGaps ? 'refreshReview.onlyGapsOn' : 'refreshReview.onlyGapsOff') }}
+                </p>
+                <p v-if="anyScope && affected !== null" class="lb-set-affects mt-1" data-testid="refresh-review-affected">
+                    {{ $tn('refreshReview.affected', affected) }}
+                </p>
+            </div>
+            <div class="flex items-center gap-3 flex-wrap">
+                <button @click="start" :disabled="running || !anyScope" data-testid="refresh-review-start"
+                        class="flex items-center gap-2 bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-50 transition-colors">
+                    <div v-if="running" class="spinner" style="width:14px;height:14px;border-width:2px;border-color:white transparent transparent transparent"></div>
+                    <span v-else v-html="icons.refresh"></span>
+                    {{ $t('refreshReview.start') }}
+                </button>
+                <button v-if="running" @click="cancel"
+                        class="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50">
+                    {{ $t('common.cancel') }}
+                </button>
+                <button v-if="!running && rows.length && !open" @click="open = true"
+                        class="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50">
+                    {{ $t('refreshReview.reopen') }}
+                </button>
+            </div>
+
+            <div v-if="running" class="mt-4">
+                <div class="flex items-center justify-between text-xs text-gray-500 mb-1">
+                    <span class="truncate">{{ progressText }}</span>
+                    <span>{{ percent }}%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2">
+                    <div class="bg-accent h-2 rounded-full transition-all duration-300" :style="{ width: percent + '%' }"></div>
+                </div>
+            </div>
+            <div class="mt-3 space-y-1 text-xs">
+                <p v-for="w in warnings" :key="w" class="text-red-600">{{ $t('refreshReview.warn.' + w) }}</p>
+                <p v-if="stats && stats.errors" class="text-red-600">{{ $t('refreshReview.errors', { count: stats.errors }) }}</p>
+                <p v-if="stats && stats.no_text" class="text-gray-500">{{ $t('refreshReview.noText', { count: stats.no_text }) }}</p>
+                <p v-if="noChanges" class="text-sm text-accent">{{ $t('refreshReview.noChanges') }}</p>
+                <p v-if="result" class="text-sm text-accent" data-testid="refresh-review-result">
+                    {{ $t('refreshReview.applied', { count: result.applied }) }}
+                    <span v-if="result.skipped.length">{{ $t('refreshReview.skipped', { count: result.skipped.length }) }}</span>
+                </p>
+                <p v-if="error" class="text-red-600">{{ error }}</p>
+            </div>
+
+            <div v-if="open" class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" @click.self="open = false">
+                <div class="bg-white rounded-xl shadow-xl max-w-4xl w-full mx-4 max-h-[90vh] flex flex-col" data-testid="refresh-review-dialog">
+                    <div class="px-6 py-4 border-b border-gray-100">
+                        <div class="flex items-center justify-between gap-3">
+                            <h3 class="text-lg font-semibold text-gray-900">{{ $t('refreshReview.dialogTitle') }}</h3>
+                            <span class="text-sm text-gray-500">{{ $t('refreshReview.selectedCount', { selected: selectedCount, total: rows.length }) }}</span>
+                        </div>
+                        <div class="flex items-center gap-4 mt-3 flex-wrap">
+                            <label class="inline-flex items-center gap-2 text-sm font-medium text-gray-700">
+                                <input type="checkbox" data-testid="refresh-review-select-all"
+                                       :checked="allVisibleSelected" :indeterminate.prop="someVisibleSelected"
+                                       @change="toggleRows(visibleRows, $event.target.checked)"
+                                       class="w-4 h-4 rounded border-gray-300 text-accent focus:ring-accent" />
+                                {{ $t('refreshReview.selectAll') }}
+                            </label>
+                            <div class="flex gap-1 text-xs">
+                                <button v-for="f in filters" :key="f" @click="filter = f" :data-filter="f"
+                                        class="px-2.5 py-1 rounded-full border"
+                                        :class="filter === f ? 'bg-accent text-white border-accent' : 'border-gray-300 text-gray-600 hover:bg-gray-50'">
+                                    {{ $t('refreshReview.filter.' + f) }}
+                                    <span v-if="f === 'removals'">({{ destructiveCount }})</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="px-6 py-4 overflow-y-auto flex-1 space-y-3">
+                        <div v-for="g in groups" :key="g.paper_id" :data-paper="g.paper_id"
+                             class="rounded-lg border"
+                             :class="g.destructive ? 'border-red-300 border-l-4' : 'border-gray-200'">
+                            <label class="flex items-center gap-2 px-3 py-2 border-b"
+                                   :class="g.destructive ? 'bg-red-50 border-red-100' : 'bg-gray-50 border-gray-100'">
+                                <input type="checkbox" :checked="groupAll(g)" :indeterminate.prop="groupSome(g)"
+                                       @change="toggleRows(g.rows, $event.target.checked)"
+                                       class="w-4 h-4 rounded border-gray-300 text-accent focus:ring-accent" />
+                                <span class="text-sm font-medium text-gray-800 flex-1 truncate">{{ g.title }}</span>
+                                <span v-if="g.destructive" data-testid="refresh-review-removes"
+                                      class="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700">
+                                    ⚠ {{ $t('refreshReview.removesData') }}
+                                </span>
+                            </label>
+                            <label v-for="r in g.rows" :key="r.id" :data-row="r.id"
+                                   class="flex items-start gap-3 px-3 py-2 text-sm border-b last:border-b-0 border-gray-100 cursor-pointer"
+                                   :class="isDestructive(r) ? 'bg-red-50' : ''">
+                                <input type="checkbox" v-model="selected[r.id]"
+                                       class="mt-0.5 w-4 h-4 rounded border-gray-300 text-accent focus:ring-accent" />
+                                <span class="w-28 shrink-0 text-gray-500">{{ rowLabel(r) }}</span>
+                                <span class="flex-1 min-w-0 grid grid-cols-2 gap-3">
+                                    <span class="min-w-0 break-words" :class="isDestructive(r) ? 'text-red-700 line-through' : 'text-gray-500'">
+                                        {{ shown(r.before) }}
+                                    </span>
+                                    <span class="min-w-0 break-words">
+                                        <template v-if="r.kind === 'category_remove'">
+                                            <span class="text-xs font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">{{ $t('refreshReview.removed') }}</span>
+                                            <span v-if="r.assigned_by === 'manual'" class="ml-1 text-xs text-red-700">{{ $t('refreshReview.manual') }}</span>
+                                        </template>
+                                        <span v-else-if="r.clears" class="text-xs font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">{{ $t('refreshReview.cleared') }}</span>
+                                        <template v-else>
+                                            <span class="text-gray-900" :class="r.field === 'abstract' ? 'line-clamp-3' : ''">{{ shown(r.after) }}</span>
+                                            <span v-if="r.kind === 'category_add'" class="ml-1 text-xs text-gray-400">{{ Math.round((r.confidence || 0) * 100) }}%</span>
+                                            <span v-if="r.source" class="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">{{ r.source }}</span>
+                                        </template>
+                                    </span>
+                                </span>
+                            </label>
+                        </div>
+                        <p v-if="!groups.length" class="text-sm text-gray-500 italic">{{ $t('refreshReview.nothingInFilter') }}</p>
+                    </div>
+
+                    <div class="px-6 py-4 border-t border-gray-100 flex items-center justify-between gap-3">
+                        <span class="text-xs text-red-700" :class="destructiveSelected ? '' : 'invisible'">
+                            ⚠ {{ $t('refreshReview.destructiveSelected', { count: destructiveSelected }) }}
+                        </span>
+                        <div class="flex gap-2">
+                            <button @click="open = false" class="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50">{{ $t('common.cancel') }}</button>
+                            <button @click="apply" :disabled="applying || !selectedCount" data-testid="refresh-review-apply"
+                                    class="px-4 py-2 text-sm text-white bg-accent rounded-lg hover:bg-accent-ink disabled:opacity-40">
+                                {{ applying ? $t('refreshReview.applying') : $t('refreshReview.apply', { count: selectedCount }) }}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `,
+    data() {
+        return {
+            icons,
+            scopeList: ['categories', 'metadata', 'abstracts'],
+            scopes: { categories: true, metadata: false, abstracts: false },
+            // "Only fill gaps" is the safe default (#210): nothing that is
+            // already there gets reassessed, and nothing is proposed for removal.
+            onlyGaps: true, affected: null,
+            filters: ['all', 'categories', 'metadata', 'removals'],
+            filter: 'all',
+            running: false, controller: null, percent: 0, progressText: '',
+            rows: [], selected: {}, open: false, noChanges: false,
+            warnings: [], stats: null, applying: false, result: null, error: '',
+        };
+    },
+    computed: {
+        anyScope() {
+            return this.scopeList.some(s => this.scopes[s]);
+        },
+        visibleRows() {
+            const f = this.filter;
+            if (f === 'categories') return this.rows.filter(r => r.kind !== 'field');
+            if (f === 'metadata') return this.rows.filter(r => r.kind === 'field');
+            if (f === 'removals') return this.rows.filter(r => this.isDestructive(r));
+            return this.rows;
+        },
+        groups() {
+            const byPaper = new Map();
+            for (const r of this.visibleRows) {
+                if (!byPaper.has(r.paper_id)) byPaper.set(r.paper_id, { paper_id: r.paper_id, title: r.paper_title, rows: [] });
+                byPaper.get(r.paper_id).rows.push(r);
+            }
+            // The flag sits on the item, not on the filtered slice: an item
+            // that loses something stays marked whatever filter is active.
+            const destructive = new Set(this.rows.filter(r => this.isDestructive(r)).map(r => r.paper_id));
+            return [...byPaper.values()].map(g => ({ ...g, destructive: destructive.has(g.paper_id) }));
+        },
+        selectedCount() {
+            return this.rows.filter(r => this.selected[r.id]).length;
+        },
+        destructiveCount() {
+            return this.rows.filter(r => this.isDestructive(r)).length;
+        },
+        destructiveSelected() {
+            return this.rows.filter(r => this.selected[r.id] && this.isDestructive(r)).length;
+        },
+        allVisibleSelected() {
+            return this.visibleRows.length > 0 && this.visibleRows.every(r => this.selected[r.id]);
+        },
+        someVisibleSelected() {
+            return !this.allVisibleSelected && this.visibleRows.some(r => this.selected[r.id]);
+        },
+    },
+    watch: {
+        scopes: { deep: true, handler() { this.loadCount(); } },
+        onlyGaps() { this.loadCount(); },
+    },
+    created() {
+        this.applyPreset();
+        this.loadCount();
+    },
+    activated() {
+        // Back on screen (Settings keeps the section alive): the library may
+        // have changed meanwhile, and a diagnosis jump may carry a preset.
+        this.applyPreset();
+        this.loadCount();
+    },
+    beforeUnmount() {
+        if (this.controller) this.controller.abort();
+    },
+    methods: {
+        // A jump from the Diagnosis (/settings/refresh?scopes=categories&gaps=1)
+        // arrives with the choice made; only the Settings page takes it.
+        applyPreset() {
+            if (this.paperIds || !this.$route) return;
+            const q = this.$route.query || {};
+            if (typeof q.scopes !== 'string') return;
+            const wanted = q.scopes.split(',');
+            this.scopes = Object.fromEntries(this.scopeList.map(s => [s, wanted.includes(s)]));
+            this.onlyGaps = q.gaps !== '0';
+        },
+        // "Affects N items": the database alone answers, before anything is
+        // sent to the LLM. A stale answer never overwrites a newer one.
+        async loadCount() {
+            const chosen = this.scopeList.filter(s => this.scopes[s]);
+            if (!chosen.length) { this.affected = null; return; }
+            const ticket = (this._countTicket = (this._countTicket || 0) + 1);
+            try {
+                const res = await api('/api/maintenance/refresh-review/count', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        scopes: chosen, only_gaps: this.onlyGaps,
+                        ...(this.paperIds ? { paper_ids: this.paperIds } : {}),
+                    }),
+                });
+                if (ticket === this._countTicket) this.affected = res.count;
+            } catch (e) {
+                if (ticket === this._countTicket) this.affected = null;
+            }
+        },
+        isDestructive(r) {
+            return r.kind === 'category_remove' || !!r.clears;
+        },
+        rowLabel(r) {
+            if (r.kind !== 'field') return t('refreshReview.category');
+            const labels = {
+                title: t('common.title'), authors: t('common.authors'), year: t('common.year'),
+                doi: 'DOI', isbn: 'ISBN', abstract: t('common.abstract'),
+                journal: t('common.journal'), publisher: t('common.publisher'),
+            };
+            return labels[r.field] || r.field;
+        },
+        shown(v) {
+            return v === null || v === undefined || v === '' ? t('validate.empty') : String(v);
+        },
+        groupAll(g) {
+            return g.rows.every(r => this.selected[r.id]);
+        },
+        groupSome(g) {
+            return !this.groupAll(g) && g.rows.some(r => this.selected[r.id]);
+        },
+        toggleRows(rows, checked) {
+            const next = { ...this.selected };
+            for (const r of rows) next[r.id] = checked;
+            this.selected = next;
+        },
+        async start() {
+            this.running = true;
+            this.percent = 0;
+            this.progressText = '';
+            this.rows = [];
+            this.selected = {};
+            this.open = false;
+            this.noChanges = false;
+            this.warnings = [];
+            this.stats = null;
+            this.result = null;
+            this.error = '';
+            this.controller = new AbortController();
+            try {
+                const resp = await fetch('/api/maintenance/refresh-review/propose', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scopes: this.scopeList.filter(s => this.scopes[s]),
+                        only_gaps: this.onlyGaps,
+                        ...(this.paperIds ? { paper_ids: this.paperIds } : {}),
+                    }),
+                    signal: this.controller.signal,
+                });
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(translateDetail(err.detail, resp.status));
+                }
+                await readSseStream(resp, (evt) => {
+                    if (evt.type === 'progress') {
+                        this.percent = evt.percent || 0;
+                        this.progressText = t('refreshReview.progress', { current: evt.current, total: evt.total, title: evt.title || '' });
+                    } else if (evt.type === 'done') {
+                        // Nothing is pre-ticked: every change is an explicit decision.
+                        this.rows = evt.rows || [];
+                        this.warnings = evt.warnings || [];
+                        this.stats = evt.stats || null;
+                        this.noChanges = this.rows.length === 0;
+                        this.open = this.rows.length > 0;
+                    }
+                });
+            } catch (e) {
+                if (e.name !== 'AbortError') this.error = t('error.generic', { message: e.message });
+            } finally {
+                this.running = false;
+                this.controller = null;
+            }
+        },
+        cancel() {
+            if (this.controller) this.controller.abort();
+        },
+        async apply() {
+            const chosen = this.rows.filter(r => this.selected[r.id]);
+            if (!chosen.length) return;
+            this.applying = true;
+            this.error = '';
+            try {
+                this.result = await api('/api/maintenance/refresh-review/apply', {
+                    method: 'POST',
+                    body: JSON.stringify({ rows: chosen }),
+                });
+                const done = new Set(chosen.map(r => r.id));
+                this.rows = this.rows.filter(r => !done.has(r.id));
+                this.selected = {};
+                this.open = false;
+                this.$emit('applied', this.result);
+                this.loadCount();
+            } catch (e) {
+                this.error = t('error.generic', { message: e.message });
+            } finally {
+                this.applying = false;
+            }
+        },
+    },
+};
+
+// The checks the Diagnosis runs, in the order the "no findings" line names them.
+const DIAGNOSIS_CHECKS = ['missing_pdf', 'orphan_pdf', 'no_pdf', 'arxiv_doi_version',
+    'uncategorized', 'llm_auth', 'llm_unreachable', 'llm_model_missing', 'backup_none', 'backup_overdue'];
+
+// The number on the Diagnosis nav entry: kinds of problem (Finding groups, not
+// items), coloured by the worst one. The frame fills it from the cheap
+// `?llm=false` call when Settings open; the section overwrites it with the
+// full result, so the two never disagree for long.
+function summarizeFindings(findings) {
+    const worst = { error: 3, warning: 2, info: 1 };
+    const kinds = new Map();
+    for (const f of findings) {
+        if (!kinds.has(f.kind) || worst[f.severity] > worst[kinds.get(f.kind)]) kinds.set(f.kind, f.severity);
+    }
+    let severity = null;
+    for (const s of kinds.values()) if (!severity || worst[s] > worst[severity]) severity = s;
+    return { kinds: kinds.size, severity };
+}
+const diagnosisCounter = reactive({
+    kinds: 0, severity: null,
+    set(findings) { Object.assign(this, summarizeFindings(findings)); },
+});
+
+// Library Diagnosis (routers/diagnosis.py): what is broken in the library —
+// a file that vanished, a stray PDF, an LLM key the provider rejects — each
+// with the fixes that apply. Runs when Settings open, so problems are seen
+// without being looked for. Nothing is fixed without a click; deleting asks.
+const LibraryDiagnosis = {
+    emits: ['open-llm-settings'],
+    template: `
+        <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6" data-testid="diagnosis">
+            <div class="lb-set-summary mb-4" data-testid="diagnosis-summary">
+                <div class="flex items-center gap-2 flex-wrap text-sm">
+                    <span class="lb-set-pill" :class="'is-' + (summary.severity || 'info')" data-testid="diagnosis-total">{{ summary.kinds }}</span>
+                    <span v-if="counts.error" class="text-red-700" data-testid="diagnosis-errors">{{ $tn('diagnosis.summary.errors', counts.error) }}</span>
+                    <span v-if="counts.warning" class="text-amber-800" data-testid="diagnosis-warnings">{{ $tn('diagnosis.summary.warnings', counts.warning) }}</span>
+                    <span v-if="counts.info" class="text-gray-600" data-testid="diagnosis-infos">{{ $tn('diagnosis.summary.infos', counts.info) }}</span>
+                    <span v-if="checkedAt" class="text-xs text-gray-400" data-testid="diagnosis-checked">{{ $t('diagnosis.summary.checked', { time: checkedTime }) }}</span>
+                </div>
+                <button @click="run(true)" :disabled="loading" data-testid="diagnosis-run"
+                        class="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-50">
+                    <div v-if="loading" class="spinner" style="width:12px;height:12px;border-width:2px"></div>
+                    <span v-else v-html="icons.refresh"></span>
+                    {{ $t('diagnosis.run') }}
+                </button>
+            </div>
+
+            <p v-if="error" class="text-sm text-red-600 mb-3">{{ error }}</p>
+            <p v-if="loaded && !problemCount && !loading" class="text-sm text-accent" data-testid="diagnosis-ok">
+                ✓ {{ $t('diagnosis.allGood') }}
+            </p>
+
+            <div v-for="g in groups" :key="g.kind" class="mb-3 rounded-lg border" :data-kind="g.kind"
+                 :class="g.severity === 'error' ? 'border-red-300' : g.severity === 'warning' ? 'border-amber-200' : 'border-gray-200'">
+                <button @click="toggle(g.kind)" class="w-full flex items-center gap-2 px-3 py-2 text-left"
+                        :class="g.severity === 'error' ? 'bg-red-50' : g.severity === 'warning' ? 'bg-amber-50' : 'bg-gray-50'">
+                    <span class="text-xs font-semibold px-2 py-0.5 rounded-full"
+                          :class="g.severity === 'error' ? 'bg-red-100 text-red-700' : g.severity === 'warning' ? 'bg-amber-100 text-amber-800' : 'bg-gray-200 text-gray-600'">
+                        {{ $t('diagnosis.severity.' + g.severity) }}
+                    </span>
+                    <span class="text-sm font-medium text-gray-800 flex-1">{{ $t('diagnosis.kind.' + g.kind + '.title') }}</span>
+                    <span class="text-xs text-gray-500" data-testid="diagnosis-group-count">{{ g.count }}</span>
+                    <span class="text-gray-400 text-xs">{{ isOpen(g) ? '▾' : '▸' }}</span>
+                </button>
+                <div v-if="isOpen(g)">
+                    <p class="px-3 pt-2 text-xs text-gray-500">{{ $t('diagnosis.kind.' + g.kind + '.explain') }}</p>
+                    <div v-for="f in g.items" :key="f.id" :data-finding="f.id"
+                         class="px-3 py-2 border-t border-gray-100 first:border-t-0 text-sm">
+                        <div class="flex items-start gap-2 flex-wrap">
+                            <div class="flex-1 min-w-0">
+                                <a v-if="f.paper_id" href="#" @click.prevent="$router.push({ name: 'paper', params: { id: f.paper_id } })"
+                                   class="font-medium text-gray-800 hover:text-accent break-words">{{ f.title }}</a>
+                                <span v-else-if="f.params.filename" class="font-medium text-gray-800 break-all">{{ f.params.filename }}</span>
+                                <span v-else-if="f.params.connection" class="font-medium text-gray-800">{{ f.params.connection }}</span>
+                                <p class="text-xs text-gray-500 break-all">{{ $t('diagnosis.kind.' + f.kind + '.detail', f.params) }}</p>
+                            </div>
+                            <div class="flex items-center gap-1.5 flex-wrap">
+                                <template v-if="f.fixes.includes('assign_file')">
+                                    <select v-model="choice[f.id]" class="text-xs border border-gray-300 rounded px-1.5 py-1 max-w-[14rem]">
+                                        <option :value="null" disabled>{{ $t('diagnosis.choose') }}</option>
+                                        <option v-for="o in options(f)" :key="o.value" :value="o.value">{{ o.label }}</option>
+                                    </select>
+                                </template>
+                                <button v-for="a in f.fixes" :key="a" @click="fix(f, a)"
+                                        :disabled="!!busy[f.id] || (a === 'assign_file' && choice[f.id] == null)"
+                                        :data-fix="a"
+                                        class="px-2.5 py-1 text-xs rounded-md border disabled:opacity-50"
+                                        :class="a === 'delete_item' ? 'border-red-300 text-red-700 hover:bg-red-50' : 'border-gray-300 text-gray-700 hover:bg-gray-50'">
+                                    {{ $t('diagnosis.fix.' + a) }}
+                                </button>
+                            </div>
+                        </div>
+                        <p v-if="messages[f.id]" class="mt-1 text-xs" :class="messages[f.id].ok ? 'text-accent' : 'text-red-600'">
+                            {{ messages[f.id].text }}
+                        </p>
+                    </div>
+                </div>
+            </div>
+            <p v-if="loaded && clean.length" class="text-xs text-gray-400 mt-4" data-testid="diagnosis-clean">
+                {{ $t('diagnosis.noFinding', { checks: clean.join(', ') }) }}
+            </p>
+        </section>
+    `,
+    data() {
+        return {
+            icons, findings: [], loading: false, loaded: false, error: '', checkedAt: null,
+            open: {}, choice: {}, busy: {}, messages: {},
+        };
+    },
+    computed: {
+        groups() {
+            const byKind = new Map();
+            for (const f of this.findings) {
+                if (!byKind.has(f.kind)) byKind.set(f.kind, { kind: f.kind, severity: f.severity, items: [], count: 0 });
+                const g = byKind.get(f.kind);
+                g.items.push(f);
+                // One Finding may stand for many items (uncategorised: params.count).
+                g.count += (f.params && f.params.count) || 1;
+            }
+            return [...byKind.values()];
+        },
+        summary() {
+            return summarizeFindings(this.findings);
+        },
+        counts() {
+            const c = { error: 0, warning: 0, info: 0 };
+            for (const g of this.groups) c[g.severity] += 1;
+            return c;
+        },
+        checkedTime() {
+            return this.checkedAt
+                ? this.checkedAt.toLocaleTimeString(uiLocale(), { hour: '2-digit', minute: '2-digit' })
+                : '';
+        },
+        // The checks that came back clean, by name.
+        clean() {
+            const found = new Set(this.groups.map(g => g.kind));
+            return DIAGNOSIS_CHECKS.filter(k => !found.has(k)).map(k => t('diagnosis.kind.' + k + '.title'));
+        },
+        problemCount() {
+            return this.findings.filter(f => f.severity !== 'info').length;
+        },
+    },
+    mounted() {
+        this.run(true);
+    },
+    methods: {
+        isOpen(g) {
+            // Errors and warnings open by default; the (often long) info list stays folded.
+            return this.open[g.kind] ?? g.severity !== 'info';
+        },
+        toggle(kind) {
+            const g = this.groups.find(x => x.kind === kind);
+            this.open = { ...this.open, [kind]: !this.isOpen(g) };
+        },
+        options(f) {
+            if (f.kind === 'orphan_pdf') return (f.targets || []).map(t => ({ value: t.paper_id, label: t.title }));
+            return (f.candidates || []).map(c => ({ value: c, label: c }));
+        },
+        async run(withLlm) {
+            this.loading = true;
+            this.error = '';
+            try {
+                const res = await api('/api/diagnosis?llm=' + (withLlm ? 'true' : 'false'));
+                // A reload after a fix skips the network probe: keep what it found.
+                const llm = withLlm ? [] : this.findings.filter(f => f.kind.startsWith('llm_'));
+                this.findings = [...llm, ...res.findings];
+                // Only a close match is preselected; otherwise the user picks.
+                const choice = {};
+                for (const f of this.findings) choice[f.id] = f.suggestion ?? null;
+                this.choice = choice;
+                this.loaded = true;
+                this.checkedAt = new Date();
+                // The nav counter follows the section: one number for both.
+                diagnosisCounter.set(this.findings);
+            } catch (e) {
+                this.error = t('error.generic', { message: e.message });
+            } finally {
+                this.loading = false;
+            }
+        },
+        async fix(f, action) {
+            if (action === 'open_llm_settings') {
+                this.$emit('open-llm-settings');
+                return;
+            }
+            if (action === 'open_backup_settings') {
+                this.$router.push('/settings/backup');
+                return;
+            }
+            if (action === 'suggest_categories') {
+                // A navigation fix: Refresh opens with categories ticked and
+                // "only fill gaps" on; the user still starts it and reviews it.
+                this.$router.push({ path: '/settings/refresh', query: { scopes: 'categories', gaps: '1' } });
+                return;
+            }
+            if (action === 'delete_item' && !confirm(t('diagnosis.deleteConfirm', { title: f.title }))) return;
+            const body = { action };
+            if (action === 'assign_file' && f.kind === 'orphan_pdf') {
+                body.file = f.params.filename;
+                body.paper_id = this.choice[f.id];
+            } else if (action === 'to_inbox') {
+                body.file = f.params.filename;
+            } else {
+                body.paper_id = f.paper_id;
+                if (action === 'assign_file') body.file = this.choice[f.id];
+            }
+            this.busy = { ...this.busy, [f.id]: true };
+            try {
+                await api('/api/diagnosis/fix', { method: 'POST', body: JSON.stringify(body) });
+                await this.run(false);
+            } catch (e) {
+                this.messages = { ...this.messages, [f.id]: { ok: false, text: e.message } };
+            } finally {
+                this.busy = { ...this.busy, [f.id]: false };
+            }
+        },
+    },
+};
+
+
+// =============================================================================
+// Collections (Sammlungen, PRD #200)
+// =============================================================================
+
+// The "+" next to Categories in the item detail (handoff task 13): a filter
+// on top, the category tree indented by depth below it, the assigned ones
+// checked and disabled. A click assigns. A filter text that names no
+// category exactly offers "Create “X”" under a chosen parent. Enter assigns
+// the first match or creates; Esc closes.
+function categoryRows(categories) {
+    const byParent = new Map();
+    for (const c of categories || []) {
+        const key = c.parent_id == null ? null : c.parent_id;
+        if (!byParent.has(key)) byParent.set(key, []);
+        byParent.get(key).push(c);
+    }
+    const known = new Set((categories || []).map((c) => c.id));
+    const rows = [];
+    const walk = (parentId, depth, seen) => {
+        const kids = (byParent.get(parentId) || []).slice()
+            .sort((a, b) => a.name.localeCompare(b.name, uiLocale()));
+        for (const c of kids) {
+            if (seen.has(c.id)) continue;  // a damaged cycle never loops
+            seen.add(c.id);
+            rows.push({ id: c.id, name: c.name, depth, parentId: c.parent_id == null ? null : c.parent_id });
+            walk(c.id, depth + 1, seen);
+        }
+    };
+    const seen = new Set();
+    walk(null, 0, seen);
+    // Orphans (a parent that no longer exists) still show, at the top level.
+    for (const c of categories || []) {
+        if (!seen.has(c.id) && !known.has(c.parent_id)) {
+            seen.add(c.id);
+            rows.push({ id: c.id, name: c.name, depth: 0, parentId: null });
+            walk(c.id, 1, seen);
+        }
+    }
+    return rows;
+}
+
+const CategoryPicker = {
+    name: 'CategoryPicker',
+    props: {
+        categories: { type: Array, required: true },
+        assignedIds: { type: Array, default: () => [] },
+        busy: { type: Boolean, default: false },
+    },
+    emits: ['assign', 'create', 'close'],
+    template: `
+        <div class="lb-cat-picker" data-testid="cat-picker" @keydown.esc.stop.prevent="$emit('close')">
+            <input ref="filter" v-model="filter" class="lb-input lb-cat-picker-filter" type="text"
+                   :placeholder="$t('categoryPicker.filter')" :aria-label="$t('categoryPicker.filter')"
+                   data-testid="cat-picker-filter" @keydown.enter.prevent="onEnter" />
+            <div class="lb-cat-picker-list" role="listbox">
+                <button v-for="row in rows" :key="row.id" type="button" role="option"
+                        class="lb-cat-picker-row" :class="{ 'is-assigned': row.assigned, 'is-context': !row.match }"
+                        :style="{ paddingLeft: (8 + row.depth * 14) + 'px' }"
+                        :disabled="row.assigned || busy" :aria-selected="row.assigned"
+                        :data-testid="'cat-picker-row-' + row.id" @click="$emit('assign', row.id)">
+                    <span class="lb-cat-picker-check" aria-hidden="true">{{ row.assigned ? '✓' : '' }}</span>
+                    <span class="lb-truncate">{{ row.name }}</span>
+                </button>
+                <div v-if="!rows.length" class="lb-cat-picker-empty">{{ $t('categoryPicker.noMatch') }}</div>
+            </div>
+            <div v-if="canCreate" class="lb-cat-picker-create" data-testid="cat-picker-create-box">
+                <label class="lb-cat-picker-label">{{ $t('categoryPicker.parent') }}
+                    <select v-model="parentId" class="lb-input" data-testid="cat-picker-parent">
+                        <option value="">{{ $t('categoryPicker.topLevel') }}</option>
+                        <option v-for="row in allRows" :key="row.id" :value="String(row.id)">{{ '  '.repeat(row.depth) + row.name }}</option>
+                    </select>
+                </label>
+                <button type="button" class="lb-btn lb-btn-primary" :disabled="busy"
+                        data-testid="cat-picker-create" @click="create">{{ $t('categoryPicker.create', { name: trimmed }) }}</button>
+            </div>
+        </div>
+    `,
+    data() {
+        return { filter: '', parentId: '' };
+    },
+    mounted() {
+        this.$nextTick(() => { if (this.$refs.filter) this.$refs.filter.focus(); });
+    },
+    computed: {
+        trimmed() {
+            return this.filter.trim();
+        },
+        allRows() {
+            return categoryRows(this.categories);
+        },
+        // Matching rows plus their ancestors (as context), in tree order.
+        rows() {
+            const assigned = new Set(this.assignedIds);
+            const needle = this.trimmed.toLocaleLowerCase(uiLocale());
+            const all = this.allRows.map((r) => ({
+                ...r, assigned: assigned.has(r.id),
+                match: !needle || r.name.toLocaleLowerCase(uiLocale()).includes(needle),
+            }));
+            if (!needle) return all;
+            const keep = new Set();
+            const byId = new Map(all.map((r) => [r.id, r]));
+            for (const r of all) {
+                if (!r.match) continue;
+                let cur = r;
+                while (cur && !keep.has(cur.id)) {
+                    keep.add(cur.id);
+                    cur = cur.parentId == null ? null : byId.get(cur.parentId);
+                }
+            }
+            return all.filter((r) => keep.has(r.id));
+        },
+        canCreate() {
+            if (!this.trimmed) return false;
+            const name = this.trimmed.toLocaleLowerCase(uiLocale());
+            return !this.allRows.some((r) => r.name.toLocaleLowerCase(uiLocale()) === name);
+        },
+    },
+    methods: {
+        onEnter() {
+            if (this.busy) return;
+            const first = this.trimmed && this.rows.find((r) => r.match && !r.assigned);
+            if (first) this.$emit('assign', first.id);
+            else if (this.canCreate) this.create();
+        },
+        create() {
+            if (!this.canCreate || this.busy) return;
+            this.$emit('create', { name: this.trimmed, parentId: this.parentId ? parseInt(this.parentId) : null });
+        },
+    },
+};
+
+// "Add to collection" for one or many Items: pick an active Collection or name
+// a new one, which is then created with the Items in one request. Adding is
+// idempotent on the server, so Items already in are reported, never an error.
+const CollectionPicker = {
+    props: { paperIds: { type: Array, required: true } },
+    emits: ['close', 'done'],
+    template: `
+        <div class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" @click.self="$emit('close')">
+            <div class="bg-white rounded-xl shadow-xl max-w-md w-full mx-4 p-6" data-testid="collection-picker">
+                <h4 class="text-base font-semibold text-gray-900 mb-4">{{ $tn('collections.picker.heading', paperIds.length) }}</h4>
+                <div v-if="loading" class="flex justify-center py-4"><div class="spinner"></div></div>
+                <div v-else class="lb-coll-picker-list">
+                    <label v-for="c in collections" :key="c.id" class="lb-coll-picker-opt"
+                           data-testid="collection-picker-option" :data-collection-id="c.id">
+                        <input type="radio" :value="c.id" v-model="choice" />
+                        <span class="lb-cat-name">{{ c.name }}</span>
+                        <span class="lb-cat-count">{{ c.item_count }}</span>
+                    </label>
+                    <label class="lb-coll-picker-opt">
+                        <input type="radio" value="new" v-model="choice" data-testid="collection-picker-new" />
+                        <span>{{ $t('collections.picker.newOption') }}</span>
+                    </label>
+                    <input v-if="choice === 'new'" v-model="newName" class="lb-input"
+                           data-testid="collection-picker-new-name"
+                           :placeholder="$t('collections.namePlaceholder')" @keyup.enter="confirm" />
+                </div>
+                <p v-if="error" class="text-xs mt-2" style="color: var(--lb-danger);" data-testid="collection-picker-error">{{ error }}</p>
+                <div class="flex justify-end gap-2 mt-5">
+                    <button @click="$emit('close')" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">{{ $t('common.cancel') }}</button>
+                    <button @click="confirm" :disabled="busy || loading || !canConfirm" data-testid="collection-picker-confirm"
+                            class="bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-40">
+                        {{ $t('collections.picker.confirm') }}
+                    </button>
+                </div>
+            </div>
+        </div>
+    `,
+    data() {
+        return { collections: [], loading: true, choice: null, newName: '', busy: false, error: '' };
+    },
+    computed: {
+        canConfirm() {
+            return this.choice === 'new' ? !!this.newName.trim() : this.choice !== null;
+        },
+    },
+    async created() {
+        try {
+            this.collections = await api('/api/collections');
+        } catch (e) {
+            this.collections = [];
+        }
+        this.choice = this.collections.length ? null : 'new';
+        this.loading = false;
+    },
+    methods: {
+        async confirm() {
+            if (!this.canConfirm || this.busy) return;
+            this.busy = true;
+            this.error = '';
+            try {
+                let collection, res;
+                if (this.choice === 'new') {
+                    res = await api('/api/collections', {
+                        method: 'POST',
+                        body: JSON.stringify({ name: this.newName, paper_ids: this.paperIds }),
+                    });
+                    collection = { id: res.id, name: res.name };
+                } else {
+                    collection = this.collections.find(c => c.id === this.choice);
+                    res = await api(`/api/collections/${collection.id}/items`, {
+                        method: 'POST',
+                        body: JSON.stringify({ paper_ids: this.paperIds }),
+                    });
+                }
+                const added = res.added_ids || [];
+                const already = res.already_ids || [];
+                const text = already.length
+                    ? t('collections.addedSome', { added: added.length, already: already.length, name: collection.name })
+                    : tn('collections.added', added.length, { name: collection.name });
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+                this.$emit('done', { collection, added, already, text });
+            } catch (e) {
+                this.error = e.message;
+            } finally {
+                this.busy = false;
+            }
+        },
+    },
+};
+
+// BibTeX/.tex import into a Collection (#203). A .bib (optionally filtered
+// to the keys a .tex cites) is previewed, then committed into the target
+// Collection — an existing one or a new one by name. Every Item of the import
+// lands there, created and already present alike. A re-import into a
+// Collection that has members reports the ones the manuscript no longer cites
+// as a suggestion; they are removed only when the user ticks them and clicks.
+const BibImportDialog = {
+    props: { collectionId: { type: [Number, String], default: null } },
+    emits: ['close', 'done'],
+    template: `
+        <div class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" @click.self="close">
+            <div class="bg-white rounded-xl shadow-xl max-w-lg w-full mx-4 p-6 max-h-[90vh] overflow-y-auto" data-testid="bib-import">
+                <h4 class="text-base font-semibold text-gray-900 mb-1">{{ $t('bibImport.heading') }}</h4>
+                <p class="text-xs text-gray-500 mb-4">{{ $t('bibImport.hint') }}</p>
+
+                <template v-if="phase === 'pick'">
+                    <label class="lb-field-label block mb-1">{{ $t('bibImport.bibFile') }}</label>
+                    <input type="file" accept=".bib,.bibtex" class="lb-input w-full mb-3" data-testid="bib-import-bib"
+                           @change="bibFile = $event.target.files[0] || null" />
+                    <label class="lb-field-label block mb-1">{{ $t('bibImport.texFile') }}</label>
+                    <input type="file" accept=".tex" class="lb-input w-full mb-1" data-testid="bib-import-tex"
+                           @change="texFile = $event.target.files[0] || null" />
+                    <p class="text-xs text-gray-400 mb-3">{{ $t('bibImport.texHint') }}</p>
+                    <label class="lb-field-label block mb-1">{{ $t('import.target.heading') }}</label>
+                    <select v-model="target" class="lb-input w-full" data-testid="bib-import-target">
+                        <option v-for="c in collections" :key="c.id" :value="String(c.id)">{{ c.name }}</option>
+                        <option value="new">{{ $t('import.target.new') }}</option>
+                    </select>
+                    <input v-if="target === 'new'" v-model="newName" class="lb-input w-full mt-2"
+                           data-testid="bib-import-new-name" :placeholder="$t('collections.namePlaceholder')" />
+                    <label class="flex items-center gap-2 text-sm text-gray-700 mt-3">
+                        <input type="checkbox" v-model="fetchOa" data-testid="bib-import-oa" />
+                        {{ $t('bibImport.fetchOa') }}
+                    </label>
+                </template>
+
+                <template v-else-if="phase === 'preview'">
+                    <p class="text-sm text-gray-700 mb-2" data-testid="bib-import-summary">
+                        {{ $t('bibImport.summary', { total: toImport.length, matched: matchedCount, created: toImport.length - matchedCount }) }}
+                    </p>
+                    <p v-if="preview.cited_count !== null" class="text-xs text-gray-500 mb-2">
+                        {{ $t('bibImport.citedOnly', { cited: preview.cited_count, total: preview.total }) }}
+                    </p>
+                    <ul class="lb-coll-picker-list mb-2" data-testid="bib-import-entries">
+                        <li v-for="e in toImport" :key="e.key" class="text-xs text-gray-600 truncate">
+                            <span class="lb-pill mr-1">{{ e.match ? $t('bibImport.inLibrary') : $t('bibImport.new') }}</span>{{ e.title || e.key }}
+                        </li>
+                    </ul>
+                    <p class="text-xs text-gray-500">{{ $t('bibImport.into', { name: targetName }) }}</p>
+                </template>
+
+                <div v-else-if="phase === 'busy'" class="flex items-center gap-2 py-4 text-sm text-gray-600">
+                    <div class="spinner"></div><span>{{ busyText }}</span>
+                </div>
+
+                <template v-else-if="phase === 'result'">
+                    <p class="text-sm text-gray-700" data-testid="bib-import-result">
+                        {{ $t('bibImport.result', { created: result.created, matched: result.matched, name: result.collection.name }) }}
+                    </p>
+                    <p v-if="result.errors" class="text-xs mt-1" style="color: var(--lb-danger);">{{ $tn('bibImport.errors', result.errors) }}</p>
+                    <p v-if="oaTried" class="text-xs text-gray-500 mt-1" data-testid="bib-import-oa-result">{{ $t('bibImport.oaResult', { n: oaFetched, total: oaTried }) }}</p>
+                    <div v-if="notCited.length" class="mt-4" data-testid="bib-import-not-cited">
+                        <h5 class="text-sm font-semibold text-gray-900">{{ $tn('bibImport.notCited.heading', notCited.length) }}</h5>
+                        <p class="text-xs text-gray-500 mb-2">{{ $t('bibImport.notCited.hint') }}</p>
+                        <label v-for="item in notCited" :key="item.paper_id" class="lb-coll-picker-opt"
+                               data-testid="bib-import-not-cited-item" :data-paper-id="item.paper_id">
+                            <input type="checkbox" :value="item.paper_id" v-model="removeIds" />
+                            <span class="lb-cat-name">{{ item.title || item.cite_key }}</span>
+                            <span class="lb-cat-count">{{ item.cite_key }}</span>
+                        </label>
+                        <button class="lb-btn lb-btn-ghost lb-coll-danger mt-2" :disabled="!removeIds.length || busy"
+                                data-testid="bib-import-remove" @click="removeNotCited">
+                            {{ $tn('bibImport.notCited.remove', removeIds.length) }}
+                        </button>
+                    </div>
+                    <p v-if="removedText" class="text-xs text-gray-500 mt-2" data-testid="bib-import-removed">{{ removedText }}</p>
+                </template>
+
+                <p v-if="error" class="text-xs mt-2" style="color: var(--lb-danger);" data-testid="bib-import-error">{{ error }}</p>
+                <div class="flex justify-end gap-2 mt-5">
+                    <button v-if="phase !== 'busy'" @click="close" class="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">
+                        {{ phase === 'result' ? $t('common.close') : $t('common.cancel') }}
+                    </button>
+                    <button v-if="phase === 'pick'" @click="runPreview" :disabled="!canPreview" data-testid="bib-import-preview"
+                            class="bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-40">
+                        {{ $t('bibImport.previewAction') }}
+                    </button>
+                    <button v-if="phase === 'preview'" @click="commit" :disabled="!toImport.length" data-testid="bib-import-commit"
+                            class="bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-40">
+                        {{ $t('bibImport.commitAction') }}
+                    </button>
+                </div>
+            </div>
+        </div>
+    `,
+    data() {
+        return {
+            phase: 'pick', collections: [], target: '', newName: '', bibFile: null, texFile: null,
+            fetchOa: true, preview: null, result: null, notCited: [], removeIds: [], removedText: '',
+            oaTried: 0, oaFetched: 0, busy: false, busyText: '', error: '',
+        };
+    },
+    computed: {
+        canPreview() {
+            if (!this.bibFile) return false;
+            return this.target === 'new' ? !!this.newName.trim() : !!this.target;
+        },
+        toImport() {
+            if (!this.preview) return [];
+            const entries = this.preview.entries || [];
+            return this.preview.cited_count !== null ? entries.filter(e => e.cited) : entries;
+        },
+        matchedCount() {
+            return this.toImport.filter(e => e.match).length;
+        },
+        targetName() {
+            if (this.target === 'new') return this.newName.trim();
+            const c = this.collections.find(x => String(x.id) === this.target);
+            return c ? c.name : '';
+        },
+    },
+    async created() {
+        try {
+            this.collections = await api('/api/collections');
+        } catch (e) {
+            this.collections = [];
+        }
+        const wanted = this.collectionId !== null && this.collectionId !== undefined ? String(this.collectionId) : '';
+        if (wanted && this.collections.some(c => String(c.id) === wanted)) this.target = wanted;
+        else this.target = this.collections.length ? String(this.collections[0].id) : 'new';
+    },
+    methods: {
+        close() {
+            if (this.phase === 'result') this.$emit('done', this.result);
+            this.$emit('close');
+        },
+        async runPreview() {
+            this.error = '';
+            const form = new FormData();
+            form.append('bib_file', this.bibFile);
+            if (this.texFile) form.append('tex_file', this.texFile);
+            this.phase = 'busy';
+            this.busyText = t('bibImport.reading');
+            try {
+                const resp = await fetch('/api/import/bibtex/preview', { method: 'POST', body: form });
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(translateDetail(err.detail, resp.status));
+                }
+                this.preview = await resp.json();
+                this.phase = 'preview';
+            } catch (e) {
+                this.error = e.message;
+                this.phase = 'pick';
+            }
+        },
+        async commit() {
+            this.error = '';
+            this.phase = 'busy';
+            this.busyText = t('bibImport.importing');
+            const body = {
+                source_name: this.bibFile ? this.bibFile.name : '',
+                entries: this.toImport.map(e => ({
+                    key: e.key, title: e.title || '', authors: e.authors || '', year: e.year || null,
+                    doi: e.doi || '', isbn: e.isbn || '', abstract: e.abstract || '', journal: e.journal || '',
+                    publisher: e.publisher || '', entry_type: e.entry_type || 'misc',
+                    matched_paper_id: e.match ? e.match.paper_id : null, raw: e.raw || {},
+                })),
+            };
+            if (this.target === 'new') body.new_collection_name = this.newName;
+            else body.collection_id = Number(this.target);
+            try {
+                this.result = await api('/api/import/bibtex/commit', { method: 'POST', body: JSON.stringify(body) });
+            } catch (e) {
+                this.error = e.message;
+                this.phase = 'preview';
+                return;
+            }
+            this.notCited = this.result.collection.not_cited || [];
+            this.removeIds = this.notCited.map(i => i.paper_id);
+            if (this.fetchOa) await this.fetchOaPdfs();
+            this.phase = 'result';
+            window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+        },
+        // Best effort, like the import always did: an open-access PDF for
+        // every Item this import created. A failure costs only that PDF.
+        async fetchOaPdfs() {
+            const created = (this.result.results || []).filter(r => r.status === 'created');
+            if (!created.length) return;
+            this.busyText = t('bibImport.fetchingOa');
+            const byId = Object.fromEntries(this.toImport.map(e => [e.key, e]));
+            try {
+                const check = await api('/api/import/bibtex/oa-check', {
+                    method: 'POST',
+                    body: JSON.stringify({ items: created.map(r => ({
+                        paper_id: r.paper_id, doi: r.doi || '', title: (byId[r.key] || {}).title || '',
+                    })) }),
+                });
+                for (const hit of (check.results || []).filter(r => r.oa_pdf_url)) {
+                    this.oaTried++;
+                    try {
+                        await api(`/api/papers/${hit.paper_id}/fetch-oa-pdf`, {
+                            method: 'POST', body: JSON.stringify({ url: hit.oa_pdf_url }),
+                        });
+                        this.oaFetched++;
+                    } catch (e) { /* this one stays without PDF */ }
+                }
+            } catch (e) { /* OpenAlex unreachable: the Items are imported anyway */ }
+        },
+        async removeNotCited() {
+            if (!this.removeIds.length || this.busy) return;
+            this.busy = true;
+            this.error = '';
+            const c = this.result.collection;
+            try {
+                const res = await api(`/api/collections/${c.id}/items`, {
+                    method: 'DELETE', body: JSON.stringify({ paper_ids: this.removeIds }),
+                });
+                const removed = res.removed_ids || [];
+                this.notCited = this.notCited.filter(i => !removed.includes(i.paper_id));
+                this.removeIds = [];
+                this.removedText = tn('collections.removed', removed.length, { name: c.name });
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            } catch (e) {
+                this.error = e.message;
+            } finally {
+                this.busy = false;
+            }
+        },
+    },
+};
+
+// --- Export menu (#202, #212) -------------------------------------------------
+// One menu for the Collection page and the item list: same formats, same
+// handling. `ids === null` means "the server resolves `query`" (plain links,
+// the GET form); an array means "exactly these Items" and goes in a POST body,
+// because a long list does not fit a URL. The head names scope and count.
+const ExportMenu = {
+    name: 'ExportMenu',
+    props: {
+        prefix: { type: String, default: 'export' },
+        query: { type: String, default: '' },
+        ids: { type: Array, default: null },
+        scopeLabel: { type: String, default: '' },
+        disabled: { type: Boolean, default: false },
+        // The item list's page head wears it as a key and at its right edge.
+        buttonClass: { type: String, default: 'lb-btn lb-btn-ghost' },
+        alignRight: { type: Boolean, default: false },
+        // Inline: no button of its own, just the formats as items of a menu
+        // that hosts it (the Collection head's "more" menu); `done` after a pick.
+        inline: { type: Boolean, default: false },
+    },
+    emits: ['done'],
+    template: `
+        <div v-if="inline" class="lb-menu-group" role="group" :aria-label="$t('export.button')"
+             :data-testid="prefix + '-export-menu'">
+            <div class="lb-menu-h">
+                <span>{{ $t('export.button') }}</span>
+                <span class="lb-menu-h-scope" :data-testid="prefix + '-export-scope'">{{ scopeLabel }}</span>
+            </div>
+            <template v-for="f in formats" :key="f">
+                <button v-if="ids" type="button" role="menuitem" class="lb-menu-item" :disabled="disabled"
+                        :data-testid="prefix + '-export-' + f" @click="download(f); $emit('done')">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>
+                    {{ $t('export.format.' + f) }}
+                </button>
+                <a v-else role="menuitem" class="lb-menu-item" :href="'/api/export/' + f + (query ? '?' + query : '')" download
+                   :data-testid="prefix + '-export-' + f" @click="$emit('done')">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12M7 11l5 5 5-5M4 20h16"/></svg>
+                    {{ $t('export.format.' + f) }}
+                </a>
+            </template>
+        </div>
+        <div v-else class="lb-coll-export">
+            <button :class="buttonClass" :disabled="disabled" @click="open = !open"
+                    :data-testid="prefix + '-action-export'">{{ $t('export.button') }} &#9662;</button>
+            <div v-if="open" class="lb-coll-export-menu" :class="{ 'is-right': alignRight }" :data-testid="prefix + '-export-menu'">
+                <div class="lb-coll-export-head" :data-testid="prefix + '-export-scope'">{{ scopeLabel }}</div>
+                <template v-for="f in formats" :key="f">
+                    <button v-if="ids" type="button" :data-testid="prefix + '-export-' + f"
+                            @click="download(f)">{{ $t('export.format.' + f) }}</button>
+                    <a v-else :href="'/api/export/' + f + (query ? '?' + query : '')" download
+                       :data-testid="prefix + '-export-' + f" @click="open = false">{{ $t('export.format.' + f) }}</a>
+                </template>
+            </div>
+        </div>
+    `,
+    data() {
+        return { open: false, formats: ['bibtex', 'ris', 'csv', 'zip'] };
+    },
+    methods: {
+        async download(fmt) {
+            this.open = false;
+            try {
+                const resp = await fetch('/api/export/' + fmt, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ids: this.ids }),
+                });
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    throw new Error(translateDetail(err.detail, resp.status));
+                }
+                const blob = await resp.blob();
+                const named = /filename="?([^";]+)"?/.exec(resp.headers.get('Content-Disposition') || '');
+                const href = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = href;
+                a.download = named ? named[1] : 'literatur_export.' + (fmt === 'bibtex' ? 'bib' : fmt);
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(href), 1000);
+            } catch (e) {
+                alert(t('export.failed', { message: e.message }));
+            }
+        },
+    },
+};
+
+// One pill of the item list's filter bar: [Label  value  ▾] plus its popover
+// (the default slot). A pill never changes its width: the value always shows,
+// in a mono slot sized in `ch` to its longest possible text, and the clear ×
+// lies exactly over the chevron's fixed slot. Active only recolours. Which
+// popover is open, Esc and the outside click belong to the list (one of each).
+const FilterPill = {
+    name: 'FilterPill',
+    inheritAttrs: false,
+    props: {
+        popKey: { type: String, required: true },
+        label: { type: String, default: '' },
+        value: { type: String, default: '' },
+        valueCh: { type: Number, default: 4 },
+        active: { type: Boolean, default: false },
+        open: { type: Boolean, default: false },
+        disabled: { type: Boolean, default: false },
+        // Semantic mode: the filter is kept but has no effect, so the pill
+        // must not look effective - disabled, no accent, no ×, a tooltip.
+        locked: { type: Boolean, default: false },
+        tip: { type: String, default: '' },
+        alignRight: { type: Boolean, default: false },
+        // Names the popover when the pill shows no label (the sort pill).
+        popLabel: { type: String, default: '' },
+    },
+    emits: ['toggle', 'clear', 'close'],
+    template: `
+        <div class="lb-fbar-pw" :class="{ 'is-active': effective }" :data-fbar-key="popKey"
+             :title="tip || null" @focusout="onFocusOut">
+            <button type="button" class="lb-fbar-pill" data-fbar-trigger v-bind="$attrs" :disabled="disabled || locked"
+                    aria-haspopup="dialog" :aria-expanded="open ? 'true' : 'false'" :aria-controls="popId"
+                    @click="$emit('toggle')">
+                <slot name="lead"></slot>
+                <span v-if="label" class="lb-fbar-pl">{{ label }}</span>
+                <span class="lb-fbar-pv" :style="{ width: valueCh + 'ch' }"
+                      :title="value.length > valueCh ? value : null">{{ value }}</span>
+                <span class="lb-fbar-cs" aria-hidden="true">
+                    <svg class="lb-fbar-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                </span>
+            </button>
+            <button v-if="effective" type="button" class="lb-fbar-clr"
+                    :aria-label="$t('filters.clearOne', { name: label })" @click="$emit('clear')">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+            </button>
+            <div v-if="open" :id="popId" class="lb-fbar-pop" :class="{ 'is-right': alignRight }"
+                 role="dialog" :aria-label="popLabel || label || null">
+                <slot></slot>
+            </div>
+        </div>
+    `,
+    computed: {
+        popId() { return 'lb-fbar-pop-' + this.popKey; },
+        effective() { return this.active && !this.locked; },
+    },
+    methods: {
+        // Tabbing out of an open popover closes it; a click on its own
+        // non-focusable parts (relatedTarget null) does not.
+        onFocusOut(e) {
+            if (this.open && e.relatedTarget && !this.$el.contains(e.relatedTarget)) this.$emit('close');
+        },
+    },
+};
+
+// The focusable controls of an open popover, in order; roving radios that are
+// not checked (tabindex -1) are skipped, so a radio list lands on its choice.
+const FBAR_FOCUSABLE = 'input:not([disabled]), select:not([disabled]), textarea:not([disabled]), '
+    + 'button:not([disabled]):not([tabindex="-1"]), [tabindex="0"]';
+
+// The item list's filters with nothing set. A year bound sitting on the
+// list's own min/max is no filter: it is stored as null, never as the bound.
+function emptyListFilters() {
+    return {
+        yearFrom: null, yearTo: null, categoryId: '', collectionId: '', hasDoi: '', importSource: '', hasPdf: '',
+        // Add-on filter selections (#190): add-on id -> { value, label, citeKeys }.
+        addonSelections: {},
+    };
+}
+
 const PaperList = {
+    components: { RefreshReview, CollectionPicker, BibImportDialog, ExportMenu, FilterPill },
     template: `
         <div class="lb-view lb-papers">
-            <!-- Page Head -->
-            <header class="lb-page-head">
+            <!-- Page head. On a Collection's page it is the Collection's own
+                 head (#201, #202): description and one meta line on the left,
+                 its actions on the right - two keys and two menus. -->
+            <header class="lb-page-head" :class="{ 'is-collection': collectionHead }"
+                    :data-testid="collectionHead ? 'collection-head' : null">
                 <div class="lb-page-head-l">
                     <div class="lb-eyebrow">
                         <span v-if="heading.color" class="lb-eyebrow-dot" :style="{ background: heading.color }"></span>
                         {{ heading.eyebrow }}
+                        <span v-if="collectionHead && collection.archived" class="lb-pill"
+                              data-testid="collection-archived">{{ $t('collections.archivedBadge') }}</span>
                     </div>
-                    <h1 class="lb-page-title">{{ heading.title }}</h1>
+                    <div v-if="collectionHead && collectionEdit" class="lb-coll-edit">
+                        <input v-model="collectionEdit.name" class="lb-input lb-coll-edit-name" data-testid="collection-edit-name"
+                               :placeholder="$t('collections.namePlaceholder')" />
+                        <textarea v-model="collectionEdit.description" class="lb-input" rows="2"
+                                  :placeholder="$t('collections.descriptionPlaceholder')"></textarea>
+                        <div class="lb-coll-head-actions">
+                            <button class="lb-btn lb-btn-primary" @click="saveCollectionEdit" data-testid="collection-edit-save">{{ $t('common.save') }}</button>
+                            <button class="lb-btn lb-btn-ghost" @click="collectionEdit = null">{{ $t('common.cancel') }}</button>
+                        </div>
+                    </div>
+                    <template v-else>
+                        <h1 class="lb-page-title">{{ heading.title }}</h1>
+                        <p v-if="collectionHead && collection.description" class="lb-coll-desc"
+                           data-testid="collection-description">{{ collection.description }}</p>
+                    </template>
                     <div class="lb-page-meta">
-                        {{ $tn('common.itemCount', resultCount) }}
+                        <span :data-testid="collectionHead ? 'collection-count' : null">{{ countLabel }}</span>
+                        <template v-if="collectionHead">
+                            <span class="lb-page-meta-sep">&middot;</span>
+                            <span data-testid="collection-pdf-coverage">{{ $t('collections.pdfCoverage', { pdf: collection.pdf_count, total: collection.item_count, percent: pdfPercent }) }}</span>
+                        </template>
                         <template v-if="searchQuery">
                             <span class="lb-page-meta-sep">&middot;</span>
                             <span>{{ $t('search.forQuery', { query: searchQuery }) }}</span>
@@ -729,137 +2460,312 @@ const PaperList = {
                         </template>
                     </div>
                 </div>
-                <div class="lb-page-head-r">
-                    <button v-if="semanticAvailable" class="lb-btn lb-btn-ghost" :class="{ 'is-on': semanticMode }"
-                            @click="toggleSemantic" :title="$t('search.semanticToggleTitle')"
-                            data-testid="semantic-toggle">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3m0 12v3m9-9h-3M6 12H3m14.5-6.5-2 2m-9 9-2 2m0-13 2 2m9 9 2 2"/></svg>
-                        {{ $t('search.semantic') }}
-                    </button>
-                    <div class="lb-search">
-                        <span class="lb-search-icon" v-html="icons.search"></span>
-                        <input v-model="searchQuery" @input="debouncedSearch"
-                               type="text" :placeholder="$t('papers.searchPlaceholder')"
-                               class="lb-search-input" />
-                        <button v-if="searchQuery" @click="clearSearch" class="lb-search-clear" :aria-label="$t('search.clear')">
-                            <span v-html="icons.x"></span>
+                <div class="lb-page-head-r" :data-testid="collectionHead ? 'collection-actions' : null">
+                    <!-- The Collection's actions (#202): chat and network as keys,
+                         adding items behind "Add", the rest behind "more". -->
+                    <template v-if="collectionHead">
+                        <button type="button" class="lb-key lb-key-primary" data-testid="collection-action-chat"
+                                :disabled="!collection.item_count || collectionBusy" @click="collectionChat">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                            {{ $t('collections.actions.chat') }}
                         </button>
-                    </div>
+                        <button type="button" class="lb-key" data-testid="collection-action-network" :disabled="!collection.item_count"
+                                @click="$router.push({ name: 'analyse', query: { collection_id: collection.id } })">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="8" r="2.5"/><circle cx="10" cy="18" r="2.5"/><path d="M8.4 6.6l7.2 1M6.8 8.4l2.3 7.2M16.4 10l-4.8 6"/></svg>
+                            {{ $t('collections.actions.network') }}
+                        </button>
+                        <div class="lb-menu-w" data-fbar-key="coll-add" @focusout="onMenuFocusOut($event, 'coll-add')">
+                            <button type="button" class="lb-key" data-fbar-trigger data-testid="collection-action-add"
+                                    aria-haspopup="menu" :aria-expanded="openPop === 'coll-add' ? 'true' : 'false'"
+                                    aria-controls="lb-fbar-pop-coll-add" @click="togglePop('coll-add')">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+                                {{ $t('common.add') }}
+                                <svg class="lb-key-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                            </button>
+                            <div v-if="openPop === 'coll-add'" id="lb-fbar-pop-coll-add" class="lb-fbar-pop is-right lb-menu"
+                                 role="menu" :aria-label="$t('common.add')" data-testid="collection-import-actions" @keydown="onMenuKeys">
+                                <button type="button" role="menuitem" class="lb-menu-item" data-testid="collection-action-upload"
+                                        @click="menuPick(() => $router.push({ name: 'import', query: { collection: collection.id } }))">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+                                    {{ $t('collections.actions.upload') }}
+                                </button>
+                                <button type="button" role="menuitem" class="lb-menu-item" data-testid="collection-action-bib-import"
+                                        @click="menuPick(() => { showBibImport = true; })">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg>
+                                    {{ $t('collections.actions.bibImport') }}
+                                </button>
+                            </div>
+                        </div>
+                        <div class="lb-menu-w" data-fbar-key="coll-more" @focusout="onMenuFocusOut($event, 'coll-more')">
+                            <button type="button" class="lb-key lb-key-icon" data-fbar-trigger data-testid="collection-action-more"
+                                    aria-haspopup="menu" :aria-expanded="openPop === 'coll-more' ? 'true' : 'false'"
+                                    aria-controls="lb-fbar-pop-coll-more" :aria-label="$t('collections.actions.more')"
+                                    :title="$t('collections.actions.more')" @click="togglePop('coll-more')">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+                            </button>
+                            <div v-if="openPop === 'coll-more'" id="lb-fbar-pop-coll-more" class="lb-fbar-pop is-right lb-menu"
+                                 role="menu" :aria-label="$t('collections.actions.more')" @keydown="onMenuKeys">
+                                <button type="button" role="menuitem" class="lb-menu-item" data-testid="collection-action-stats"
+                                        @click="menuPick(openCollectionStats)">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M21 20H3"/></svg>
+                                    {{ $t('collections.actions.stats') }}
+                                </button>
+                                <button type="button" role="menuitem" class="lb-menu-item" data-testid="collection-action-validate"
+                                        :disabled="!collection.item_count || collectionBusy || bulkValidating" @click="menuPick(collectionValidate)">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 6v6c0 4.5 3.4 8 8 9 4.6-1 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg>
+                                    {{ $t('collections.actions.validate') }}
+                                </button>
+                                <button type="button" role="menuitem" class="lb-menu-item" data-testid="collection-action-refresh"
+                                        :disabled="!collection.item_count || collectionBusy" @click="menuPick(collectionRefreshReview)">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
+                                    {{ $t('collections.actions.refreshReview') }}
+                                </button>
+                                <button type="button" role="menuitem" class="lb-menu-item" data-testid="collection-action-duplicates"
+                                        :disabled="dupLoading" @click="menuPick(findDuplicates)">
+                                    <svg v-if="!dupLoading" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                                    <span v-else class="spinner-sm"></span>
+                                    {{ $t('collections.actions.duplicates') }}
+                                    <span v-if="dupGroups && dupGroups.length" class="lb-menu-k">{{ dupGroups.length }}</span>
+                                </button>
+                                <div class="lb-menu-sep" role="separator"></div>
+                                <export-menu inline prefix="collection" :query="'collection_id=' + collection.id"
+                                             :scope-label="$tn('common.itemCount', collection.item_count)" @done="onMenuExportDone" />
+                                <div class="lb-menu-sep" role="separator"></div>
+                                <button type="button" role="menuitem" class="lb-menu-item" data-testid="collection-edit"
+                                        @click="menuPick(startCollectionEdit)">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16z"/></svg>
+                                    {{ $t('collections.actions.edit') }}
+                                </button>
+                                <button type="button" role="menuitem" class="lb-menu-item" data-testid="collection-archive"
+                                        @click="menuPick(toggleCollectionArchived)">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/></svg>
+                                    {{ collection.archived ? $t('collections.restoreAction') : $t('collections.archiveAction') }}
+                                </button>
+                                <div class="lb-menu-sep" role="separator"></div>
+                                <button type="button" role="menuitem" class="lb-menu-item is-danger" data-testid="collection-delete"
+                                        @click="menuPick(deleteCollection)">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13M9 7V4h6v3"/></svg>
+                                    {{ $t('collections.deleteAction') }}
+                                </button>
+                            </div>
+                        </div>
+                    </template>
+                    <template v-else-if="!isCollectionRoute">
+                        <button type="button" class="lb-key" @click="openResearchChat">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                            {{ $t('nav.researchChat') }}
+                        </button>
+                        <button type="button" class="lb-key" :disabled="dupLoading" @click="findDuplicates">
+                            <svg v-if="!dupLoading" xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+                            <span v-else class="spinner-sm"></span>
+                            {{ $t('duplicates.short') }}
+                            <span v-if="dupGroups && dupGroups.length" class="lb-pill lb-pill-accent">{{ dupGroups.length }}</span>
+                        </button>
+                        <export-menu prefix="list" :query="exportScope.query" :ids="exportScope.ids"
+                                     :scope-label="exportScope.label" :disabled="!exportScope.count"
+                                     button-class="lb-key" align-right />
+                    </template>
                 </div>
             </header>
 
-            <!-- Toolbar -->
-            <div class="lb-toolbar">
-                <div class="lb-toolbar-l">
-                    <button class="lb-btn lb-btn-ghost" :class="{ 'is-on': showFilters || hasActiveFilters }"
-                            @click="showFilters = !showFilters">
-                        <span v-html="icons.filter"></span>
-                        {{ $t('filters.heading') }}
-                        <span v-if="hasActiveFilters" class="lb-pill lb-pill-accent">{{ activeFilterCount }}</span>
+            <!-- Filter bar, two fixed rows: search with sort and view, then the
+                 filter pills with the reset. Sticks to the top while the list
+                 scrolls (the window scrolls; style.css keeps <main> from
+                 trapping it). Filters apply live. The sentinel marks where the
+                 bar would sit unstuck. -->
+            <div ref="fbarSentinel" class="lb-fbar-sentinel" aria-hidden="true"></div>
+            <div ref="fbar" class="lb-fbar" data-testid="filter-bar">
+                <div class="lb-fbar-row1">
+                <div class="lb-fbar-search">
+                    <span class="lb-fbar-search-icon" v-html="icons.search"></span>
+                    <input v-model="searchQuery" @input="debouncedSearch"
+                           type="text" :placeholder="$t('papers.searchPlaceholder')"
+                           :aria-label="$t('papers.searchPlaceholder')" class="lb-search-input" />
+                    <button v-if="searchQuery" type="button" @click="clearSearch" class="lb-search-clear" :aria-label="$t('search.clear')">
+                        <span v-html="icons.x"></span>
                     </button>
-                    <button class="lb-btn lb-btn-ghost" @click="openResearchChat">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                        {{ $t('nav.researchChat') }}
-                    </button>
-                    <button class="lb-btn lb-btn-ghost" :disabled="dupLoading" @click="findDuplicates">
-                        <svg v-if="!dupLoading" xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-                        <span v-else class="spinner-sm"></span>
-                        {{ $t('duplicates.short') }}
-                        <span v-if="dupGroups && dupGroups.length" class="lb-pill lb-pill-accent">{{ dupGroups.length }}</span>
+                    <button v-if="semanticAvailable" type="button" class="lb-fbar-sw" :class="{ 'is-on': semanticMode }"
+                            :aria-pressed="semanticMode ? 'true' : 'false'"
+                            @click="toggleSemantic" :title="$t('search.semanticToggleTitle')"
+                            data-testid="semantic-toggle">
+                        <span class="lb-fbar-trk" aria-hidden="true"><span class="lb-fbar-knob"></span></span>
+                        {{ $t('search.semanticShort') }}
                     </button>
                 </div>
-                <div class="lb-toolbar-r">
-                    <div class="lb-sortgroup">
-                        <span class="lb-sortgroup-l">{{ $t('papers.sortBy') }}</span>
-                        <select v-model="sortBy" class="lb-select">
-                            <option value="year">{{ $t('common.year') }}</option>
-                            <option value="authors">{{ $t('papers.sortAuthor') }}</option>
-                            <option value="title">{{ $t('common.title') }}</option>
-                            <option value="cited_by_count">{{ $t('common.citations') }}</option>
-                            <option value="created_at">{{ $t('papers.sortAdded') }}</option>
-                        </select>
-                        <button class="lb-icon-btn" :title="sortAsc ? $t('papers.sortAsc') : $t('papers.sortDesc')"
+
+                <div class="lb-fbar-r">
+                    <filter-pill pop-key="sort" class="lb-fbar-sort" data-testid="filter-sort"
+                                 :aria-label="$t('papers.sortBy') + ': ' + sortLabel" :pop-label="$t('papers.sortBy')"
+                                 :value="sortLabel" :value-ch="sortLabel.length" :open="openPop === 'sort'" :locked="semanticMode"
+                                 :tip="semanticMode ? $t('filters.semanticOff') : ''" :align-right="popRight"
+                                 @toggle="togglePop('sort')" @close="closePop(false)">
+                        <template #lead>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
+                        </template>
+                        <div class="lb-fbar-mh">{{ $t('papers.sortBy') }}</div>
+                        <div class="lb-fbar-list" role="radiogroup" :aria-label="$t('papers.sortBy')"
+                             @keydown="onRadioKeys($event, (v) => { sortBy = v; })">
+                            <button v-for="o in sortOptions" :key="o.value" type="button" role="radio" class="lb-fbar-opt"
+                                    :data-value="o.value" :aria-checked="o.on ? 'true' : 'false'" :tabindex="o.on ? 0 : -1"
+                                    @click="pickAndClose(() => { sortBy = o.value; })">
+                                <span class="lb-fbar-radio" aria-hidden="true"></span>{{ o.label }}
+                            </button>
+                        </div>
+                    </filter-pill>
+                    <span class="lb-fbar-tipwrap" :title="semanticMode ? $t('filters.semanticOff') : null">
+                        <button type="button" class="lb-fbar-pill lb-fbar-sq lb-fbar-dir" :class="{ 'is-asc': sortAsc }"
+                                :disabled="semanticMode" data-testid="filter-sort-dir"
+                                :aria-label="sortAsc ? $t('papers.sortAsc') : $t('papers.sortDesc')"
+                                :title="semanticMode ? null : (sortAsc ? $t('papers.sortAsc') : $t('papers.sortDesc'))"
                                 @click="sortAsc = !sortAsc">
-                            {{ sortAsc ? '↑' : '↓' }}
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+                        </button>
+                    </span>
+                    <div class="lb-fbar-seg lb-fbar-seg2" :title="semanticMode ? $t('filters.semanticOff') : null">
+                        <span class="lb-fbar-seg-thumb" :style="{ transform: view === 'grid' ? 'translateX(100%)' : 'none' }"></span>
+                        <button type="button" :aria-pressed="view === 'list' ? 'true' : 'false'" :disabled="semanticMode"
+                                :aria-label="$t('papers.viewList')" :title="semanticMode ? null : $t('papers.viewList')" @click="view = 'list'">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
+                        </button>
+                        <button type="button" :aria-pressed="view === 'grid' ? 'true' : 'false'" :disabled="semanticMode"
+                                :aria-label="$t('papers.viewGrid')" :title="semanticMode ? null : $t('papers.viewGrid')" @click="view = 'grid'">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg>
                         </button>
                     </div>
-                    <div class="lb-segmented">
-                        <button class="lb-seg" :class="{ 'is-on': view === 'list' }" :title="$t('papers.viewList')"
-                                @click="view = 'list'">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
-                        </button>
-                        <button class="lb-seg" :class="{ 'is-on': view === 'grid' }" :title="$t('papers.viewGrid')"
-                                @click="view = 'grid'">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-                        </button>
-                    </div>
+                </div>
+                </div>
+
+                <div class="lb-fbar-row2">
+                <div class="lb-fbar-pills">
+                    <!-- Year: histogram of the list, two thumbs, exact entry, presets -->
+                    <filter-pill pop-key="year" data-testid="filter-year" :label="$t('common.year')"
+                                 :value="yearPillValue" :value-ch="yearPillCh" :active="!!(filters.yearFrom || filters.yearTo)"
+                                 :open="openPop === 'year'" :disabled="!yearBounds.has" :locked="semanticMode"
+                                 :tip="semanticMode ? $t('filters.semanticOff') : ''" :align-right="popRight"
+                                 @toggle="togglePop('year')" @close="closePop(false)"
+                                 @clear="clearPill('year', () => setYearRange(null, null))">
+                        <div class="lb-fbar-pop-pad lb-fbar-year">
+                            <div class="lb-fbar-pop-head">
+                                <span class="lb-fbar-mh">{{ $t('filters.yearHeading') }}</span>
+                                <span class="lb-fbar-range-val">{{ yearLo }}–{{ yearHi }}</span>
+                            </div>
+                            <div class="lb-fbar-hist" aria-hidden="true">
+                                <span v-for="b in yearHist" :key="b.from" class="lb-fbar-hb"
+                                      :class="{ 'is-zero': !b.n, 'is-out': b.to < yearLo || b.from > yearHi }"
+                                      :style="{ height: b.h + '%' }" :title="b.tip"></span>
+                            </div>
+                            <div class="lb-fbar-rng" :style="yearFillStyle">
+                                <span class="lb-fbar-rng-track"><span class="lb-fbar-rng-fill"></span></span>
+                                <input type="range" class="lb-fbar-rng-in" :class="{ 'is-top': yearFromOnTop }"
+                                       :min="yearBounds.min" :max="yearBounds.max" step="1" :value="yearLo"
+                                       :aria-label="$t('filters.yearFrom')" data-testid="filter-year-from-range"
+                                       @input="onYearRange('from', $event)" @change="commitYearDraft" />
+                                <input type="range" class="lb-fbar-rng-in"
+                                       :min="yearBounds.min" :max="yearBounds.max" step="1" :value="yearHi"
+                                       :aria-label="$t('filters.yearTo')" data-testid="filter-year-to-range"
+                                       @input="onYearRange('to', $event)" @change="commitYearDraft" />
+                            </div>
+                            <div class="lb-fbar-yearnums">
+                                <input type="number" class="lb-fbar-num" :min="yearBounds.min" :max="yearBounds.max"
+                                       :value="yearLo" :aria-label="$t('filters.yearFrom')" data-testid="filter-year-from"
+                                       @input="onYearNumber('from', $event, false)" @change="onYearNumber('from', $event, true)" />
+                                <span class="lb-fbar-yearnums-sep" aria-hidden="true">–</span>
+                                <input type="number" class="lb-fbar-num" :min="yearBounds.min" :max="yearBounds.max"
+                                       :value="yearHi" :aria-label="$t('filters.yearTo')" data-testid="filter-year-to"
+                                       @input="onYearNumber('to', $event, false)" @change="onYearNumber('to', $event, true)" />
+                            </div>
+                            <div class="lb-fbar-presets">
+                                <button v-for="p in yearPresets" :key="p.key" type="button" class="lb-fbar-chip"
+                                        :class="{ 'is-on': p.on }" :aria-pressed="p.on ? 'true' : 'false'"
+                                        @click="setYearRange(p.lo, p.hi)">{{ p.label }}</button>
+                            </div>
+                        </div>
+                    </filter-pill>
+
+                    <!-- PDF and DOI: Any / With / Without, a sliding thumb -->
+                    <filter-pill v-for="f in presenceFilters" :key="f.key" :pop-key="f.key" :data-testid="'filter-' + f.key"
+                                 :label="f.label" :value="f.value" :value-ch="presenceCh" :active="!!filters[f.field]"
+                                 :open="openPop === f.key" :locked="semanticMode"
+                                 :tip="semanticMode ? $t('filters.semanticOff') : ''" :align-right="popRight"
+                                 @toggle="togglePop(f.key)" @close="closePop(false)"
+                                 @clear="clearPill(f.key, () => { filters[f.field] = ''; })">
+                        <div class="lb-fbar-pop-pad">
+                            <div class="lb-fbar-mh">{{ f.heading }}</div>
+                            <div class="lb-fbar-seg lb-fbar-seg3" role="radiogroup" :aria-label="f.label"
+                                 @keydown="onRadioKeys($event, (v) => { filters[f.field] = v; })">
+                                <span class="lb-fbar-seg-thumb" :style="{ transform: 'translateX(' + (f.index * 100) + '%)' }"></span>
+                                <button v-for="o in f.options" :key="o.value" type="button" role="radio" :data-value="o.value"
+                                        :aria-checked="o.on ? 'true' : 'false'" :tabindex="o.on ? 0 : -1"
+                                        @click="filters[f.field] = o.value">
+                                    {{ o.label }}<small>{{ o.n }}</small>
+                                </button>
+                            </div>
+                        </div>
+                    </filter-pill>
+
+                    <!-- Provenance -->
+                    <filter-pill pop-key="provenance" data-testid="filter-provenance" :label="$t('filters.provenance')"
+                                 :value="sourcePillValue" :value-ch="sourcePillCh" :active="!!filters.importSource"
+                                 :open="openPop === 'provenance'" :locked="semanticMode"
+                                 :tip="semanticMode ? $t('filters.semanticOff') : ''" :align-right="popRight"
+                                 @toggle="togglePop('provenance')" @close="closePop(false)"
+                                 @clear="clearPill('provenance', () => { filters.importSource = ''; })">
+                        <div class="lb-fbar-list" role="radiogroup" :aria-label="$t('filters.provenance')"
+                             @keydown="onRadioKeys($event, (v) => { filters.importSource = v; })">
+                            <button v-for="o in sourceOptions" :key="o.value" type="button" role="radio" class="lb-fbar-opt"
+                                    :data-value="o.value" :aria-checked="o.on ? 'true' : 'false'" :tabindex="o.on ? 0 : -1"
+                                    @click="pickAndClose(() => { filters.importSource = o.value; })">
+                                <span class="lb-fbar-radio" aria-hidden="true"></span>{{ o.label }}<span class="lb-fbar-n">{{ o.n }}</span>
+                            </button>
+                        </div>
+                    </filter-pill>
+
+                    <!-- Collection (server-side; not on a Collection's own page) -->
+                    <filter-pill v-if="!isCollectionRoute" pop-key="collection" data-testid="filter-collection"
+                                 :label="$t('collections.filter')" :value="collectionPillValue" :value-ch="collectionPillCh"
+                                 :active="!!filters.collectionId" :open="openPop === 'collection'" :locked="semanticMode"
+                                 :tip="semanticMode ? $t('filters.semanticOff') : ''" :align-right="popRight"
+                                 @toggle="togglePop('collection')" @close="closePop(false)"
+                                 @clear="clearPill('collection', () => { filters.collectionId = ''; })">
+                        <div class="lb-fbar-list" role="radiogroup" :aria-label="$t('collections.filter')"
+                             @keydown="onRadioKeys($event, (v) => { filters.collectionId = v; })">
+                            <button v-for="o in collectionOptions" :key="o.value" type="button" role="radio" class="lb-fbar-opt"
+                                    :data-value="o.value" :aria-checked="o.on ? 'true' : 'false'" :tabindex="o.on ? 0 : -1"
+                                    @click="pickAndClose(() => { filters.collectionId = o.value; })">
+                                <span class="lb-fbar-radio" aria-hidden="true"></span><span class="lb-fbar-opt-l">{{ o.label }}</span><span v-if="o.n != null" class="lb-fbar-n">{{ o.n }}</span>
+                            </button>
+                        </div>
+                    </filter-pill>
+
+                    <!-- Add-on slot "item-list-filter" (#190): one pill per Add-on,
+                         its component renders unchanged inside the popover. -->
+                    <filter-pill v-for="s in listFilterSlots" :key="s.key" :pop-key="'addon-' + s.addon"
+                                 :data-testid="'filter-addon-' + s.addon" :label="addonName(s.addon)"
+                                 :value="activeAddonSelections[s.addon] ? String(activeAddonSelections[s.addon].label || '') : $t('filters.pill.all')"
+                                 :value-ch="addonPillCh" :active="!!activeAddonSelections[s.addon]"
+                                 :open="openPop === 'addon-' + s.addon" :locked="semanticMode"
+                                 :tip="semanticMode ? $t('filters.semanticOff') : ''" :align-right="popRight"
+                                 @toggle="togglePop('addon-' + s.addon)" @close="closePop(false)"
+                                 @clear="clearPill('addon-' + s.addon, () => setAddonSelection(s.addon, null))">
+                        <div class="lb-fbar-pop-pad lb-fbar-slot" :data-addon-slot="s.key">
+                            <component :is="s.component" :selection="filters.addonSelections[s.addon] || null"
+                                       @update:selection="setAddonSelection(s.addon, $event)" />
+                        </div>
+                    </filter-pill>
+                </div>
+                <button v-if="hasActiveFilters" type="button" class="lb-fbar-reset" data-testid="filter-reset"
+                        @click="resetFilters">{{ $t('filters.resetAll') }}</button>
                 </div>
             </div>
 
-            <!-- Filter Bar -->
-            <div v-if="showFilters" class="lb-filter-bar">
-                <div class="lb-filter-grid" :style="{ gridTemplateColumns: filterGridColumns }">
-                    <label class="lb-field">
-                        <span class="lb-field-label">{{ $t('filters.yearFrom') }}</span>
-                        <input v-model.number="filters.yearFrom" type="number" :placeholder="$t('filters.yearFromPlaceholder')" class="lb-input" />
-                    </label>
-                    <label class="lb-field">
-                        <span class="lb-field-label">{{ $t('filters.yearTo') }}</span>
-                        <input v-model.number="filters.yearTo" type="number" :placeholder="$t('filters.yearToPlaceholder')" class="lb-input" />
-                    </label>
-                    <label class="lb-field">
-                        <span class="lb-field-label">{{ $t('filters.category') }}</span>
-                        <select v-model="filters.categoryId" class="lb-input">
-                            <option value="">{{ $t('filters.allCategories') }}</option>
-                            <option v-for="c in allCategories" :key="c.id" :value="c.id">{{ c.name }}</option>
-                        </select>
-                    </label>
-                    <label class="lb-field">
-                        <span class="lb-field-label">DOI</span>
-                        <select v-model="filters.hasDoi" class="lb-input">
-                            <option value="">{{ $t('filters.any') }}</option>
-                            <option value="yes">{{ $t('filters.withDoi') }}</option>
-                            <option value="no">{{ $t('filters.withoutDoi') }}</option>
-                        </select>
-                    </label>
-                    <label class="lb-field">
-                        <span class="lb-field-label">{{ $t('filters.provenance') }}</span>
-                        <select v-model="filters.importSource" class="lb-input">
-                            <option value="">{{ $t('filters.allSources') }}</option>
-                            <option value="pdf">{{ $t('filters.srcPdf') }}</option>
-                            <option value="bibtex">{{ $t('filters.srcBibtex') }}</option>
-                            <option value="ris">{{ $t('filters.srcRis') }}</option>
-                            <option value="other">{{ $t('filters.srcOther') }}</option>
-                        </select>
-                    </label>
-                    <label class="lb-field">
-                        <span class="lb-field-label">PDF</span>
-                        <select v-model="filters.hasPdf" class="lb-input">
-                            <option value="">{{ $t('filters.any') }}</option>
-                            <option value="yes">{{ $t('filters.withPdf') }}</option>
-                            <option value="no">{{ $t('filters.withoutPdf') }}</option>
-                        </select>
-                    </label>
-                    <!-- Add-on slot "item-list-filter" (#190) -->
-                    <div v-for="s in listFilterSlots" :key="s.key" class="lb-field" :data-addon-slot="s.key">
-                        <component :is="s.component" :selection="filters.addonSelections[s.addon] || null"
-                                   @update:selection="setAddonSelection(s.addon, $event)" />
-                    </div>
-                </div>
-                <div v-if="tagCloud.length" class="lb-field" style="margin-top: 14px;">
-                    <span class="lb-field-label">{{ $t('filters.frequentCategories') }}</span>
-                    <div class="lb-chiprow">
-                        <button v-for="[name, n, id] in tagCloud" :key="id"
-                                class="lb-chip"
-                                :class="{ 'is-on': String(filters.categoryId) === String(id) }"
-                                @click="filters.categoryId = (String(filters.categoryId) === String(id) ? '' : String(id))">
-                            {{ name }} <span class="lb-chip-n">{{ n }}</span>
-                        </button>
-                    </div>
-                </div>
-                <div v-if="hasActiveFilters" style="margin-top: 12px;">
-                    <button class="lb-btn lb-btn-text" @click="resetFilters">{{ $t('filters.resetAll') }}</button>
-                </div>
+            <!-- Category rail: every category of the list, most frequent first -->
+            <div v-if="categoryChips.length" class="lb-fbar-rail" role="group" :aria-label="$t('filters.category')"
+                 data-testid="filter-categories" :title="semanticMode ? $t('filters.semanticOff') : null">
+                <button v-for="c in categoryChips" :key="c.id" type="button" class="lb-fbar-chip"
+                        :class="{ 'is-on': c.on && !semanticMode }" :aria-pressed="c.on ? 'true' : 'false'"
+                        :disabled="semanticMode" :data-category-id="c.id" @click="toggleCategory(c.id)">
+                    {{ c.name }}<span class="lb-fbar-chip-n">{{ c.n }}</span>
+                </button>
             </div>
 
             <!-- Selection Action Bar -->
@@ -879,15 +2785,34 @@ const PaperList = {
                                 <span v-html="icons.refresh"></span>
                                 {{ bulkValidating ? $t('bulk.validating') : $t('bulk.validateMetadata') }}
                             </button>
+                            <button @click="refreshReviewIds = selectedPapers.slice(); showActionDropdown = false"
+                                    data-testid="bulk-refresh-review"
+                                    class="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 flex items-center gap-2">
+                                <span v-html="icons.refresh"></span>
+                                {{ $t('bulk.refreshReview') }}
+                            </button>
                             <button @click="bulkFetchAbstracts(); showActionDropdown = false" :disabled="fetchingAbstracts"
                                     class="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 flex items-center gap-2 disabled:opacity-40">
                                 <span v-html="icons.pdf"></span>
-                                {{ fetchingAbstracts ? 'Lade...' : 'Abstracts holen' }}
+                                {{ fetchingAbstracts ? $t('common.loading') : $t('library.fetchAbstracts') }}
                             </button>
                             <button @click="discoverDois(); showActionDropdown = false" :disabled="discoveringDois"
                                     class="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 flex items-center gap-2 disabled:opacity-40">
                                 <span v-html="icons.search"></span>
                                 {{ discoveringDois ? $t('bulk.searching') : $t('bulk.findDois') }}
+                            </button>
+                            <div class="border-t border-gray-100 my-1"></div>
+                            <button @click="collectionPickerIds = selectedPapers.slice(); showActionDropdown = false"
+                                    data-testid="bulk-add-to-collection"
+                                    class="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 flex items-center gap-2">
+                                <span v-html="icons.plus"></span>
+                                {{ $t('collections.bulkAdd') }}
+                            </button>
+                            <button v-if="isCollectionRoute && collection" @click="bulkRemoveFromCollection(); showActionDropdown = false"
+                                    data-testid="bulk-remove-from-collection"
+                                    class="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 flex items-center gap-2">
+                                <span v-html="icons.x"></span>
+                                {{ $t('collections.bulkRemove') }}
                             </button>
                             <div class="border-t border-gray-100 my-1"></div>
                             <button @click="bulkDeleteSelected(); showActionDropdown = false" :disabled="bulkDeleting"
@@ -900,14 +2825,62 @@ const PaperList = {
                 </div>
             </div>
 
-            <!-- Loading -->
-            <div v-if="loading" class="flex justify-center py-12">
+            <!-- Refresh mit Prüfung fuer die ausgewaehlten Eintraege -->
+            <div v-if="refreshReviewIds" class="fixed inset-0 bg-black/40 z-40 flex items-center justify-center" @click.self="refreshReviewIds = null; refreshReviewScope = ''">
+                <div class="bg-white rounded-xl shadow-xl max-w-lg w-full mx-4 p-6" data-testid="bulk-refresh-review-panel">
+                    <refresh-review :paper-ids="refreshReviewIds" :scope-label="refreshReviewScope" @applied="loadPapers" />
+                    <div class="flex justify-end mt-4">
+                        <button @click="refreshReviewIds = null; refreshReviewScope = ''" class="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50">{{ $t('common.close') }}</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Statistik der Sammlung (#202) -->
+            <div v-if="collectionStats" class="fixed inset-0 bg-black/40 z-40 flex items-center justify-center" @click.self="collectionStats = null">
+                <div class="bg-white rounded-xl shadow-xl max-w-lg w-full mx-4 p-6" data-testid="collection-stats">
+                    <h4 class="text-base font-semibold text-gray-900 mb-1">{{ $t('collections.stats.heading') }}</h4>
+                    <p class="lb-scope-label mb-3" data-testid="collection-stats-scope">{{ $t('scope.collection', { name: collectionStats.scope.name }) }}</p>
+                    <div class="lb-coll-stats-grid">
+                        <span>{{ $tn('common.itemCount', collectionStats.paper_count) }}</span>
+                        <span data-testid="collection-stats-pdf">{{ $t('collections.stats.withPdf', { n: collectionStats.with_pdf }) }}</span>
+                        <span>{{ $t('collections.stats.withDoi', { n: collectionStats.with_doi }) }}</span>
+                        <span v-if="collectionStats.year_min">{{ $t('collections.stats.years', { from: collectionStats.year_min, to: collectionStats.year_max }) }}</span>
+                    </div>
+                    <template v-for="block in collectionStatsBlocks" :key="block.key">
+                        <h5 v-if="block.rows.length" class="lb-aside-h mt-3">{{ $t('collections.stats.' + block.key) }}</h5>
+                        <ul v-if="block.rows.length" class="lb-coll-stats-list" :data-testid="'collection-stats-' + block.key">
+                            <li v-for="r in block.rows" :key="r.label"><span>{{ r.label }}</span><span class="lb-mono">{{ r.count }}</span></li>
+                        </ul>
+                    </template>
+                    <div class="flex justify-end mt-4">
+                        <button @click="collectionStats = null" class="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50">{{ $t('common.close') }}</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Zu Sammlung hinzufuegen (#201) -->
+            <collection-picker v-if="collectionPickerIds" :paper-ids="collectionPickerIds"
+                               @close="collectionPickerIds = null" @done="onAddedToCollection" />
+            <!-- BibTeX/.tex in diese Sammlung (#203) -->
+            <bib-import-dialog v-if="showBibImport && collection" :collection-id="collection.id"
+                               @close="showBibImport = false" @done="onBibImported" />
+            <div v-if="collectionNotice" class="toast lb-drop-toast" role="status" data-testid="collection-toast">
+                <span>{{ collectionNotice }}</span>
+            </div>
+
+            <!-- Loading: the spinner only while there is nothing to show yet.
+                 A reload keeps the current list in place, dimmed: swapping it
+                 for a spinner collapses the page, the scroll position clamps
+                 and the view jumps. -->
+            <div v-if="showSpinner" class="flex justify-center py-12">
                 <div class="spinner"></div>
             </div>
 
+            <div v-else ref="listRegion" class="lb-listwrap" :class="{ 'is-busy': loading }"
+                 :aria-busy="loading ? 'true' : 'false'" data-testid="list-region">
             <!-- Semantic Search Results (own branch: different fields than a full paper,
                  no silent mixing into the regular filtered list -- Erwartungsbruch) -->
-            <template v-else-if="semanticMode">
+            <template v-if="semanticMode">
                 <p v-if="semanticMeta.note" class="lb-empty-text" style="margin: 0 2px 12px;">{{ semanticMeta.note }}</p>
                 <ul v-if="semanticResults.length" class="lb-rowlist" data-testid="semantic-results">
                     <li v-for="hit in semanticResults" :key="hit.paper_id" class="lb-row"
@@ -947,6 +2920,8 @@ const PaperList = {
                     <li v-for="paper in sortedPapers" :key="paper.id"
                         class="lb-row"
                         :style="selectedPapers.includes(paper.id) ? { background: 'var(--lb-bg-soft)' } : null"
+                        draggable="true" :data-paper-id="paper.id"
+                        @dragstart="onItemDragStart($event, paper)" @dragend="onItemDragEnd"
                         @click="$router.push({ name: 'paper', params: { id: paper.id } })">
                         <div class="lb-row-year">
                             <input type="checkbox" :value="paper.id" v-model="selectedPapers" @click.stop
@@ -963,16 +2938,18 @@ const PaperList = {
                                 </template>
                             </div>
                             <p v-if="paper.abstract" class="lb-row-abstract">{{ paper.abstract }}</p>
+                            <p v-if="isCollectionRoute && paper.collection_note" class="lb-coll-note"
+                               data-testid="collection-item-note">{{ paper.collection_note }}</p>
                             <div class="lb-row-foot">
                                 <div class="lb-tags">
                                     <span class="lb-tag lb-tag-src" :class="'lb-src-' + paperSource(paper).key"
                                           :title="$t('papers.provenanceTooltip', { source: paperSource(paper).label + (paperSource(paper).detail ? ' (' + paperSource(paper).detail + ')' : '') })"
-                                          @click.stop="filters.importSource = paperSource(paper).key; showFilters = true">
+                                          @click.stop="filters.importSource = paperSource(paper).key">
                                         {{ paperSource(paper).label }}
                                     </span>
                                     <span v-for="cat in (paper.categories || [])" :key="'c'+cat.id"
                                           class="lb-tag lb-tag-cat"
-                                          @click.stop="filters.categoryId = String(cat.id); showFilters = true">
+                                          @click.stop="filters.categoryId = String(cat.id)">
                                         {{ cat.name }}
                                     </span>
                                 </div>
@@ -997,6 +2974,8 @@ const PaperList = {
                 <div v-else class="lb-grid">
                     <article v-for="paper in sortedPapers" :key="paper.id"
                              class="lb-pcard"
+                             draggable="true" :data-paper-id="paper.id"
+                             @dragstart="onItemDragStart($event, paper)" @dragend="onItemDragEnd"
                              @click="$router.push({ name: 'paper', params: { id: paper.id } })">
                         <div class="lb-pcard-thumb">
                             <div class="lb-pcard-pages">
@@ -1010,7 +2989,7 @@ const PaperList = {
                             <div class="lb-tags" style="margin: 6px 0 2px;">
                                 <span class="lb-tag lb-tag-src" :class="'lb-src-' + paperSource(paper).key"
                                       :title="$t('papers.provenanceTooltip', { source: paperSource(paper).label })"
-                                      @click.stop="filters.importSource = paperSource(paper).key; showFilters = true">
+                                      @click.stop="filters.importSource = paperSource(paper).key">
                                     {{ paperSource(paper).label }}
                                 </span>
                                 <span v-if="!paper.filename" class="lb-tag lb-stat-nopdf" :title="$t('papers.noPdfTitle')">{{ $t('papers.noPdf') }}</span>
@@ -1040,12 +3019,20 @@ const PaperList = {
                                      data-testid="library-empty-migrate">{{ $t('papers.empty.migrate') }}</router-link>
                     </div>
                 </template>
+                <template v-else-if="isCollectionRoute && collection && !collection.item_count">
+                    <p class="lb-empty-text" data-testid="collection-empty">{{ $t('collections.emptyCollection') }}</p>
+                </template>
                 <template v-else>
                     <div class="lb-empty-title">{{ $t('papers.noResults') }}</div>
                     <p class="lb-empty-text">
                         {{ $t('papers.emptyHint') }}
                     </p>
+                    <!-- A filter that matched nothing needs the way back right
+                         here, not only up in the bar. -->
+                    <button v-if="hasActiveFilters" type="button" class="lb-fbar-reset" data-testid="filter-reset-empty"
+                            style="margin-top: 12px;" @click="resetFilters">{{ $t('filters.resetAll') }}</button>
                 </template>
+            </div>
             </div>
 
             <!-- DOI Confirmation Modal -->
@@ -1178,14 +3165,13 @@ const PaperList = {
                                             :class="dupKeep[gi] === p.id
                                                 ? 'bg-accent text-white'
                                                 : 'bg-gray-100 text-gray-600 hover:bg-gray-200'">
-                                            {{ dupKeep[gi] === p.id ? '&#10003; Behalten' : 'Behalten' }}
+                                            {{ (dupKeep[gi] === p.id ? '✓ ' : '') + $t('duplicates.keep') }}
                                         </button>
                                     </div>
                                 </div>
                                 <div v-if="dupKeep[gi]" class="bg-gray-50 px-4 py-2 flex items-center justify-between border-t border-gray-200">
                                     <span class="text-xs text-gray-500">
-                                        {{ group.papers.filter(p => p.id !== dupKeep[gi]).length }} Paper werden geloescht,
-                                        Kategorien werden uebernommen.
+                                        {{ $tn('duplicates.mergeSummary', group.papers.filter(p => p.id !== dupKeep[gi]).length) }}
                                     </span>
                                     <div class="flex items-center gap-2">
                                         <button @click="dismissDuplicateGroup(gi)"
@@ -1226,15 +3212,31 @@ const PaperList = {
             doiCandidateIndex: 0,
             applyingDoi: false,
             doiAcceptedCount: 0,
-            showFilters: false,
-            filters: {
-                yearFrom: null, yearTo: null, categoryId: '', hasDoi: '', importSource: '', hasPdf: '',
-                // Add-on filter selections (#190): add-on id -> { value, label, citeKeys }.
-                addonSelections: {},
-            },
+            filters: emptyListFilters(),
+            // Filter bar: the one open popover ('' = none), whether it had to
+            // flip to the pill's right edge to stay in the viewport, the year
+            // range while a thumb moves (the list follows when it rests), and
+            // the Add-ons' human-readable names for their pills.
+            openPop: '',
+            popRight: false,
+            yearDraft: null,
+            addonNames: {},
             allCategories: [],
+            // Collections (#201): the filter's options, the page's own
+            // Collection, the head's edit draft, and the picker's Item ids.
+            allCollections: [],
+            collection: null,
+            collectionEdit: null,
+            collectionPickerIds: null,
+            showBibImport: false,
+            collectionNotice: '',
             customFields: [],
             showActionDropdown: false,
+            // Refresh mit Prüfung fuer die Auswahl (Snapshot der IDs beim Oeffnen)
+            refreshReviewIds: null,
+            refreshReviewScope: '',
+            collectionStats: null,
+            collectionBusy: false,
             // Duplikate
             showDupModal: false,
             dupLoading: false,
@@ -1252,23 +3254,270 @@ const PaperList = {
         };
     },
     computed: {
+        // What the export menu exports: what you see (#212). A selection wins;
+        // otherwise the view. A server scope (search, category, collection)
+        // goes as a GET query when it alone defines the list; as soon as a
+        // client-side filter narrows it further, or two scopes meet, or the
+        // list is a semantic ranking, the visible Items are named explicitly.
+        exportScope() {
+            const sel = this.selectedPapers;
+            if (sel.length) {
+                return { ids: sel.slice(), query: '', count: sel.length,
+                         label: t('export.scopeSelection', { count: sel.length }) };
+            }
+            const semantic = this.semanticMode && this.searchQuery.trim();
+            const visible = semantic ? this.semanticResults.map(h => h.paper_id) : this.filteredPapers.map(p => p.id);
+            const label = tn('common.itemCount', visible.length);
+            const f = this.filters;
+            const clientFiltered = this.clientFilterActive || Object.keys(this.activeAddonSelections).length > 0;
+            const scopes = [];
+            if (this.searchQuery) scopes.push('search=' + encodeURIComponent(this.searchQuery));
+            if (this.$route.name === 'category' && this.$route.params.id) scopes.push('category_id=' + this.$route.params.id);
+            if (f.collectionId) scopes.push('collection_id=' + encodeURIComponent(f.collectionId));
+            if (semantic || clientFiltered || scopes.length > 1) {
+                return { ids: visible, query: '', count: visible.length, label };
+            }
+            return { ids: null, query: scopes[0] || '', count: visible.length, label };
+        },
         resultCount() {
             return this.semanticMode ? this.semanticResults.length : this.filteredPapers.length;
         },
+        // The spinner only stands in for a list with nothing to show yet; a
+        // reload keeps what is there (dimmed, aria-busy).
+        showSpinner() {
+            if (!this.loading) return false;
+            return this.semanticMode ? !this.semanticResults.length : !this.papers.length;
+        },
+        // On a Collection's page the page head is the Collection's head.
+        collectionHead() {
+            return this.isCollectionRoute && !!this.collection;
+        },
+        // The filters this page applies itself, on top of what the server sent.
+        clientFilterActive() {
+            const f = this.filters;
+            return !!(f.yearFrom || f.yearTo || f.categoryId || f.hasDoi || f.importSource || f.hasPdf);
+        },
+        // "x of y items" while a client-side filter narrows the list. y is the
+        // list the server sent; a server-side filter (Collection, Add-on) has
+        // already shrunk it, so "5 of 5" would only mislead - plain count then.
+        countLabel() {
+            if (!this.semanticMode && this.clientFilterActive) {
+                return tn('common.itemCountOf', this.papers.length, { shown: this.filteredPapers.length });
+            }
+            return tn('common.itemCount', this.resultCount);
+        },
         title() {
-            if (this.searchQuery) return 'Suchergebnisse';
+            if (this.searchQuery) return t('library.searchResults');
             if (this.$route.name === 'category') return this.categoryName || t('breadcrumb.category');
-            return 'Alle Paper';
+            return t('library.allItems');
+        },
+        collectionStatsBlocks() {
+            const s = this.collectionStats;
+            if (!s) return [];
+            return [
+                { key: 'byYear', rows: (s.by_year || []).map(r => ({ label: String(r.year), count: r.count })) },
+                { key: 'venues', rows: (s.top_venues || []).map(r => ({ label: r.name, count: r.count })) },
+                { key: 'categories', rows: (s.top_categories || []).map(r => ({ label: r.name, count: r.count })) },
+            ];
+        },
+        isCollectionRoute() {
+            return this.$route.name === 'collection';
+        },
+        pdfPercent() {
+            const c = this.collection;
+            return c && c.item_count ? Math.round((100 * c.pdf_count) / c.item_count) : 0;
         },
         heading() {
+            if (this.isCollectionRoute) {
+                return { eyebrow: t('collections.eyebrow'), title: this.collection ? this.collection.name : '—' };
+            }
             if (this.$route.name === 'category') {
                 return { eyebrow: t('breadcrumb.category'), title: this.categoryName || '—' };
             }
             return { eyebrow: t('breadcrumb.library'), title: t('nav.items') };
         },
-        filterGridColumns() {
-            // Jahr von, Jahr bis, Kategorie, DOI, Herkunft, PDF, [Add-on-Filter …]
-            return '140px 140px 1fr 1fr 1fr 1fr' + ' 1fr'.repeat(this.listFilterSlots.length);
+        // --- Filter bar ---------------------------------------------------
+        // One pass over the list the server sent: what every pill counts,
+        // the years for the histogram, the categories for the rail. The
+        // counts describe that base list, not the list after the other
+        // filters - cheap, and stable while one clicks around.
+        listFacets() {
+            const f = { total: 0, pdf: 0, doi: 0, src: { pdf: 0, bibtex: 0, ris: 0, other: 0 },
+                        years: new Map(), cats: new Map() };
+            for (const p of this.papers) {
+                f.total += 1;
+                if (p.filename) f.pdf += 1;
+                if (p.doi) f.doi += 1;
+                f.src[this.paperSource(p).key] += 1;
+                const y = parseInt(p.year, 10);
+                if (y > 0) f.years.set(y, (f.years.get(y) || 0) + 1);
+                for (const c of p.categories || []) {
+                    const e = f.cats.get(c.id);
+                    if (e) e.n += 1;
+                    else f.cats.set(c.id, { id: c.id, name: c.name, n: 1 });
+                }
+            }
+            return f;
+        },
+        yearBounds() {
+            const ys = [...this.listFacets.years.keys()];
+            return ys.length ? { has: true, min: Math.min(...ys), max: Math.max(...ys) } : { has: false, min: 0, max: 0 };
+        },
+        // The range the Year pill and its popover show: the moving thumbs
+        // while dragging, otherwise the filter, clamped into the list's span.
+        yearLo() {
+            if (this.yearDraft) return this.yearDraft.lo;
+            const b = this.yearBounds;
+            return this.filters.yearFrom ? Math.min(Math.max(this.filters.yearFrom, b.min), b.max) : b.min;
+        },
+        yearHi() {
+            if (this.yearDraft) return this.yearDraft.hi;
+            const b = this.yearBounds;
+            return this.filters.yearTo ? Math.max(Math.min(this.filters.yearTo, b.max), b.min) : b.max;
+        },
+        yearPillValue() {
+            return this.yearBounds.has ? this.yearLo + '–' + this.yearHi : '—';
+        },
+        yearPillCh() {
+            const b = this.yearBounds;
+            return b.has ? String(b.min).length + 1 + String(b.max).length : 9;
+        },
+        // At most ~60 bars: a wide span is binned into equal groups of years.
+        yearHist() {
+            const b = this.yearBounds;
+            if (!b.has) return [];
+            const size = Math.ceil((b.max - b.min + 1) / 60);
+            const bins = [];
+            for (let from = b.min; from <= b.max; from += size) {
+                bins.push({ from, to: Math.min(from + size - 1, b.max), n: 0 });
+            }
+            for (const [y, n] of this.listFacets.years) bins[Math.floor((y - b.min) / size)].n += n;
+            const top = Math.max(1, ...bins.map((x) => x.n));
+            return bins.map((x) => ({
+                ...x,
+                h: x.n ? Math.round(12 + (88 * x.n) / top) : 0,
+                tip: (x.from === x.to ? x.from : x.from + '–' + x.to) + ': ' + tn('common.itemCount', x.n),
+            }));
+        },
+        // The accent fill between the thumbs moves by transform only.
+        yearFillStyle() {
+            const b = this.yearBounds;
+            const span = Math.max(1, b.max - b.min);
+            return { '--lo': (this.yearLo - b.min) / span, '--span': (this.yearHi - this.yearLo) / span };
+        },
+        // Two thumbs on one spot: the one that can still move goes on top.
+        yearFromOnTop() {
+            const b = this.yearBounds;
+            return this.yearLo > (b.min + b.max) / 2;
+        },
+        // Presets from the data, never fixed years: "last n years" counted
+        // back from today, offered only where it narrows the list and still
+        // holds an item; open-ended, so next year's items join on their own.
+        yearPresets() {
+            const b = this.yearBounds;
+            if (!b.has) return [];
+            const now = new Date().getFullYear();
+            const out = [];
+            for (const n of [5, 10, 20]) {
+                const lo = now - n + 1;
+                if (lo <= b.min || lo > b.max) continue;
+                out.push({ key: 'last' + n, label: t('filters.yearLastN', { n }), lo, hi: b.max });
+            }
+            out.push({ key: 'all', label: t('filters.yearAll'), lo: b.min, hi: b.max });
+            return out.map((p) => ({ ...p, on: !this.yearDraft && p.lo === this.yearLo && p.hi === this.yearHi }));
+        },
+        // PDF and DOI share one shape: Any / With / Without, counted.
+        presenceFilters() {
+            const f = this.listFacets;
+            const pill = { '': t('filters.pill.any'), yes: t('filters.pill.yes'), no: t('filters.pill.no') };
+            const make = (key, field, label, heading, n, withKey, withoutKey) => {
+                const opts = [
+                    { value: '', label: t('filters.any'), n: f.total },
+                    { value: 'yes', label: t(withKey), n },
+                    { value: 'no', label: t(withoutKey), n: f.total - n },
+                ].map((o) => ({ ...o, on: o.value === (this.filters[field] || '') }));
+                return { key, field, label, heading, value: pill[this.filters[field] || ''] || pill[''],
+                         index: Math.max(0, opts.findIndex((o) => o.on)), options: opts };
+            };
+            return [
+                make('pdf', 'hasPdf', t('filters.pdf'), t('filters.pdfHeading'), f.pdf, 'filters.withPdf', 'filters.withoutPdf'),
+                make('doi', 'hasDoi', t('filters.doi'), t('filters.doi'), f.doi, 'filters.withDoi', 'filters.withoutDoi'),
+            ];
+        },
+        presenceCh() {
+            return Math.max(...['filters.pill.any', 'filters.pill.yes', 'filters.pill.no'].map((k) => t(k).length));
+        },
+        sourceOptions() {
+            const src = this.listFacets.src;
+            const sel = this.filters.importSource || '';
+            return [
+                { value: '', label: t('filters.allSources'), n: this.listFacets.total },
+                { value: 'pdf', label: t('filters.srcPdf'), n: src.pdf },
+                { value: 'bibtex', label: t('filters.srcBibtex'), n: src.bibtex },
+                { value: 'ris', label: t('filters.srcRis'), n: src.ris },
+                { value: 'other', label: t('filters.srcOther'), n: src.other },
+            ].map((o) => ({ ...o, on: o.value === sel }));
+        },
+        sourcePillValues() {
+            return {
+                '': t('filters.pill.all'), pdf: t('filters.pill.srcPdf'), bibtex: t('filters.pill.srcBibtex'),
+                ris: t('filters.pill.srcRis'), other: t('filters.pill.srcOther'),
+            };
+        },
+        sourcePillValue() {
+            return this.sourcePillValues[this.filters.importSource || ''] || this.sourcePillValues[''];
+        },
+        sourcePillCh() {
+            return Math.max(...Object.values(this.sourcePillValues).map((v) => v.length));
+        },
+        collectionOptions() {
+            const sel = String(this.filters.collectionId || '');
+            return [{ value: '', label: t('collections.filterAll'), n: null }]
+                .concat(this.allCollections.map((c) => ({ value: String(c.id), label: c.name, n: c.item_count })))
+                .map((o) => ({ ...o, on: o.value === sel }));
+        },
+        collectionPillValue() {
+            const sel = String(this.filters.collectionId || '');
+            const c = sel && this.allCollections.find((x) => String(x.id) === sel);
+            return c ? c.name : t('filters.pill.all');
+        },
+        // Names can be long: the slot is as wide as the longest, up to a cap,
+        // and an over-long name ends in an ellipsis (full name as tooltip)
+        // instead of widening the pill - or leaving it mostly empty.
+        collectionPillCh() {
+            const lengths = this.allCollections.map((c) => String(c.name || '').length);
+            return Math.min(12, Math.max(t('filters.pill.all').length, ...lengths));
+        },
+        // An Add-on's selection labels are unknown ahead: one fixed, modest
+        // slot - stable, and not a wide gap behind "all".
+        addonPillCh() {
+            return Math.max(8, t('filters.pill.all').length);
+        },
+        sortOptions() {
+            return [
+                { value: 'year', label: t('common.year') },
+                { value: 'authors', label: t('papers.sortAuthor') },
+                { value: 'title', label: t('common.title') },
+                { value: 'cited_by_count', label: t('common.citations') },
+                { value: 'created_at', label: t('papers.sortAdded') },
+            ].map((o) => ({ ...o, on: o.value === this.sortBy }));
+        },
+        // The sort pill is no filter: it wears just the current key. Its width
+        // changes only on a pick from its own menu, which closes it.
+        sortLabel() {
+            const o = this.sortOptions.find((x) => x.on);
+            return o ? o.label : '';
+        },
+        // Every category of the list, most frequent first. On a category's
+        // own page that category is the page itself, not a choice - unless it
+        // is the one a row tag just picked.
+        categoryChips() {
+            const own = this.$route.name === 'category' ? parseInt(this.$route.params.id, 10) : null;
+            const sel = String(this.filters.categoryId || '');
+            return [...this.listFacets.cats.values()]
+                .filter((c) => c.id !== own || String(c.id) === sel)
+                .sort((a, b) => b.n - a.n || String(a.name).localeCompare(String(b.name), uiLocale()))
+                .map((c) => ({ ...c, on: String(c.id) === sel }));
         },
         // Active Add-ons' filter components (slot "item-list-filter", #190).
         listFilterSlots() {
@@ -1283,19 +3532,6 @@ const PaperList = {
             }
             return out;
         },
-        tagCloud() {
-            const m = new Map();
-            this.papers.forEach(p => (p.categories || []).forEach(c => {
-                const key = c.id;
-                const entry = m.get(key) || { name: c.name, id: c.id, n: 0 };
-                entry.n += 1;
-                m.set(key, entry);
-            }));
-            return [...m.values()]
-                .sort((a, b) => b.n - a.n)
-                .slice(0, 12)
-                .map(e => [e.name, e.n, e.id]);
-        },
         categoryName() {
             const cid = parseInt(this.$route.params.id);
             const cat = this.allCategories.find(c => c.id === cid);
@@ -1304,6 +3540,7 @@ const PaperList = {
         hasActiveFilters() {
             return (
                 this.filters.yearFrom || this.filters.yearTo || this.filters.categoryId || this.filters.hasDoi || this.filters.importSource || this.filters.hasPdf
+                || (this.filters.collectionId && !this.isCollectionRoute)
                 || Object.keys(this.activeAddonSelections).length > 0
             );
         },
@@ -1314,17 +3551,8 @@ const PaperList = {
             return this.papers.length === 0
                 && !this.searchQuery
                 && !this.hasActiveFilters
-                && this.$route.name !== 'category';
-        },
-        activeFilterCount() {
-            let c = 0;
-            if (this.filters.yearFrom || this.filters.yearTo) c++;
-            if (this.filters.categoryId) c++;
-            if (this.filters.hasDoi) c++;
-            if (this.filters.importSource) c++;
-            if (this.filters.hasPdf) c++;
-            c += Object.keys(this.activeAddonSelections).length;
-            return c;
+                && this.$route.name !== 'category'
+                && !this.isCollectionRoute;
         },
         currentDoiCandidate() {
             if (this.doiCandidateIndex < this.doiCandidates.length) {
@@ -1392,27 +3620,268 @@ const PaperList = {
                 this.selectAll = false;
                 this.semanticResults = [];
                 this.semanticMeta = { mode: '', note: '' };
+                this.collectionEdit = null;
+                this.openPop = '';
+                this.yearDraft = null;
+                // A filter set on one list must not silently narrow the next.
+                // The flag keeps the reset from loading a second time (the
+                // Collection filter's watcher) or scrolling (the align).
+                this._routeResetting = true;
+                this._alignAfterLoad = false;
+                this.filters = emptyListFilters();
+                this.$nextTick(() => { this._routeResetting = false; });
                 this.loadPapers();
+                this.loadCollection();
             }
+        },
+        // Server-side filter: the list holds only the Collection's Items.
+        'filters.collectionId'() {
+            if (this._routeResetting || this.isCollectionRoute) return;
+            this._alignAfterLoad = true;
+            this.loadPapers();
+        },
+        // A filter or sort change replaces the list: if the bar is stuck,
+        // the new list starts right under it (see alignListToBar). Year
+        // thumbs only reach `filters` when they rest, so this runs on commit.
+        filters: {
+            handler() {
+                if (!this._routeResetting) this.requestAlign(false);
+            },
+            deep: true,
+        },
+        sortBy() { this.requestAlign(false); },
+        sortAsc() { this.requestAlign(false); },
+        // An Add-on pill wears the Add-on's name; ask for names only once
+        // an Add-on actually contributes a filter.
+        listFilterSlots: {
+            handler(slots) {
+                if (slots.some((s) => !(s.addon in this.addonNames))) this.loadAddonNames();
+            },
+            immediate: true,
         },
     },
     created() {
         this.loadPapers();
         this.loadMeta();
+        this.loadCollection();
         this._closeDropdown = (e) => {
             if (this.showActionDropdown && this.$refs.actionDropdownRef && !this.$refs.actionDropdownRef.contains(e.target)) {
                 this.showActionDropdown = false;
             }
         };
         document.addEventListener('click', this._closeDropdown);
+        // Filter bar popovers: a press outside the open one closes it (a
+        // press, not a click - a thumb dragged out of the popover must not
+        // close it on release), Esc closes it and hands focus back to its
+        // pill. The path is taken at dispatch, before a re-render can detach
+        // the pressed element.
+        this._onFbarPointer = (e) => {
+            if (!this.openPop) return;
+            const path = e.composedPath ? e.composedPath() : [];
+            const inside = path.some((el) => el && el.getAttribute && el.getAttribute('data-fbar-key') === this.openPop);
+            if (!inside) this.closePop(false);
+        };
+        this._onFbarKey = (e) => {
+            if (e.key === 'Escape' && this.openPop) {
+                e.preventDefault();
+                this.closePop(true);
+            }
+        };
+        document.addEventListener('pointerdown', this._onFbarPointer);
+        document.addEventListener('keydown', this._onFbarKey);
         this._onAddonChanged = (ev) => this.onAddonChanged(ev);
         window.addEventListener(ADDON_EVENT, this._onAddonChanged);
+        this._onItemsCategorized = (ev) => this.onItemsCategorized(ev.detail || {});
+        window.addEventListener(ITEMS_CATEGORIZED_EVENT, this._onItemsCategorized);
+        this._onItemsCollected = (ev) => {
+            const id = ev.detail && ev.detail.collectionId;
+            if (this.isCollectionRoute && parseInt(this.$route.params.id) === id) this.loadPapers();
+        };
+        window.addEventListener(ITEMS_COLLECTED_EVENT, this._onItemsCollected);
     },
     beforeUnmount() {
         document.removeEventListener('click', this._closeDropdown);
+        document.removeEventListener('pointerdown', this._onFbarPointer);
+        document.removeEventListener('keydown', this._onFbarKey);
+        clearTimeout(this._yearTimer);
         window.removeEventListener(ADDON_EVENT, this._onAddonChanged);
+        window.removeEventListener(ITEMS_CATEGORIZED_EVENT, this._onItemsCategorized);
+        window.removeEventListener(ITEMS_COLLECTED_EVENT, this._onItemsCollected);
     },
     methods: {
+        // Drag onto a sidebar category (#199). Selection follows the drag: a
+        // selected row carries the whole selection, any other row only itself.
+        onItemDragStart(e, paper) {
+            const ids = this.selectedPapers.includes(paper.id) ? this.selectedPapers.slice() : [paper.id];
+            e.dataTransfer.setData(ITEM_DRAG_MIME, JSON.stringify(ids));
+            e.dataTransfer.effectAllowed = 'copy';
+            if (e.dataTransfer.setDragImage) {
+                const ghost = document.createElement('div');
+                ghost.className = 'lb-drag-ghost';
+                ghost.textContent = tn('common.itemCount', ids.length);
+                document.body.appendChild(ghost);
+                e.dataTransfer.setDragImage(ghost, 12, 12);
+                setTimeout(() => ghost.remove(), 0);
+            }
+            window.dispatchEvent(new CustomEvent(ITEM_DRAG_EVENT, { detail: { active: true } }));
+        },
+        onItemDragEnd() {
+            window.dispatchEvent(new CustomEvent(ITEM_DRAG_EVENT, { detail: { active: false } }));
+        },
+        // Keep the category tags of the visible rows true without a reload;
+        // a list showing the target category itself is reloaded.
+        onItemsCategorized({ categoryId, name, added = [], removed = [] }) {
+            if (this.$route.name === 'category' && parseInt(this.$route.params.id) === categoryId) {
+                this.loadPapers();
+                return;
+            }
+            for (const p of this.papers) {
+                const cats = p.categories || [];
+                if (added.includes(p.id) && !cats.some(c => c.id === categoryId)) {
+                    p.categories = cats.concat([{ id: categoryId, name }]);
+                } else if (removed.includes(p.id)) {
+                    p.categories = cats.filter(c => c.id !== categoryId);
+                }
+            }
+        },
+        // --- Analyses and export on the page's Collection (#202) ---------
+        // The whole membership, independent of the list's search/filters.
+        async collectionPaperIds() {
+            const rows = await api(`/api/papers?collection_id=${this.collection.id}`);
+            return rows.map(p => p.id);
+        },
+        async withCollectionIds(fn) {
+            if (this.collectionBusy) return;
+            this.collectionBusy = true;
+            try {
+                const ids = await this.collectionPaperIds();
+                if (ids.length) await fn(ids);
+            } catch (e) {
+                alert(e.message);
+            } finally {
+                this.collectionBusy = false;
+            }
+        },
+        collectionResearchChat() {
+            const c = this.collection;
+            return this.withCollectionIds(async (ids) => {
+                this.$router.push({ name: 'research-chat',
+                    query: { paper_ids: ids.join(','), collection_id: c.id, collection_name: c.name } });
+            });
+        },
+        collectionRefreshReview() {
+            const c = this.collection;
+            return this.withCollectionIds(async (ids) => {
+                this.refreshReviewScope = t('scope.collection', { name: c.name });
+                this.refreshReviewIds = ids;
+            });
+        },
+        collectionValidate() {
+            const c = this.collection;
+            return this.withCollectionIds(async (ids) => {
+                if (!confirm(tn('collections.actions.validateConfirm', ids.length, { name: c.name }))) return;
+                await this.runBulkValidate(ids);
+            });
+        },
+        async openCollectionStats() {
+            try {
+                this.collectionStats = await api(`/api/stats?collection_id=${this.collection.id}`);
+            } catch (e) {
+                alert(e.message);
+            }
+        },
+        // The page's own Collection (route /collection/:id).
+        async loadCollection() {
+            if (!this.isCollectionRoute) {
+                this.collection = null;
+                return;
+            }
+            try {
+                this.collection = await api(`/api/collections/${this.$route.params.id}`);
+            } catch (e) {
+                this.collection = null;
+            }
+        },
+        startCollectionEdit() {
+            this.collectionEdit = { name: this.collection.name, description: this.collection.description || '' };
+        },
+        async saveCollectionEdit() {
+            try {
+                this.collection = await api(`/api/collections/${this.collection.id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify(this.collectionEdit),
+                });
+                this.collectionEdit = null;
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            } catch (e) {
+                alert(t('error.generic', { message: e.message }));
+            }
+        },
+        async toggleCollectionArchived() {
+            const c = this.collection;
+            if (!c.archived && !confirm(t('collections.archiveConfirm', { name: c.name }))) return;
+            try {
+                this.collection = await api(`/api/collections/${c.id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ archived: !c.archived }),
+                });
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            } catch (e) {
+                alert(t('error.generic', { message: e.message }));
+            }
+        },
+        async deleteCollection() {
+            const c = this.collection;
+            if (!confirm(tn('collections.deleteConfirm', c.item_count, { name: c.name }))) return;
+            try {
+                await api(`/api/collections/${c.id}`, { method: 'DELETE' });
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+                this.$router.push('/');
+            } catch (e) {
+                alert(t('error.generic', { message: e.message }));
+            }
+        },
+        showCollectionNotice(text) {
+            clearTimeout(this._collectionNoticeTimer);
+            this.collectionNotice = text;
+            this._collectionNoticeTimer = setTimeout(() => { this.collectionNotice = ''; }, 6000);
+        },
+        async onAddedToCollection({ text }) {
+            this.collectionPickerIds = null;
+            this.showCollectionNotice(text);
+            try { this.allCollections = await api('/api/collections'); } catch (e) {}
+            if (this.isCollectionRoute || this.filters.collectionId) {
+                await this.loadPapers();
+                await this.loadCollection();
+            }
+        },
+        async onBibImported() {
+            try { this.allCollections = await api('/api/collections'); } catch (e) {}
+            if (this.isCollectionRoute) {
+                await this.loadPapers();
+                await this.loadCollection();
+            }
+        },
+        async bulkRemoveFromCollection() {
+            const c = this.collection;
+            const ids = this.selectedPapers.slice();
+            if (!c || !ids.length) return;
+            if (!confirm(tn('collections.removeConfirm', ids.length, { name: c.name }))) return;
+            try {
+                const res = await api(`/api/collections/${c.id}/items`, {
+                    method: 'DELETE',
+                    body: JSON.stringify({ paper_ids: ids }),
+                });
+                this.selectedPapers = [];
+                this.selectAll = false;
+                this.showCollectionNotice(tn('collections.removed', (res.removed_ids || []).length, { name: c.name }));
+                await this.loadPapers();
+                await this.loadCollection();
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            } catch (e) {
+                alert(t('error.generic', { message: e.message }));
+            }
+        },
         async loadMeta() {
             try {
                 const [fields, categories] = await Promise.all([
@@ -1422,6 +3891,11 @@ const PaperList = {
                 this.customFields = fields;
                 this.allCategories = categories;
             } catch (e) {}
+            try {
+                this.allCollections = await api('/api/collections');
+            } catch (e) {
+                this.allCollections = [];
+            }
             // Semantic-search toggle only shows up once the embedding role is
             // bound (connection + model, /api/llm/status). No config / request
             // failure -> stay hidden.
@@ -1433,23 +3907,39 @@ const PaperList = {
             }
             if (!this.semanticAvailable) this.semanticMode = false;
         },
+        // One ticket for both loaders (SPA-10): only the newest request may
+        // land, an older one that answers late is dropped. Resetting the
+        // results without a request takes a ticket too, so an answer still in
+        // flight lands nowhere -- and nothing is loading any more.
+        dropPendingSearch() {
+            this._searchTicket = (this._searchTicket || 0) + 1;
+            this.loading = false;
+        },
         async loadPapers() {
+            const ticket = (this._searchTicket = (this._searchTicket || 0) + 1);
             this.loading = true;
             try {
                 let url = '/api/papers?';
                 if (this.searchQuery) url += `search=${encodeURIComponent(this.searchQuery)}&`;
                 if (this.$route.name === 'category' && this.$route.params.id) url += `category_id=${this.$route.params.id}&`;
+                const collectionId = this.isCollectionRoute ? this.$route.params.id : this.filters.collectionId;
+                if (collectionId) url += `collection_id=${encodeURIComponent(collectionId)}&`;
                 url = this.withAddonCiteKeys(url);
-                this.papers = await api(url);
+                const papers = await api(url);
+                if (ticket !== this._searchTicket) return;
+                this.papers = papers;
             } catch (e) {
+                if (ticket !== this._searchTicket) return;
                 console.error('Load papers error:', e);
                 this.papers = [];
             }
             this.loading = false;
+            this.alignAfterLoad();
         },
         debouncedSearch() {
             clearTimeout(this.debounceTimer);
             this.debounceTimer = setTimeout(() => {
+                this._alignAfterLoad = true;
                 if (this.semanticMode) this.runSemanticSearch();
                 else this.loadPapers();
             }, 300);
@@ -1457,11 +3947,40 @@ const PaperList = {
         clearSearch() {
             this.searchQuery = '';
             if (this.semanticMode) {
+                this.dropPendingSearch();
                 this.semanticResults = [];
                 this.semanticMeta = { mode: '', note: '' };
             } else {
+                this._alignAfterLoad = true;
                 this.loadPapers();
             }
+        },
+        // --- Keeping the list in view ----------------------------------------
+        // When a filter, sort or search replaces the list while the bar is
+        // stuck (the page is scrolled past the bar's own place), the new list
+        // starts right under the bar - instead of wherever the browser clamps
+        // a scroll position that belonged to the old list. Instant, no smooth
+        // scroll; nothing happens while the bar sits in its place.
+        requestAlign(afterLoad) {
+            if (afterLoad) this._alignAfterLoad = true;
+            this.$nextTick(() => this.alignListToBar());
+        },
+        // A server-side change (search, Collection, Add-on) aligns again once
+        // its answer is in the list.
+        alignAfterLoad() {
+            if (!this._alignAfterLoad) return;
+            this._alignAfterLoad = false;
+            this.$nextTick(() => this.alignListToBar());
+        },
+        alignListToBar() {
+            const bar = this.$refs.fbar;
+            const mark = this.$refs.fbarSentinel;
+            const list = this.$refs.listRegion;
+            if (!bar || !mark || !list) return;
+            const barRect = bar.getBoundingClientRect();
+            if (barRect.top - mark.getBoundingClientRect().top < 1) return;  // not stuck
+            const delta = list.getBoundingClientRect().top - (barRect.bottom + 8);
+            if (Math.abs(delta) >= 1) window.scrollTo({ top: window.scrollY + delta, behavior: 'instant' });
         },
         // Explicit opt-in toggle (#101): switches the search from /api/papers
         // (server-side substring search) to /api/search/semantic (embedding
@@ -1473,8 +3992,11 @@ const PaperList = {
             if (!this.semanticAvailable) return;
             this.semanticMode = !this.semanticMode;
             if (this.semanticMode) {
+                // The pills lock in semantic mode; none stays open behind it.
+                this.closePop(false);
                 this.runSemanticSearch();
             } else {
+                this.dropPendingSearch();
                 this.semanticResults = [];
                 this.semanticMeta = { mode: '', note: '' };
                 this.loadPapers();
@@ -1483,30 +4005,213 @@ const PaperList = {
         async runSemanticSearch() {
             const q = this.searchQuery.trim();
             if (!q) {
+                this.dropPendingSearch();
                 this.semanticResults = [];
                 this.semanticMeta = { mode: '', note: '' };
                 return;
             }
+            const ticket = (this._searchTicket = (this._searchTicket || 0) + 1);
             this.loading = true;
             try {
                 const data = await api(`/api/search/semantic?q=${encodeURIComponent(q)}`);
+                if (ticket !== this._searchTicket) return;
                 this.semanticResults = data.results || [];
                 this.semanticMeta = { mode: data.mode || '', note: data.note || '' };
             } catch (e) {
+                if (ticket !== this._searchTicket) return;
                 console.error('Semantic search error:', e);
                 this.semanticResults = [];
                 this.semanticMeta = { mode: '', note: '' };
             }
             this.loading = false;
+            this.alignAfterLoad();
+        },
+        // --- Popovers and menus (filter bar, Collection head) -------------
+        // One open at a time, keyed by `openPop`. Opening flips a filter
+        // popover to the pill's right edge if it would leave the viewport
+        // (measured once, before the first paint) and moves focus to its
+        // first control - without scrolling the page.
+        togglePop(key) {
+            if (this.openPop === key) {
+                this.closePop(false);
+                return;
+            }
+            this.commitYearDraft();
+            this.openPop = key;
+            this.popRight = false;
+            this.$nextTick(() => {
+                const pop = document.getElementById('lb-fbar-pop-' + key);
+                if (!pop || this.openPop !== key) return;
+                if (pop.getBoundingClientRect().right > window.innerWidth - 8) this.popRight = true;
+                const first = pop.querySelector(FBAR_FOCUSABLE);
+                if (first) first.focus({ preventScroll: true });
+            });
+        },
+        closePop(refocus) {
+            const key = this.openPop;
+            if (!key) return;
+            this.commitYearDraft();
+            this.openPop = '';
+            if (refocus) this.focusPill(key);
+        },
+        // Back to the pill or menu key that opened `key`.
+        focusPill(key) {
+            this.$nextTick(() => {
+                const trigger = this.$el.querySelector(`[data-fbar-key="${key}"] [data-fbar-trigger]`);
+                if (trigger) trigger.focus({ preventScroll: true });
+            });
+        },
+        // Tabbing out of an open menu closes it, like a filter popover.
+        onMenuFocusOut(e, key) {
+            if (this.openPop === key && e.relatedTarget && !e.currentTarget.contains(e.relatedTarget)) this.closePop(false);
+        },
+        // Up/Down (and Home/End) walk the enabled items of a menu.
+        onMenuKeys(e) {
+            const step = { ArrowDown: 1, ArrowUp: -1 }[e.key];
+            if (!step && e.key !== 'Home' && e.key !== 'End') return;
+            const items = [...e.currentTarget.querySelectorAll('[role="menuitem"]:not([disabled])')];
+            if (!items.length) return;
+            e.preventDefault();
+            const at = items.indexOf(document.activeElement);
+            let next;
+            if (e.key === 'Home') next = 0;
+            else if (e.key === 'End') next = items.length - 1;
+            else next = at < 0 ? 0 : (at + step + items.length) % items.length;
+            items[next].focus();
+        },
+        // A menu item closes its menu, hands focus back to the key, then acts.
+        menuPick(act) {
+            this.closePop(true);
+            act();
+        },
+        // An export link must still be in the page when the browser follows
+        // it: the menu closes only after the click has run its course.
+        onMenuExportDone() {
+            setTimeout(() => this.closePop(true), 0);
+        },
+        // The Collection's Research Chat: the whole Collection, unless a
+        // selection, a filter or a search says the visible items are meant.
+        collectionChat() {
+            if (this.selectedPapers.length || this.clientFilterActive || this.searchQuery.trim()) {
+                this.openResearchChat();
+                return;
+            }
+            this.collectionResearchChat();
+        },
+        // The pill's ×: the filter goes, the popover with it, and focus
+        // stays on the pill (the × itself disappears).
+        clearPill(key, clear) {
+            clear();
+            this.yearDraft = null;
+            if (this.openPop === key) this.openPop = '';
+            this.focusPill(key);
+        },
+        // A pick from a radio list is final: apply, close, back to the pill.
+        pickAndClose(apply) {
+            apply();
+            this.closePop(true);
+        },
+        // Arrow keys in a radio group move to the next option and choose it
+        // (live, like the click); Home/End jump to the ends.
+        onRadioKeys(e, choose) {
+            const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[e.key];
+            if (!step && e.key !== 'Home' && e.key !== 'End') return;
+            const radios = [...e.currentTarget.querySelectorAll('[role="radio"]')];
+            if (!radios.length) return;
+            e.preventDefault();
+            const at = radios.indexOf(document.activeElement);
+            let next;
+            if (e.key === 'Home') next = 0;
+            else if (e.key === 'End') next = radios.length - 1;
+            else next = ((at < 0 ? 0 : at) + step + radios.length) % radios.length;
+            choose(radios[next].getAttribute('data-value') || '');
+            this.$nextTick(() => radios[next].focus());
+        },
+        toggleCategory(id) {
+            this.filters.categoryId = String(this.filters.categoryId) === String(id) ? '' : String(id);
+        },
+        // --- Year ---------------------------------------------------------
+        // A bound on the list's own min/max is "no filter": null, so
+        // hasActiveFilters and the export scope stay honest.
+        setYearRange(lo, hi) {
+            const b = this.yearBounds;
+            this.yearDraft = null;
+            this.filters.yearFrom = lo == null || lo <= b.min ? null : lo;
+            this.filters.yearTo = hi == null || hi >= b.max ? null : hi;
+        },
+        // While a thumb moves, the popover and the pill follow at once; the
+        // list (a full re-filter and re-render) follows when the thumb rests
+        // or is let go.
+        onYearRange(which, e) {
+            const v = parseInt(e.target.value, 10);
+            const cur = this.yearDraft || { lo: this.yearLo, hi: this.yearHi };
+            const lo = which === 'from' ? Math.min(v, cur.hi) : cur.lo;
+            const hi = which === 'to' ? Math.max(v, cur.lo) : cur.hi;
+            const shown = which === 'from' ? lo : hi;
+            if (String(shown) !== e.target.value) e.target.value = shown;  // a thumb never passes the other
+            this.yearDraft = { lo, hi };
+            clearTimeout(this._yearTimer);
+            this._yearTimer = setTimeout(() => this.commitYearDraft(), 150);
+        },
+        commitYearDraft() {
+            clearTimeout(this._yearTimer);
+            const d = this.yearDraft;
+            if (d) this.setYearRange(d.lo, d.hi);
+        },
+        // Exact entry: a complete year inside the span applies while typing
+        // (and on the spinner); the change event (Enter, leaving the field)
+        // clamps whatever stands there, and an empty field drops that side.
+        onYearNumber(which, e, commit) {
+            const b = this.yearBounds;
+            const raw = String(e.target.value || '').trim();
+            this.yearDraft = null;
+            if (!raw) {
+                if (!commit) return;
+                if (which === 'from') this.setYearRange(null, this.yearHi);
+                else this.setYearRange(this.yearLo, null);
+                e.target.value = which === 'from' ? this.yearLo : this.yearHi;
+                return;
+            }
+            let v = parseInt(raw, 10);
+            if (!Number.isFinite(v)) return;
+            if (!commit && (v < b.min || v > b.max)) return;
+            v = Math.min(Math.max(v, b.min), b.max);
+            const lo = which === 'from' ? Math.min(v, this.yearHi) : this.yearLo;
+            const hi = which === 'to' ? Math.max(v, this.yearLo) : this.yearHi;
+            this.setYearRange(lo, hi);
+            if (commit) e.target.value = which === 'from' ? lo : hi;
+        },
+        // --- Add-on pills --------------------------------------------------
+        // The Manifest name, as Settings and the Marketplace show it; the
+        // id stands in when the list cannot be read.
+        async loadAddonNames() {
+            if (this._addonNamesLoading) return;
+            this._addonNamesLoading = true;
+            const names = Object.assign({}, this.addonNames);
+            try {
+                const data = await api('/api/plugins');
+                for (const p of (data && data.plugins) || []) {
+                    if (p && p.id && p.name) names[p.id] = String(p.name);
+                }
+            } catch (e) { /* the id stands in */ }
+            for (const s of this.listFilterSlots) if (!(s.addon in names)) names[s.addon] = s.addon;
+            this.addonNames = names;
+            this._addonNamesLoading = false;
+        },
+        addonName(id) {
+            return this.addonNames[id] || id;
         },
         resetFilters() {
             const hadAddonFilter = Object.keys(this.activeAddonSelections).length > 0;
-            this.filters = {
-                yearFrom: null, yearTo: null, categoryId: '', hasDoi: '', importSource: '', hasPdf: '',
-                addonSelections: {},
-            };
-            // Add-on filters are server-side (cite_keys): fetch again.
-            if (hadAddonFilter) this.loadPapers();
+            const hadCollection = !!this.filters.collectionId && !this.isCollectionRoute;
+            this.yearDraft = null;
+            this.filters = emptyListFilters();
+            // Add-on filters are server-side (cite_keys): fetch again - unless
+            // the Collection filter's own watcher is about to.
+            if (hadAddonFilter && !hadCollection) {
+                this._alignAfterLoad = true;
+                this.loadPapers();
+            }
         },
         // One Add-on's filter selection changed (slot "item-list-filter", #190).
         setAddonSelection(addonId, selection) {
@@ -1520,6 +4225,7 @@ const PaperList = {
                 delete next[addonId];
             }
             this.filters.addonSelections = next;
+            this._alignAfterLoad = true;
             this.loadPapers();
         },
         // Adds the Add-on filters' cite keys to a /api/papers URL. Several
@@ -1543,6 +4249,7 @@ const PaperList = {
         // An Add-on switched off takes its filter with it.
         onAddonChanged(ev) {
             const d = (ev && ev.detail) || {};
+            if (!d.active && this.openPop === 'addon-' + d.id && !addonIsActive(d.id)) this.openPop = '';
             if (d.active || !this.filters.addonSelections[d.id]) return;
             const next = Object.assign({}, this.filters.addonSelections);
             delete next[d.id];
@@ -1568,9 +4275,9 @@ const PaperList = {
             return { key: 'other', label: 'Import', detail: detailStored || orig };
         },
         formatAuthors(authors) {
-            if (!authors) return 'Unbekannt';
+            if (!authors) return t('common.unknown');
             if (Array.isArray(authors)) {
-                if (authors.length === 0) return 'Unbekannt';
+                if (authors.length === 0) return t('common.unknown');
                 if (authors.length <= 3) return authors.join(', ');
                 return authors.slice(0, 2).join(', ') + ' et al.';
             }
@@ -1600,7 +4307,7 @@ const PaperList = {
                 const result = await api('/api/papers/fetch-abstracts', {
                     method: 'POST',
                 });
-                alert(`Abstracts aktualisiert:\n${result.total} Paper geprueft\n${result.fetched} Abstracts nachgeladen`);
+                alert(t('library.abstractsFetched', { total: result.total, fetched: result.fetched }));
                 if (result.fetched > 0) {
                     await this.loadPapers();
                 }
@@ -1617,7 +4324,7 @@ const PaperList = {
                     method: 'POST',
                     body: JSON.stringify({ paper_ids: this.selectedPapers }),
                 });
-                alert(`Abstracts aktualisiert:\n${result.total} Paper geprueft\n${result.fetched} Abstracts nachgeladen`);
+                alert(t('library.abstractsFetched', { total: result.total, fetched: result.fetched }));
                 if (result.fetched > 0) {
                     await this.loadPapers();
                 }
@@ -1637,7 +4344,7 @@ const PaperList = {
                     this.doiCandidateIndex = 0;
                     this.doiAcceptedCount = 0;
                 } else {
-                    alert(`DOI-Suche abgeschlossen:\n${result.total_checked} Paper geprueft\nKeine neuen DOIs gefunden.`);
+                    alert(t('library.doiSearchNoneFound', { total: result.total_checked }));
                 }
             } catch (e) {
                 alert(t('error.doiSearchFailed', { message: e.message }));
@@ -1682,7 +4389,7 @@ const PaperList = {
                 const total = this.doiCandidates.length;
                 this.doiCandidates = [];
                 this.doiCandidateIndex = 0;
-                alert(`DOI-Pruefung abgeschlossen: ${this.doiAcceptedCount} von ${total} DOIs uebernommen.`);
+                alert(t('library.doiReviewDone', { accepted: this.doiAcceptedCount, total }));
                 if (this.doiAcceptedCount > 0) {
                     this.loadPapers();
                 }
@@ -1690,11 +4397,14 @@ const PaperList = {
         },
         async bulkValidate() {
             if (!this.selectedPapers.length) return;
+            await this.runBulkValidate(this.selectedPapers.slice());
+        },
+        async runBulkValidate(ids) {
             this.bulkValidating = true;
             try {
                 const result = await api('/api/papers/bulk-validate', {
                     method: 'POST',
-                    body: JSON.stringify({ paper_ids: this.selectedPapers }),
+                    body: JSON.stringify({ paper_ids: ids }),
                 });
                 // Response shape after the propose/apply refactor:
                 //   results: [{id, status: applied|review|noop|error, confidence}]
@@ -1704,15 +4414,15 @@ const PaperList = {
                 const review = result.results.filter(r => r.status === 'review').length;
                 const noop = result.results.filter(r => r.status === 'noop').length;
                 const err = result.results.filter(r => r.status === 'error').length;
-                let msg = `Validierung abgeschlossen: ${applied} auto-uebernommen`;
-                if (review) msg += `, ${review} brauchen Pruefung (niedrige Konfidenz)`;
-                if (noop) msg += `, ${noop} unveraendert`;
-                if (err) msg += `, ${err} Fehler`;
+                let msg = t('library.validateDone', { applied });
+                if (review) msg += t('library.validateNeedsReview', { count: review });
+                if (noop) msg += t('library.validateUnchanged', { count: noop });
+                if (err) msg += t('library.validateErrors', { count: err });
                 if (review && result.review_queue && result.review_queue.length) {
                     // Surface the review-queue IDs in the console so a user
                     // can find them. A future improvement could chain them
                     // into the validation popup sequentially.
-                    console.info('Niedrig-Konfidenz Paper-IDs:', result.review_queue.map(e => e.id));
+                    console.info('Low-confidence item ids:', result.review_queue.map(e => e.id));
                 }
                 alert(msg);
                 this.selectedPapers = [];
@@ -1720,7 +4430,7 @@ const PaperList = {
                 await this.loadPapers();
                 window.dispatchEvent(new CustomEvent('refresh-sidebar'));
             } catch (e) {
-                alert('Bulk-Validierung fehlgeschlagen: ' + e.message);
+                alert(t('library.bulkValidateFailed', { message: e.message }));
             }
             this.bulkValidating = false;
         },
@@ -1755,11 +4465,11 @@ const PaperList = {
                 this.dupGroups = data.groups || [];
                 for (let i = 0; i < this.dupGroups.length; i++) {
                     const g = this.dupGroups[i];
-                    const best = g.papers.reduce((a, b) => {
-                        const scoreA = (a.doi ? 2 : 0) + (a.title ? 1 : 0) + (a.authors ? 1 : 0);
-                        const scoreB = (b.doi ? 2 : 0) + (b.title ? 1 : 0) + (b.authors ? 1 : 0);
-                        return scoreB > scoreA ? b : a;
-                    });
+                    // An item whose PDF is really on disk outranks every
+                    // metadata field: merging keeps the keeper's file.
+                    const score = (p) => (p.has_file ? 8 : 0) + (p.doi ? 2 : 0)
+                        + (p.title ? 1 : 0) + (p.authors ? 1 : 0);
+                    const best = g.papers.reduce((a, b) => (score(b) > score(a) ? b : a));
                     this.dupKeep[i] = best.id;
                 }
             } catch (e) {
@@ -1809,10 +4519,582 @@ const PaperList = {
 
 
 // =============================================================================
+// PDF preview (#229) — PDF.js behind one small adapter
+// -----------------------------------------------------------------------------
+// The detail view's preview is PDF.js instead of the browser's own viewer:
+// only a viewer the app steers can jump to a spot and frame it. The version is
+// pinned and vendored unchanged from the npm tarball pdfjs-dist-5.4.624.tgz
+// (integrity sha512-sm6TxKTtWv1Oh6n3C6J6a8odejb5uO4A4zo/2dgkHuC0iu8ZMAXOezEODkVaoVp8nX1Xzr+0WxFJJmUr45hQzg==)
+// into static/vendor: same origin (the worker has to be), offline, loaded with
+// a dynamic import(), no build step (ADR-0002 stays deferred). Shipped are the
+// library, the worker, the viewer component with its CSS and annotation icons,
+// and the LICENSE (Apache-2.0) - no CMaps and no standard fonts: binary
+// formats, and papers embed their fonts.
+//
+// The SPA reaches PDF.js through this adapter and nothing else:
+//   createPdfViewer(host, { onPageChange({ page, pages }) }) -> Promise<viewer>
+//   viewer.open(url, { page })  load a file and start on `page`
+//   viewer.goTo(page, rect)     scroll `rect` (page fractions, origin top left)
+//                               into the upper third and frame it, twice pulsing
+//   viewer.zoom('in' | 'out' | 'width'),  viewer.destroy()
+// Tests swap the whole adapter for a fake (`window.LB_PDF_VIEWER`, set up in
+// tests/js/setup.js) - the same kind of seam as LB_SCRIPT_LOADER.
+// =============================================================================
+
+const PDFJS_DIR = '/static/vendor/pdfjs-5.4.624/';
+let _pdfjs = null;
+
+// PDF.js 5.4.624 keeps one page count for the whole window
+// (PagesMapper.instance) instead of one per document: every document that
+// loads sets it, PDFViewer.setDocument() zeroes it whenever a viewer lets
+// its document go, and getPage() refuses every page above it. Left alone,
+// the reload after the reader saved the file ended in "Invalid page
+// request" and an empty preview. The count follows the document on screen.
+let _pdfOnScreen = null;
+
+function keepPageCount(lib) {
+    // Another PDF.js without this internal only loses the reload fix,
+    // never the preview.
+    const mapper = lib.PagesMapper && lib.PagesMapper.instance;
+    if (mapper) mapper.pagesNumber = _pdfOnScreen ? _pdfOnScreen.numPages : 0;
+}
+
+function loadPdfJs() {
+    if (!_pdfjs) {
+        _pdfjs = (async () => {
+            // The viewer component reads the library from globalThis.pdfjsLib,
+            // which the library module sets: library first, viewer second.
+            const lib = await import(/* @vite-ignore */ PDFJS_DIR + 'pdf.min.mjs');
+            lib.GlobalWorkerOptions.workerSrc = PDFJS_DIR + 'pdf.worker.min.mjs';
+            const viewer = await import(/* @vite-ignore */ PDFJS_DIR + 'pdf_viewer.mjs');
+            // Its stylesheet first: without it the text layer would flash up
+            // as visible text before the first page is drawn.
+            if (!document.querySelector('link[data-lb-pdfjs]')) {
+                await new Promise((resolve) => {
+                    const link = document.createElement('link');
+                    link.rel = 'stylesheet';
+                    link.href = PDFJS_DIR + 'pdf_viewer.css';
+                    link.setAttribute('data-lb-pdfjs', '');
+                    link.onload = resolve;
+                    link.onerror = resolve;
+                    document.head.appendChild(link);
+                });
+            }
+            return { lib, viewer };
+        })();
+        _pdfjs.catch(() => { _pdfjs = null; });
+    }
+    return _pdfjs;
+}
+
+async function createPdfJsViewer(host, handlers = {}) {
+    const { lib, viewer: pdfjsViewer } = await loadPdfJs();
+    const container = document.createElement('div');
+    container.className = 'lb-pdfjs';
+    const pagesEl = document.createElement('div');
+    pagesEl.className = 'pdfViewer';
+    container.appendChild(pagesEl);
+    host.appendChild(container);
+
+    const eventBus = new pdfjsViewer.EventBus();
+    const linkService = new pdfjsViewer.PDFLinkService({ eventBus, externalLinkTarget: pdfjsViewer.LinkTarget.BLANK });
+    const teardown = new AbortController();
+    const pdfViewer = new pdfjsViewer.PDFViewer({
+        container, viewer: pagesEl, eventBus, linkService, abortSignal: teardown.signal,
+        // The reader's annotations are drawn as they are in the file; forms
+        // stay static and nothing can be edited - LocalBib never writes a PDF.
+        annotationMode: lib.AnnotationMode.ENABLE,
+        annotationEditorMode: lib.AnnotationEditorType.DISABLE,
+        imageResourcesPath: PDFJS_DIR + 'images/',
+    });
+    linkService.setViewer(pdfViewer);
+
+    let shown = null;        // the loading task whose document is on screen
+    let latest = null;       // the newest open(); an older one that resolves late is dropped
+    let startPage = 1;
+    let pending = null;      // a goTo() that arrived before the pages existed
+    let ring = null;         // { page, el } - the frame around the last jump target
+
+    const report = (page) => {
+        if (handlers.onPageChange) handlers.onPageChange({ page, pages: pdfViewer.pagesCount });
+    };
+    eventBus.on('pagesinit', () => {
+        pdfViewer.currentScaleValue = 'page-width';
+        if (startPage > 1) pdfViewer.currentPageNumber = Math.min(startPage, pdfViewer.pagesCount);
+        report(pdfViewer.currentPageNumber);
+        if (pending) {
+            const { page, rect } = pending;
+            pending = null;
+            goTo(page, rect);
+        }
+    });
+    eventBus.on('pagechanging', (e) => report(e.pageNumber));
+    // A zoom re-renders the page and drops foreign children; the frame
+    // (positioned in percent) goes back in.
+    eventBus.on('pagerendered', ({ pageNumber }) => {
+        if (!ring || ring.page !== pageNumber || ring.el.isConnected) return;
+        const view = pdfViewer.getPageView(pageNumber - 1);
+        if (view) view.div.appendChild(ring.el);
+    });
+    // "Page width" follows the panel when the window or the layout changes.
+    let widthFrame = 0;
+    const resize = new ResizeObserver(() => {
+        if (pdfViewer.currentScaleValue !== 'page-width') return;
+        cancelAnimationFrame(widthFrame);
+        widthFrame = requestAnimationFrame(() => { pdfViewer.currentScaleValue = 'page-width'; });
+    });
+    resize.observe(container);
+
+    function frame(page, rect) {
+        if (ring) ring.el.remove();
+        ring = null;
+        if (!rect) return;
+        const el = document.createElement('div');
+        el.className = 'lb-pdf-ring';
+        el.style.left = `calc(${rect.x * 100}% - 6px)`;
+        el.style.top = `calc(${rect.y * 100}% - 5px)`;
+        el.style.width = `calc(${rect.w * 100}% + 12px)`;
+        el.style.height = `calc(${rect.h * 100}% + 10px)`;
+        // Two pulses on the jump, not again each time a zoom puts it back.
+        el.addEventListener('animationend', () => el.classList.add('is-settled'), { once: true });
+        ring = { page, el };
+        const view = pdfViewer.getPageView(page - 1);
+        if (view) view.div.appendChild(el);
+    }
+
+    function goTo(page, rect) {
+        if (!pdfViewer.pdfDocument || !pdfViewer.pagesCount) {
+            pending = { page, rect };
+            return;
+        }
+        const view = pdfViewer.getPageView(page - 1);
+        if (!view) return;
+        const box = container.getBoundingClientRect();
+        const pageBox = view.div.getBoundingClientRect();
+        const top = pageBox.top - box.top + container.scrollTop + (rect ? rect.y * pageBox.height : 0);
+        // A spot lands in the upper third of the preview, a bare page at its top.
+        container.scrollTop = Math.max(0, top - (rect ? container.clientHeight / 3 : 0));
+        if (rect) {
+            const left = pageBox.left - box.left + container.scrollLeft + rect.x * pageBox.width;
+            const right = left + rect.w * pageBox.width;
+            if (left < container.scrollLeft || right > container.scrollLeft + container.clientWidth) {
+                container.scrollLeft = Math.max(0, left - 24);
+            }
+        }
+        frame(page, rect);
+        report(page);
+    }
+
+    return {
+        async open(url, { page = 1 } = {}) {
+            startPage = page || 1;
+            const task = lib.getDocument({ url, isEvalSupported: false });
+            latest = task;
+            // A locked PDF asks for its password here; cancelling ends the load.
+            task.onPassword = (update, reason) => {
+                const answer = window.prompt(t(reason === lib.PasswordResponses.INCORRECT_PASSWORD
+                    ? 'pdf.passwordWrong' : 'pdf.password'));
+                if (answer === null) task.destroy();
+                else update(answer);
+            };
+            let doc;
+            try {
+                doc = await task.promise;
+            } catch (e) {
+                if (task !== latest) return null;   // superseded: its failure is no news
+                throw e;
+            }
+            if (task !== latest) {
+                task.destroy();
+                keepPageCount(lib);   // its load set the count to its own pages
+                return null;
+            }
+            frame(null, null);
+            // The old document goes first: swapping in one call would zero
+            // the count after the new document has set it.
+            if (pdfViewer.pdfDocument) pdfViewer.setDocument(null);
+            _pdfOnScreen = doc;
+            keepPageCount(lib);
+            pdfViewer.setDocument(doc);
+            linkService.setDocument(doc, null);
+            if (shown) shown.destroy();
+            shown = task;
+            return { pages: doc.numPages };
+        },
+        goTo,
+        zoom(step) {
+            if (!pdfViewer.pdfDocument) return;
+            if (step === 'width') pdfViewer.currentScaleValue = 'page-width';
+            else if (step === 'in') pdfViewer.increaseScale();
+            else pdfViewer.decreaseScale();
+        },
+        destroy() {
+            resize.disconnect();
+            cancelAnimationFrame(widthFrame);
+            latest = null;
+            // Drops the viewer's document listeners (copy, scroll) with the pages.
+            if (_pdfOnScreen === pdfViewer.pdfDocument) _pdfOnScreen = null;
+            pdfViewer.setDocument(null);
+            keepPageCount(lib);
+            linkService.setDocument(null, null);
+            teardown.abort();
+            if (shown) shown.destroy();
+            shown = null;
+            container.remove();
+        },
+    };
+}
+
+function createPdfViewer(host, handlers) {
+    if (typeof window.LB_PDF_VIEWER === 'function') return Promise.resolve(window.LB_PDF_VIEWER(host, handlers));
+    return createPdfJsViewer(host, handlers);
+}
+
+// The preview pane: one adapter per mounted pane, opened on `src` and opened
+// again (on the page it was on) whenever `src` changes - the URL carries the
+// file's Stand, so a file the reader saved again is fetched afresh.
+const PdfPreview = {
+    props: {
+        src: { type: String, required: true },
+        page: { type: Number, default: null },
+    },
+    emits: ['page'],
+    template: `
+        <div class="lb-pdf-host" data-testid="pdf-frame" :data-src="src">
+            <div ref="mount" class="lb-pdf-mount"></div>
+            <p v-if="failed" class="lb-pdf-failed">{{ $t('pdf.loadFailed') }}</p>
+        </div>
+    `,
+    data() {
+        return { failed: false };
+    },
+    async mounted() {
+        this._page = this.page || 1;
+        let viewer;
+        try {
+            viewer = await createPdfViewer(this.$refs.mount, {
+                onPageChange: (state) => {
+                    this._page = state.page;
+                    this.$emit('page', state);
+                },
+            });
+        } catch (e) {
+            console.error('pdf.viewer', e);
+            this.failed = true;
+            return;
+        }
+        if (this._gone) {
+            viewer.destroy();
+            return;
+        }
+        this._viewer = viewer;
+        await this.show();
+        if (this._queued) {
+            const { page, rect } = this._queued;
+            this._queued = null;
+            viewer.goTo(page, rect);
+        }
+    },
+    unmounted() {
+        this._gone = true;
+        if (this._viewer) this._viewer.destroy();
+    },
+    watch: {
+        src() { this.show(); },
+        page(value) { if (value) this.goTo(value, null); },
+    },
+    methods: {
+        async show() {
+            if (!this._viewer) return;
+            this.failed = false;
+            try {
+                await this._viewer.open(this.src, { page: this._page });
+            } catch (e) {
+                console.error('pdf.open', e);
+                this.failed = true;
+            }
+        },
+        goTo(page, rect) {
+            if (this._viewer) this._viewer.goTo(page, rect);
+            else this._queued = { page, rect };
+        },
+        zoom(step) {
+            if (this._viewer) this._viewer.zoom(step);
+        },
+    },
+};
+
+// --- Annotations block (#229) -------------------------------------------------
+// What the reader marked in the PDF, read by GET /api/papers/{id}/annotations.
+// Presentational: the detail view owns the data and its refresh (so a tab can
+// count it while the block is elsewhere), the block owns only its filters.
+
+const ANNOTATION_TYPES = {
+    Highlight: 'highlight', Underline: 'underline', StrikeOut: 'strikeout', Squiggly: 'squiggly',
+    Text: 'note', FreeText: 'textBox', Caret: 'caret', Ink: 'ink', Square: 'rectangle',
+    Circle: 'ellipse', Line: 'line', Polygon: 'polygon', PolyLine: 'polyline', Stamp: 'stamp',
+};
+
+const _annSvg = (body) => `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+const ANNOTATION_ICONS = {
+    highlight: _annSvg('<path d="M9 11l-6 6v3h9l3-3"/><path d="M22 12l-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4"/>'),
+    underline: _annSvg('<path d="M6 4v6a6 6 0 0 0 12 0V4"/><path d="M4 20h16"/>'),
+    strikeout: _annSvg('<path d="M16 4H9a3 3 0 0 0-2.83 4"/><path d="M14 12a4 4 0 0 1 0 8H6"/><path d="M4 12h16"/>'),
+    squiggly: _annSvg('<path d="M6 4v6a6 6 0 0 0 12 0V4"/><path d="M3 20c1.5-2 3-2 4.5 0s3 2 4.5 0 3-2 4.5 0 3 2 4.5 0"/>'),
+    comment: _annSvg('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'),
+    area: _annSvg('<rect x="3" y="5" width="18" height="14" rx="1"/>'),
+    ellipse: _annSvg('<ellipse cx="12" cy="12" rx="9" ry="7"/>'),
+    ink: _annSvg('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>'),
+    line: _annSvg('<path d="M5 19L19 5"/>'),
+    polygon: _annSvg('<path d="M12 3l9 7-4 11H7L3 10z"/>'),
+    stamp: _annSvg('<path d="M5 21h14"/><path d="M4 15.5A2.5 2.5 0 0 1 6.5 13h11a2.5 2.5 0 0 1 2.5 2.5V17H4z"/><path d="M14 13V8.5c0-1.5 1-1.5 1-3.5a3 3 0 0 0-6 0c0 2 1 2 1 3.5V13"/>'),
+};
+const ANNOTATION_ICON_OF = {
+    Highlight: 'highlight', Underline: 'underline', StrikeOut: 'strikeout', Squiggly: 'squiggly',
+    Text: 'comment', FreeText: 'comment', Caret: 'comment', Ink: 'ink', Square: 'area',
+    Circle: 'ellipse', Line: 'line', PolyLine: 'line', Polygon: 'polygon', Stamp: 'stamp',
+};
+
+// Short date and time of an annotation ("Oct 9, 20:39"), the year only when
+// it is not this one.
+function formatAnnotationTime(iso) {
+    if (!iso) return '';
+    const when = new Date(iso);
+    if (isNaN(when.getTime())) return '';
+    const opts = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' };
+    if (when.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+    return new Intl.DateTimeFormat(uiLocale(), opts).format(when);
+}
+
+// The reader's mark colour as a tint behind the quote: light colours carry
+// more of it than dark ones, the dark theme less of every colour.
+function annotationTint(hex, dark) {
+    const m = /^#([0-9a-f]{6})$/i.exec(hex || '');
+    if (!m) return 'var(--lb-accent-soft)';
+    const n = parseInt(m[1], 16);
+    const r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+    const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    const alpha = dark ? 0.34 : (lum > 0.6 ? 0.55 : 0.28);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+const AnnotationsBlock = {
+    props: {
+        // { status: 'loading' | 'ready' | 'unreadable' | 'error', data, error }
+        state: { type: Object, required: true },
+        activeId: { type: String, default: null },
+        paperId: { type: Number, required: true },
+    },
+    emits: ['jump'],
+    template: `
+        <section class="lb-detail-section lb-ann" data-testid="annotations" aria-labelledby="lb-ann-h">
+            <div class="lb-ann-head">
+                <div class="lb-ann-title">
+                    <h4 id="lb-ann-h" class="lb-detail-h">{{ $t('annotations.heading') }}</h4>
+                    <span v-if="ready" class="lb-ann-count" data-testid="annotations-count">{{ entries.length }}</span>
+                </div>
+                <span v-if="loading" class="lb-ann-stand">{{ $t('annotations.reading') }}</span>
+                <span v-else-if="ready" class="lb-ann-stand" data-testid="annotations-stand">{{ $t('annotations.readFrom', { when: standLabel }) }}</span>
+            </div>
+
+            <div v-if="loading" class="lb-ann-loading" aria-busy="true" data-testid="annotations-loading">
+                <div class="lb-ann-shimmer" style="width: 86%;"></div>
+                <div class="lb-ann-shimmer" style="width: 64%;"></div>
+                <div class="lb-ann-shimmer" style="width: 74%;"></div>
+                <p class="lb-ann-hint">{{ $t('annotations.state.notWaiting') }}</p>
+            </div>
+
+            <p v-else-if="state.status === 'unreadable'" class="lb-ann-unreadable" data-testid="annotations-unreadable">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+                <span>{{ $t('annotations.state.unreadable') }}</span>
+            </p>
+
+            <p v-else-if="state.status === 'error'" class="lb-ann-error" data-testid="annotations-error">{{ state.error }}</p>
+
+            <div v-else-if="ready && !entries.length" class="lb-ann-emptybox" data-testid="annotations-empty">
+                <p class="lb-ann-empty">{{ $t('annotations.state.empty') }}</p>
+                <p class="lb-ann-hint">{{ $t('annotations.state.emptyHint') }}</p>
+            </div>
+
+            <template v-else-if="ready">
+                <div role="toolbar" class="lb-ann-filters" :aria-label="$t('annotations.filter.label')">
+                    <div class="lb-ann-chips">
+                        <button v-for="c in chips" :key="c.key" type="button" class="lb-ann-chip"
+                                :class="{ 'is-on': kindFilter === c.key }" :aria-pressed="String(kindFilter === c.key)"
+                                :data-filter="c.key" @click="kindFilter = c.key">
+                            {{ c.label }} <span class="lb-ann-chip-n">{{ c.count }}</span>
+                        </button>
+                    </div>
+                    <div class="lb-ann-dots">
+                        <button v-for="d in colors" :key="d.hex" type="button" class="lb-ann-dot"
+                                :class="{ 'is-on': colorFilter === d.hex }" :aria-pressed="String(colorFilter === d.hex)"
+                                :aria-label="$t('annotations.filter.color', { color: d.hex, n: d.count })"
+                                :title="$t('annotations.filter.color', { color: d.hex, n: d.count })"
+                                :data-color="d.hex" @click="colorFilter = colorFilter === d.hex ? null : d.hex">
+                            <span class="lb-ann-swatch" :style="{ background: d.hex }"></span>{{ d.count }}
+                        </button>
+                    </div>
+                </div>
+
+                <div v-if="!visible.length" class="lb-ann-nomatch" data-testid="annotations-no-match">
+                    <span>{{ $t('annotations.filter.noMatch') }}</span>
+                    <button type="button" class="lb-btn-text" @click="showAll">{{ $t('annotations.filter.showAll') }}</button>
+                </div>
+
+                <div v-for="g in groups" :key="g.vkey" class="lb-ann-group" data-testid="annotations-group">
+                    <div class="lb-ann-group-head">
+                        <span class="lb-ann-group-title">{{ g.title }}</span>
+                        <span class="lb-ann-group-pages">{{ g.pages }}</span>
+                    </div>
+                    <button v-for="a in g.items" :key="a.id" type="button" class="lb-ann-row"
+                            :class="{ 'is-active': a.id === activeId }" :aria-pressed="String(a.id === activeId)"
+                            :data-annotation-id="a.id" @click="$emit('jump', a)">
+                        <span class="lb-ann-icon" aria-hidden="true" v-html="iconOf(a)"></span>
+                        <span class="lb-ann-body">
+                            <span v-if="a.quote" class="lb-ann-quote"><span class="lb-ann-mark" :style="markStyle(a)">{{ a.quote }}</span></span>
+                            <img v-if="a.has_image" class="lb-ann-img" :src="imageUrl(a)" :alt="$t('annotations.row.imageAlt', { n: a.page })" loading="lazy">
+                            <span v-if="a.caption" class="lb-ann-caption">{{ a.caption }}</span>
+                            <template v-if="a.kind === 'comment'">
+                                <span v-if="a.comment" class="lb-ann-note">{{ a.comment }}</span>
+                                <span v-if="a.context" class="lb-ann-context">{{ $t('annotations.row.nextTo', { context: a.context }) }}</span>
+                            </template>
+                            <span v-else-if="a.comment" class="lb-ann-comment" data-testid="annotation-comment">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                                <span>{{ a.comment }}</span>
+                            </span>
+                            <span v-if="a.replies && a.replies.length" class="lb-ann-replies">
+                                <span v-for="(r, i) in a.replies" :key="i" class="lb-ann-reply">
+                                    <span class="lb-ann-reply-text">{{ r.text }}</span>
+                                    <span class="lb-ann-reply-meta">{{ replyMeta(r) }}</span>
+                                </span>
+                            </span>
+                            <span class="lb-ann-meta">
+                                <span v-if="a.color" class="lb-ann-swatch is-small" :style="{ background: a.color }"></span>
+                                <span>{{ typeLabel(a) }}</span>
+                                <template v-if="showAuthors && a.author"><span aria-hidden="true">·</span><span>{{ a.author }}</span></template>
+                                <template v-if="when(a)"><span aria-hidden="true">·</span><span>{{ when(a) }}</span></template>
+                                <span v-if="a.merged > 1" class="lb-ann-merged">{{ a.merged === 2 ? $t('annotations.row.mergedTwice') : $t('annotations.row.mergedMany', { n: a.merged }) }}</span>
+                            </span>
+                        </span>
+                        <span class="lb-ann-page">
+                            <span>{{ $t('annotations.page', { n: a.page }) }}</span>
+                            <span v-if="a.id === activeId" class="lb-ann-inpreview">{{ $t('annotations.row.inPreview') }}</span>
+                        </span>
+                    </button>
+                </div>
+            </template>
+        </section>
+    `,
+    data() {
+        return { kindFilter: 'all', colorFilter: null };
+    },
+    computed: {
+        loading() { return this.state.status === 'loading' || this.state.status === 'idle'; },
+        ready() { return this.state.status === 'ready' && !!this.state.data; },
+        data() { return this.ready ? this.state.data : null; },
+        entries() { return (this.data && this.data.annotations) || []; },
+        showAuthors() { return !!(this.data && this.data.multiple_authors); },
+        standLabel() {
+            const iso = this.data && this.data.file_modified;
+            const at = iso ? new Date(iso).getTime() : NaN;
+            if (!isNaN(at) && Math.abs(Date.now() - at) < 60000) return t('annotations.justNow');
+            return formatAnnotationTime(iso);
+        },
+        chips() {
+            const all = this.entries;
+            return [
+                { key: 'all', label: t('annotations.filter.all'), count: all.length },
+                { key: 'highlights', label: t('annotations.filter.highlights'), count: all.filter((a) => a.kind === 'highlight').length },
+                { key: 'comments', label: t('annotations.filter.comments'), count: all.filter((a) => !!a.comment).length },
+                { key: 'shapes', label: t('annotations.filter.shapes'), count: all.filter((a) => a.kind === 'shape').length },
+            ];
+        },
+        // The colours in the file, the most used first.
+        colors() {
+            const seen = new Map();
+            this.entries.forEach((a, i) => {
+                if (!a.color) return;
+                const c = seen.get(a.color) || { hex: a.color, count: 0, first: i };
+                c.count += 1;
+                seen.set(a.color, c);
+            });
+            return [...seen.values()].sort((x, y) => (y.count - x.count) || (x.first - y.first));
+        },
+        visible() {
+            const kind = this.kindFilter;
+            return this.entries.filter((a) => {
+                if (this.colorFilter && a.color !== this.colorFilter) return false;
+                if (kind === 'highlights') return a.kind === 'highlight';
+                if (kind === 'comments') return !!a.comment;
+                if (kind === 'shapes') return a.kind === 'shape';
+                return true;
+            });
+        },
+        // Runs of entries under one section (or, without sections, one page).
+        groups() {
+            const bySection = !!(this.data && this.data.has_sections);
+            const out = [];
+            for (const a of this.visible) {
+                const section = bySection && a.section ? a.section : null;
+                const key = section ? 's:' + section : 'p:' + a.page;
+                let g = out[out.length - 1];
+                if (!g || g.key !== key) {
+                    g = { key, section, from: a.page, to: a.page, items: [] };
+                    out.push(g);
+                }
+                g.items.push(a);
+                g.from = Math.min(g.from, a.page);
+                g.to = Math.max(g.to, a.page);
+            }
+            return out.map((g, i) => ({
+                ...g,
+                vkey: g.key + '#' + i,
+                title: g.section || t('annotations.group.page', { n: g.from }),
+                pages: !g.section ? ''
+                    : g.from === g.to ? t('annotations.page', { n: g.from })
+                        : t('annotations.group.pages', { from: g.from, to: g.to }),
+            }));
+        },
+    },
+    watch: {
+        // A colour that left the file must not filter the list into emptiness.
+        colors(list) {
+            if (this.colorFilter && !list.some((c) => c.hex === this.colorFilter)) this.colorFilter = null;
+        },
+        paperId() { this.showAll(); },
+    },
+    methods: {
+        showAll() {
+            this.kindFilter = 'all';
+            this.colorFilter = null;
+        },
+        iconOf(a) { return ANNOTATION_ICONS[ANNOTATION_ICON_OF[a.subtype] || 'area']; },
+        typeLabel(a) { return t('annotations.type.' + (ANNOTATION_TYPES[a.subtype] || 'highlight')); },
+        when(a) { return formatAnnotationTime(a.created || a.modified); },
+        replyMeta(r) {
+            return [this.showAuthors ? r.author : '', formatAnnotationTime(r.created)].filter(Boolean).join(' · ');
+        },
+        markStyle(a) {
+            const color = a.color || 'currentColor';
+            if (a.subtype === 'Underline') return { textDecorationLine: 'underline', textDecorationColor: color };
+            if (a.subtype === 'StrikeOut') return { textDecorationLine: 'line-through', textDecorationColor: color };
+            if (a.subtype === 'Squiggly') return { textDecorationLine: 'underline', textDecorationStyle: 'wavy', textDecorationColor: color };
+            return { background: annotationTint(a.color, uiPrefs.darkMode) };
+        },
+        imageUrl(a) {
+            const stand = this.data ? this.data.file_modified : '';
+            return `/api/papers/${this.paperId}/annotations/${encodeURIComponent(a.id)}/image?v=${encodeURIComponent(stand || '')}`;
+        },
+    },
+};
+
+
+// =============================================================================
 // PaperDetail Component
 // =============================================================================
 
 const PaperDetail = {
+    components: { CollectionPicker, CategoryPicker, PdfPreview, AnnotationsBlock },
     template: `
         <div class="lb-modal-overlay" @click.self="close">
         <!-- Two-panel assembly (#161). It owns the gap between the panels, so a
@@ -1821,7 +5103,7 @@ const PaperDetail = {
         <div class="lb-detail-assembly" @click.stop data-testid="detail-assembly">
 
             <!-- ============ PDF PANEL (docked, scrolls on its own) ============ -->
-            <section v-if="paper" class="lb-pdf-panel" :class="{ 'is-empty': !paper.filename }"
+            <section v-if="paper" ref="pdfPanel" class="lb-pdf-panel" :class="{ 'is-empty': !paper.filename }"
                      data-testid="pdf-panel">
                 <header class="lb-pdf-head">
                     <span class="lb-mono lb-truncate lb-pdf-name" :title="paper.filename || $t('pdf.none')">
@@ -1830,14 +5112,25 @@ const PaperDetail = {
                     <!-- Without a file the actions belong to the drop zone below,
                          not up here twice. -->
                     <div class="lb-pdf-actions">
-                        <button v-if="paper.filename" class="lb-btn lb-btn-primary" @click="openInApp">{{ $t('pdf.open') }}</button>
+                        <template v-if="paper.filename">
+                            <span v-if="pdfState.pages" class="lb-mono lb-pdf-pageno" data-testid="pdf-page">{{ $t('pdf.pageOf', { page: pdfState.page, pages: pdfState.pages }) }}</span>
+                            <div class="lb-pdf-zoom" role="group">
+                                <button type="button" class="lb-pdf-tool" @click="zoomPdf('out')" :aria-label="$t('pdf.zoomOut')" :title="$t('pdf.zoomOut')">&minus;</button>
+                                <button type="button" class="lb-pdf-tool" @click="zoomPdf('width')" :aria-label="$t('pdf.fitWidth')" :title="$t('pdf.fitWidth')">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h18"/><path d="M7 8l-4 4 4 4"/><path d="M17 8l4 4-4 4"/></svg>
+                                </button>
+                                <button type="button" class="lb-pdf-tool" @click="zoomPdf('in')" :aria-label="$t('pdf.zoomIn')" :title="$t('pdf.zoomIn')">+</button>
+                            </div>
+                            <button class="lb-btn lb-btn-primary" @click="openInApp">{{ $t('pdf.open') }}</button>
+                        </template>
                         <input ref="attachPdfInput" type="file" accept="application/pdf,.pdf" style="display:none" @change="onPdfSelected" />
                     </div>
                 </header>
                 <div class="lb-pdf-body">
-                    <iframe v-if="paper.filename" class="lb-pdf-frame" data-testid="pdf-frame"
-                            :src="'/api/papers/' + paper.id + '/pdf' + (pdfPage ? '#page=' + pdfPage : '')"
-                            loading="lazy"></iframe>
+                    <!-- PDF.js through its adapter (#229); keyed on the Item so
+                         another Item gets a fresh preview. -->
+                    <pdf-preview v-if="paper.filename" ref="pdfPreview" :key="paper.id"
+                                 :src="previewUrl" :page="pdfPage" @page="onPdfPage" />
                     <div v-else class="lb-pdf-drop" data-testid="pdf-drop-zone">
                         <p class="lb-pdf-drop-h">{{ $t('pdf.none') }}</p>
                         <p class="lb-pdf-drop-p">{{ $t('pdf.dropHint') }}</p>
@@ -1854,9 +5147,10 @@ const PaperDetail = {
                 </div>
             </section>
 
-            <div class="lb-modal">
+            <div class="lb-modal" :class="{ 'has-tabs': tabItems.length > 0, 'is-side-open': sideOpen }">
             <!-- Sticky header -->
             <header class="lb-modal-head">
+                <div class="lb-head-main">
                 <button class="lb-modal-back" @click="close">
                     <span v-html="icons.back"></span>
                     {{ $t('detail.backToList') }}
@@ -1869,12 +5163,6 @@ const PaperDetail = {
                        :href="'https://doi.org/' + paper.doi" target="_blank" rel="noopener">
                         {{ $t('detail.openDoi') }}
                     </a>
-                    <!-- Only visible in the two-column band (1100-1440px), where the
-                         metadata column is folded away by default. -->
-                    <button class="lb-btn lb-btn-ghost lb-meta-toggle" @click="metaOpen = !metaOpen"
-                            :aria-pressed="String(metaOpen)" data-testid="meta-toggle">
-                        {{ metaOpen ? $t('detail.hideMetadata') : $t('detail.metadata') }}
-                    </button>
                     <div class="relative">
                         <button @click="actionMenuOpen = !actionMenuOpen"
                                 class="lb-modal-close" :aria-label="$t('common.more')"
@@ -1917,6 +5205,20 @@ const PaperDetail = {
                         </div>
                         <div v-if="actionMenuOpen" class="fixed inset-0 z-20" @click="actionMenuOpen = false"></div>
                     </div>
+                </div>
+                </div>
+                <!-- Tab bar and close above the side panel (#230) -->
+                <div class="lb-head-side" v-if="paper">
+                    <div v-if="tabItems.length" role="tablist" class="lb-tabs" :aria-label="$t('detail.sidePanel')" data-testid="side-tabs">
+                        <button v-for="tab in tabItems" :key="tab.index" type="button" role="tab" class="lb-tab"
+                                :class="{ 'is-active': tab.active }" :aria-selected="String(tab.active)"
+                                :data-tab="tab.index" @click="pickTab(tab.index)">
+                            <span class="lb-tab-label">{{ tab.label }}</span>
+                            <span v-if="tab.count" class="lb-tab-count">{{ tab.count }}</span>
+                            <span v-if="tab.dot" class="lb-tab-dot" :aria-label="$t('detail.hasNotes')"></span>
+                        </button>
+                    </div>
+                    <div v-else class="lb-head-fill"></div>
                     <button class="lb-modal-close" @click="close" :aria-label="$t('common.close')">
                         <span v-html="icons.x"></span>
                     </button>
@@ -1929,10 +5231,50 @@ const PaperDetail = {
             </div>
 
             <template v-else-if="paper">
-            <div class="lb-modal-grid" :class="{ 'is-meta-open': metaOpen }">
-                <!-- ============ MAIN (content column, own scroll region) ============ -->
-                <main class="lb-modal-main" data-testid="content-column">
+            <div class="lb-modal-grid">
+                <!-- One zone per column: the main column and one panel per tab, each
+                     holding the blocks the stored layout puts there (#230). Every block is
+                     written once below; a hidden tab stays in the DOM (v-show) so the
+                     notes editor keeps its state. -->
+                <component v-for="zone in zones" :key="zone.key" :is="zone.kind === 'main' ? 'main' : 'aside'"
+                           v-show="zone.kind === 'main' || zone.active"
+                           :class="zone.kind === 'main' ? 'lb-modal-main' : 'lb-modal-aside'"
+                           :role="zone.kind === 'main' ? null : 'tabpanel'"
+                           :aria-label="zone.kind === 'main' ? null : zone.label"
+                           :data-testid="zone.kind === 'main' ? 'content-column' : 'metadata-column'"
+                           :data-zone="zone.key">
+                <template v-if="zone.banners">
+                    <!-- OCR Result Banner — sits with the metadata it describes
+                         instead of pushing the content column down. -->
+                    <div v-if="ocrResult" class="lb-aside-banner" style="background: var(--lb-bg-soft);">
+                        <button @click="ocrResult = null" class="absolute top-2 right-2 opacity-50 hover:opacity-100" style="color: var(--lb-mute);">
+                            <span v-html="icons.x"></span>
+                        </button>
+                        <p class="font-medium mb-1" style="color: var(--lb-ink);">{{ ocrResult._ocr_chars > 0 ? $t('ocr.completed') : $t('ocr.noResult') }}</p>
+                        <p v-if="ocrResult._ocr_chars > 0" style="color: var(--lb-ink-2);">
+                            {{ $t('ocr.charsExtracted', { count: ocrResult._ocr_chars }) }}
+                            <span v-if="ocrResult._ocr_searchable"> &middot; {{ $t('ocr.searchable') }}</span>
+                            <span v-if="ocrResult._ocr_llm && Object.keys(ocrResult._ocr_llm).length"> &middot; {{ $t('ocr.llmUpdated') }}</span>
+                        </p>
+                        <p v-else style="color: var(--lb-ink-2);">{{ $t('ocr.noText') }}</p>
+                    </div>
 
+                    <!-- Validate Result Banner -->
+                    <div v-if="validateResult" class="lb-aside-banner" style="background: var(--lb-accent-soft);">
+                        <button @click="validateResult = null" class="absolute top-2 right-2 opacity-50 hover:opacity-100" style="color: var(--lb-accent-ink);">
+                            <span v-html="icons.x"></span>
+                        </button>
+                        <p class="font-medium mb-1" style="color: var(--lb-accent-ink);">{{ $t('validate.done') }}</p>
+                        <p style="color: var(--lb-accent-ink);">
+                            {{ $t('chat.source') }}: {{ validateResult._validate_source }}
+                            <span v-if="validateResult._validate_changes && Object.keys(validateResult._validate_changes).length">
+                                &middot; {{ $t('validate.fieldsUpdated', { count: Object.keys(validateResult._validate_changes).length }) }}
+                            </span>
+                        </p>
+                    </div>
+                </template>
+
+                <template v-if="zone.kind === 'main'">
                 <!-- Edit Metadata Form (replaces title block) -->
                 <div v-if="editingMeta" class="lb-detail-section">
                     <h4 class="lb-detail-h">{{ $t('detail.editMetadata') }}</h4>
@@ -1977,7 +5319,7 @@ const PaperDetail = {
                                 <button @click="generateAbstract" :disabled="generatingAbstract"
                                         class="lb-btn lb-btn-ghost" style="font-size: 11px; padding: 4px 8px;">
                                     <span v-if="generatingAbstract" class="spinner" style="width:10px;height:10px;border-width:1.5px;"></span>
-                                    {{ generatingAbstract ? 'Generiere...' : 'Abstract generieren' }}
+                                    {{ generatingAbstract ? $t('abstract.generating') : $t('abstract.generate') }}
                                 </button>
                             </div>
                             <textarea v-model="editMeta.abstract" rows="4" class="lb-input"></textarea>
@@ -2005,236 +5347,253 @@ const PaperDetail = {
                     <h1 class="lb-detail-title">{{ paper.title || $t('papers.untitled') }}</h1>
                     <p class="lb-detail-authors" v-if="paper.authors">{{ paper.authors }}</p>
                 </template>
+                </template>
 
-                <!-- Abstract -->
-                <section v-if="!editingMeta && paper.abstract" class="lb-detail-section">
-                    <div class="flex items-center gap-2" style="margin-bottom: 10px;">
-                        <h4 class="lb-detail-h" style="margin: 0;">Abstract</h4>
-                        <span v-if="paper.abstract_source === 'generated'" class="lb-tag" style="font-size: 9.5px;" :title="$t('abstract.aiGeneratedTitle')">{{ $t('abstract.aiGenerated') }}</span>
-                        <span v-else-if="paper.abstract_source === 'pdf'" class="lb-tag" style="font-size: 9.5px;" :title="$t('abstract.aiExtractedTitle')">{{ $t('abstract.aiExtracted') }}</span>
-                    </div>
-                    <p class="lb-detail-abstract">{{ paper.abstract }}</p>
-                </section>
+                <template v-for="b in zone.blocks" :key="b">
 
-                <!-- Notizen (#160) -->
-                <section v-if="!editingMeta" class="lb-detail-section" data-testid="paper-notes">
-                    <div class="flex items-center justify-between" style="margin-bottom: 10px;">
-                        <h4 class="lb-detail-h" style="margin: 0;">{{ $t('notes.heading') }}</h4>
-                        <div class="flex items-center gap-3">
-                            <span v-if="notesStatus" class="lb-notes-status" :data-state="notesSaveState">{{ notesStatus }}</span>
-                            <button @click="notesEditing ? showNotes() : editNotes()" class="lb-btn-text" style="font-size: 11.5px;">
-                                {{ notesEditing ? $t('notes.view') : $t('common.edit') }}
-                            </button>
+                    <!-- Abstract -->
+                    <section v-if="b === 'abstract' && !editingMeta && paper.abstract" class="lb-detail-section">
+                        <div class="flex items-center gap-2" style="margin-bottom: 10px;">
+                            <h4 class="lb-detail-h" style="margin: 0;">Abstract</h4>
+                            <span v-if="paper.abstract_source === 'generated'" class="lb-tag" style="font-size: 9.5px;" :title="$t('abstract.aiGeneratedTitle')">{{ $t('abstract.aiGenerated') }}</span>
+                            <span v-else-if="paper.abstract_source === 'pdf'" class="lb-tag" style="font-size: 9.5px;" :title="$t('abstract.aiExtractedTitle')">{{ $t('abstract.aiExtracted') }}</span>
                         </div>
-                    </div>
-                    <div v-if="notesEditing" class="lb-notes-editor" data-testid="paper-notes-editor">
-                        <textarea ref="notesInput" v-model="notesDraft" @input="onNotesTyped()"
-                                  rows="6" class="lb-input"
-                                  :placeholder="$t('notes.placeholder')"></textarea>
-                    </div>
-                    <div v-else class="lb-md lb-notes-rendered" data-testid="paper-notes-rendered"
-                         :title="$t('notes.clickToEdit')" @click="editNotes()" v-html="notesHtml"></div>
-                </section>
+                        <p class="lb-detail-abstract">{{ paper.abstract }}</p>
+                    </section>
 
-                <!-- Custom Fields -->
-                <section v-if="!editingMeta && paper.custom_fields && paper.custom_fields.length" class="lb-detail-section">
-                    <h4 class="lb-detail-h">{{ $t('customFields.heading') }}</h4>
-                    <div class="space-y-4">
-                        <div v-for="cf in paper.custom_fields" :key="cf.field_id">
-                            <template v-if="cf.field_type === 'text'">
-                                <label class="block text-xs mb-1" style="color: var(--lb-mute);">{{ cf.name }}</label>
-                                <textarea v-model="customValues[cf.field_id]"
-                                          @blur="saveCustomValue(cf.field_id)"
-                                          rows="3" :placeholder="$t('customFields.enterPlaceholder', { name: cf.name })"
-                                          class="lb-input"></textarea>
-                            </template>
-                            <template v-else-if="cf.field_type === 'number'">
-                                <label class="block text-xs mb-1" style="color: var(--lb-mute);">{{ cf.name }}</label>
-                                <input v-model="customValues[cf.field_id]"
-                                       @blur="saveCustomValue(cf.field_id)"
-                                       type="number" class="lb-input" />
-                            </template>
-                            <template v-else-if="cf.field_type === 'progress'">
-                                <label class="block text-xs mb-1" style="color: var(--lb-mute);">{{ cf.name }}: {{ customValues[cf.field_id] || 0 }}%</label>
-                                <div class="flex items-center gap-3">
+                    <!-- Annotationen aus der PDF (#229); ohne PDF kein Block -->
+                    <annotations-block v-if="b === 'annotations' && !editingMeta && paper.filename" :state="annotations"
+                                       :active-id="activeAnnotationId" :paper-id="paper.id"
+                                       @jump="jumpToAnnotation" />
+
+                    <!-- Notizen (#160) -->
+                    <section v-if="b === 'notes' && !editingMeta" class="lb-detail-section" data-testid="paper-notes">
+                        <div class="flex items-center justify-between" style="margin-bottom: 10px;">
+                            <h4 class="lb-detail-h" style="margin: 0;">{{ $t('notes.heading') }}</h4>
+                            <div class="flex items-center gap-3">
+                                <span v-if="notesStatus" class="lb-notes-status" :data-state="notesSaveState">{{ notesStatus }}</span>
+                                <button @click="notesEditing ? showNotes() : editNotes()" class="lb-btn-text" style="font-size: 11.5px;">
+                                    {{ notesEditing ? $t('notes.view') : $t('common.edit') }}
+                                </button>
+                            </div>
+                        </div>
+                        <div v-if="notesEditing" class="lb-notes-editor" data-testid="paper-notes-editor">
+                            <textarea ref="notesInput" v-model="notesDraft" @input="onNotesTyped()"
+                                      rows="6" class="lb-input"
+                                      :placeholder="$t('notes.placeholder')"></textarea>
+                        </div>
+                        <div v-else class="lb-md lb-notes-rendered" data-testid="paper-notes-rendered"
+                             :title="$t('notes.clickToEdit')" @click="editNotes()" v-html="notesHtml"></div>
+                    </section>
+
+                    <!-- Custom Fields -->
+                    <section v-if="b === 'customFields' && !editingMeta && paper.custom_fields && paper.custom_fields.length" class="lb-detail-section">
+                        <h4 class="lb-detail-h">{{ $t('customFields.heading') }}</h4>
+                        <div class="space-y-4">
+                            <div v-for="cf in paper.custom_fields" :key="cf.field_id">
+                                <template v-if="cf.field_type === 'text'">
+                                    <label class="block text-xs mb-1" style="color: var(--lb-mute);">{{ cf.name }}</label>
+                                    <textarea v-model="customValues[cf.field_id]"
+                                              @blur="saveCustomValue(cf.field_id)"
+                                              rows="3" :placeholder="$t('customFields.enterPlaceholder', { name: cf.name })"
+                                              class="lb-input"></textarea>
+                                </template>
+                                <template v-else-if="cf.field_type === 'number'">
+                                    <label class="block text-xs mb-1" style="color: var(--lb-mute);">{{ cf.name }}</label>
                                     <input v-model="customValues[cf.field_id]"
-                                           @input="saveCustomValue(cf.field_id)"
-                                           type="range" min="0" max="100" step="5"
-                                           class="flex-1 h-2 rounded-lg appearance-none cursor-pointer" style="background: var(--lb-bg-soft); accent-color: var(--lb-accent);" />
-                                    <div class="w-32 h-3 rounded-full overflow-hidden flex-shrink-0" style="background: var(--lb-bg-soft);">
-                                        <div class="h-full rounded-full transition-all" style="background: var(--lb-accent);" :style="{ width: (customValues[cf.field_id] || 0) + '%' }"></div>
+                                           @blur="saveCustomValue(cf.field_id)"
+                                           type="number" class="lb-input" />
+                                </template>
+                                <template v-else-if="cf.field_type === 'progress'">
+                                    <label class="block text-xs mb-1" style="color: var(--lb-mute);">{{ cf.name }}: {{ customValues[cf.field_id] || 0 }}%</label>
+                                    <div class="flex items-center gap-3">
+                                        <input v-model="customValues[cf.field_id]"
+                                               @input="saveCustomValue(cf.field_id)"
+                                               type="range" min="0" max="100" step="5"
+                                               class="flex-1 h-2 rounded-lg appearance-none cursor-pointer" style="background: var(--lb-bg-soft); accent-color: var(--lb-accent);" />
+                                        <div class="w-32 h-3 rounded-full overflow-hidden flex-shrink-0" style="background: var(--lb-bg-soft);">
+                                            <div class="h-full rounded-full transition-all" style="background: var(--lb-accent);" :style="{ width: (customValues[cf.field_id] || 0) + '%' }"></div>
+                                        </div>
                                     </div>
-                                </div>
-                            </template>
-                            <template v-else-if="cf.field_type === 'select'">
-                                <label class="block text-xs mb-1" style="color: var(--lb-mute);">{{ cf.name }}</label>
-                                <select v-model="customValues[cf.field_id]"
-                                        @change="saveCustomValue(cf.field_id)"
-                                        class="lb-input">
-                                    <option value="">{{ $t('common.selectPlaceholder') }}</option>
-                                    <option v-for="opt in (cf.options || '').split(',')" :key="opt" :value="opt.trim()">{{ opt.trim() }}</option>
-                                </select>
-                            </template>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- Extracted References -->
-                <section v-if="!editingMeta" class="lb-detail-section">
-                    <div class="flex items-center justify-between" style="margin-bottom: 10px;">
-                        <h4 class="lb-detail-h" style="margin: 0;">
-                            {{ $t('refs.extractedHeading') }}
-                            <span v-if="paperRefs.length" style="color: var(--lb-mute);">({{ paperRefs.length }})</span>
-                        </h4>
-                        <div class="flex items-center gap-2">
-                            <button @click="startAddRef" class="lb-btn-text" style="font-size: 11.5px;">+ {{ $t('refs.manual') }}</button>
-                            <button v-if="paperRefs.length" @click="reExtractReferences" :disabled="extractingRefs" class="lb-btn-text" style="font-size: 11.5px;">{{ $t('refs.reExtract') }}</button>
-                        </div>
-                    </div>
-
-                    <div v-if="refExtractionResult" class="mb-4 p-3 rounded-lg text-sm" style="background: var(--lb-bg-soft); border: 1px solid var(--lb-hairline);">
-                        <p v-if="refExtractionResult.status === 'ok' || refExtractionResult.status === 'already_extracted'" style="color: var(--lb-ink-2);">
-                            <strong>{{ refExtractionResult.total_extracted }}</strong> {{ $t('refs.countReferences') }} &middot;
-                            <strong>{{ refExtractionResult.with_doi }}</strong> {{ $t('refs.countWithDoi') }} &middot;
-                            <strong>{{ refExtractionResult.in_library }}</strong> {{ $t('refs.inLibrary') }}
-                        </p>
-                        <p v-else style="color: var(--lb-ink-2);">{{ refExtractionResult.error || $t('refs.extractionFailed') }}</p>
-                    </div>
-
-                    <div v-if="paperRefs.length" class="space-y-2" style="max-height: 600px; overflow-y: auto;">
-                        <div v-for="ref in paperRefs" :key="ref.id || ref.ref_index"
-                             class="flex items-start gap-3 p-2 rounded-lg text-sm group"
-                             style="border: 1px solid var(--lb-hairline); transition: background .12s;"
-                             onmouseover="this.style.background='var(--lb-bg-soft)'"
-                             onmouseout="this.style.background='transparent'">
-                            <span class="lb-mono flex-shrink-0" style="font-size: 11px; color: var(--lb-mute); margin-top: 2px; min-width: 24px; text-align: right;">[{{ ref.ref_index }}]</span>
-                            <div class="flex-1 min-w-0">
-                                <p class="font-medium leading-snug" style="color: var(--lb-ink); font-family: var(--lb-font-serif); font-size: 14px;">
-                                    <router-link v-if="ref.matched_paper_id" :to="'/paper/' + ref.matched_paper_id"
-                                                 style="color: var(--lb-accent-ink); text-decoration: none;">{{ ref.title || $t('papers.untitled') }}</router-link>
-                                    <span v-else>{{ ref.title || $t('papers.untitled') }}</span>
-                                </p>
-                                <p class="text-xs mt-0.5" style="color: var(--lb-ink-3);">
-                                    <span v-if="ref.authors" style="font-style: italic;">{{ ref.authors }}</span>
-                                    <span v-if="ref.year"> ({{ ref.year }})</span>
-                                    <span v-if="ref.journal"> &middot; {{ ref.journal }}</span>
-                                </p>
-                                <p v-if="ref.doi" class="lb-mono text-xs mt-0.5">
-                                    <a :href="'https://doi.org/' + ref.doi" target="_blank" style="color: var(--lb-accent-ink);">{{ ref.doi }}</a>
-                                </p>
-                                <p v-else-if="ref.title" class="text-xs mt-0.5">
-                                    <a :href="refScholarUrl(ref)" target="_blank" style="color: var(--lb-accent-ink);" :title="$t('refs.scholarTitle')">{{ $t('refs.scholarLink') }} &#8599;</a>
-                                </p>
-                            </div>
-                            <div class="flex items-center gap-2 flex-shrink-0">
-                                <span v-if="ref.matched_paper_id" class="lb-tag lb-tag-cat" style="font-size: 10px;" :title="$t('refs.matchTooltip', { percent: Math.round((ref.match_confidence || 0) * 100) })">{{ $t('refs.inLibrary') }}</span>
-                                <span v-else-if="ref.doi" class="lb-tag" style="font-size: 10px;">DOI</span>
-                                <span v-else class="lb-tag" style="font-size: 10px; color: var(--lb-mute);">{{ $t('refs.external') }}</span>
-                                <button @click="startEditRef(ref)" class="opacity-0 group-hover:opacity-100 transition-all" style="color: var(--lb-mute);" :title="$t('common.edit')">
-                                    <span v-html="icons.edit"></span>
-                                </button>
-                                <button @click="deleteRef(ref)" class="opacity-0 group-hover:opacity-100 transition-all" style="color: var(--lb-mute);" :title="$t('common.delete')">
-                                    <span v-html="icons.trash"></span>
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                    <p v-else-if="!extractingRefs" class="text-sm" style="color: var(--lb-mute);">
-                        Noch keine Referenzen extrahiert. Ueber das Menue &laquo;Referenzen extrahieren&raquo; ausfuehren.
-                    </p>
-                </section>
-
-                </main>
-
-                <!-- ============ ASIDE (metadata column, own scroll region) ============ -->
-                <aside class="lb-modal-aside" data-testid="metadata-column">
-                    <!-- OCR Result Banner — sits with the metadata it describes
-                         instead of pushing the content column down. -->
-                    <div v-if="ocrResult" class="lb-aside-banner" style="background: var(--lb-bg-soft);">
-                        <button @click="ocrResult = null" class="absolute top-2 right-2 opacity-50 hover:opacity-100" style="color: var(--lb-mute);">
-                            <span v-html="icons.x"></span>
-                        </button>
-                        <p class="font-medium mb-1" style="color: var(--lb-ink);">{{ ocrResult._ocr_chars > 0 ? $t('ocr.completed') : $t('ocr.noResult') }}</p>
-                        <p v-if="ocrResult._ocr_chars > 0" style="color: var(--lb-ink-2);">
-                            {{ $t('ocr.charsExtracted', { count: ocrResult._ocr_chars }) }}
-                            <span v-if="ocrResult._ocr_searchable"> &middot; {{ $t('ocr.searchable') }}</span>
-                            <span v-if="ocrResult._ocr_llm && Object.keys(ocrResult._ocr_llm).length"> &middot; {{ $t('ocr.llmUpdated') }}</span>
-                        </p>
-                        <p v-else style="color: var(--lb-ink-2);">{{ $t('ocr.noText') }}</p>
-                    </div>
-
-                    <!-- Validate Result Banner -->
-                    <div v-if="validateResult" class="lb-aside-banner" style="background: var(--lb-accent-soft);">
-                        <button @click="validateResult = null" class="absolute top-2 right-2 opacity-50 hover:opacity-100" style="color: var(--lb-accent-ink);">
-                            <span v-html="icons.x"></span>
-                        </button>
-                        <p class="font-medium mb-1" style="color: var(--lb-accent-ink);">{{ $t('validate.done') }}</p>
-                        <p style="color: var(--lb-accent-ink);">
-                            {{ $t('chat.source') }}: {{ validateResult._validate_source }}
-                            <span v-if="validateResult._validate_changes && Object.keys(validateResult._validate_changes).length">
-                                &middot; {{ $t('validate.fieldsUpdated', { count: Object.keys(validateResult._validate_changes).length }) }}
-                            </span>
-                        </p>
-                    </div>
-
-                    <div class="lb-aside-block">
-                        <h5 class="lb-aside-h">{{ $t('detail.metadata') }}</h5>
-                        <dl class="lb-aside-dl">
-                            <dt>{{ $t('common.year') }}</dt><dd>{{ paper.year || '&mdash;' }}</dd>
-                            <dt>Journal</dt><dd>{{ paper.journal || '&mdash;' }}</dd>
-                            <dt>{{ $t('common.publisher') }}</dt><dd>{{ paper.publisher || '&mdash;' }}</dd>
-                            <dt>DOI</dt><dd class="lb-mono lb-truncate" :title="paper.doi">{{ paper.doi || '&mdash;' }}</dd>
-                            <dt>ISBN</dt><dd class="lb-mono lb-truncate" :title="paper.isbn">{{ paper.isbn || '&mdash;' }}</dd>
-                            <dt>{{ $t('common.citations') }}</dt><dd>{{ paper.cited_by_count != null ? paper.cited_by_count : '&mdash;' }}</dd>
-                            <dt>{{ $t('detail.citeKey') }}</dt>
-                            <dd v-if="!editingCiteKey" class="lb-mono lb-truncate" :title="paper.cite_key">
-                                {{ paper.cite_key || '&mdash;' }}
-                                <button @click="startEditCiteKey" class="text-xs ml-1" style="color: var(--lb-mute); cursor: pointer;" :title="$t('detail.editCiteKey')">&#9998;</button>
-                            </dd>
-                            <dd v-else>
-                                <input v-model="citeKeyDraft" @keyup.enter="saveCiteKey" @keydown.esc.stop="editingCiteKey = false"
-                                       class="lb-input lb-mono" style="font-size: 12px; padding: 2px 6px; width: 100%;"
-                                       :disabled="citeKeySaving" ref="citeKeyInput" />
-                                <div class="flex gap-1 mt-1">
-                                    <button @click="saveCiteKey" :disabled="citeKeySaving" class="lb-tag" style="cursor:pointer;">{{ citeKeySaving ? '...' : 'OK' }}</button>
-                                    <button @click="editingCiteKey = false" class="lb-tag" style="cursor:pointer;">{{ $t('common.cancel') }}</button>
-                                </div>
-                                <p v-if="citeKeyError" class="text-xs mt-1" style="color: var(--lb-danger);">{{ citeKeyError }}</p>
-                            </dd>
-                        </dl>
-                    </div>
-
-                    <div class="lb-aside-block">
-                        <div class="flex items-center justify-between">
-                            <h5 class="lb-aside-h">{{ $t('sidebar.categories') }}</h5>
-                            <div class="relative">
-                                <button @click="showCatAdd = !showCatAdd"
-                                        class="lb-modal-close" style="width:22px;height:22px;font-weight:600;" :title="$t('categories.add')">+</button>
-                                <div v-if="showCatAdd" class="absolute right-0 top-full mt-1 w-56 z-30 p-2"
-                                     style="background: var(--lb-bg-elev); border: 1px solid var(--lb-hairline); border-radius: 8px; box-shadow: var(--lb-shadow-lg);">
-                                    <select v-model="selectedCategoryId" @change="if(selectedCategoryId){addCategory(); showCatAdd=false;}" class="lb-input" style="font-size: 12px; padding: 6px 8px;">
-                                        <option value="">{{ $t('categories.choose') }}</option>
-                                        <option v-for="c in availableCategories" :key="c.id" :value="c.id">{{ c.name }}</option>
+                                </template>
+                                <template v-else-if="cf.field_type === 'select'">
+                                    <label class="block text-xs mb-1" style="color: var(--lb-mute);">{{ cf.name }}</label>
+                                    <select v-model="customValues[cf.field_id]"
+                                            @change="saveCustomValue(cf.field_id)"
+                                            class="lb-input">
+                                        <option value="">{{ $t('common.selectPlaceholder') }}</option>
+                                        <option v-for="opt in (cf.options || '').split(',')" :key="opt" :value="opt.trim()">{{ opt.trim() }}</option>
                                     </select>
-                                </div>
-                                <div v-if="showCatAdd" class="fixed inset-0 z-20" @click="showCatAdd=false"></div>
+                                </template>
                             </div>
                         </div>
-                        <div class="lb-aside-tags">
-                            <button v-for="cat in paper.categories" :key="cat.id" class="lb-tag lb-tag-cat" style="cursor:pointer;" @click="removeCategory(cat.id)" :title="$t('categories.removeTooltip', { name: cat.name })">
-                                {{ cat.name }} <span style="opacity:.5;">&times;</span>
-                            </button>
-                            <span v-if="!paper.categories || !paper.categories.length" class="text-xs italic" style="color: var(--lb-mute);">{{ $t('common.none') }}</span>
-                        </div>
-                    </div>
+                    </section>
 
-                    <!-- Add-on slot "item-detail-aside" (#190): keyed on the Item id,
-                         so navigating to another Item remounts the component. -->
+                    <!-- Extracted References -->
+                    <section v-if="b === 'references' && !editingMeta" class="lb-detail-section">
+                        <div class="flex items-center justify-between" style="margin-bottom: 10px;">
+                            <h4 class="lb-detail-h" style="margin: 0;">
+                                {{ $t('refs.extractedHeading') }}
+                                <span v-if="paperRefs.length" style="color: var(--lb-mute);">({{ paperRefs.length }})</span>
+                            </h4>
+                            <div class="flex items-center gap-2">
+                                <button @click="startAddRef" class="lb-btn-text" style="font-size: 11.5px;">+ {{ $t('refs.manual') }}</button>
+                                <button v-if="paperRefs.length" @click="reExtractReferences" :disabled="extractingRefs" class="lb-btn-text" style="font-size: 11.5px;">{{ $t('refs.reExtract') }}</button>
+                            </div>
+                        </div>
+
+                        <div v-if="refExtractionResult" class="mb-4 p-3 rounded-lg text-sm" style="background: var(--lb-bg-soft); border: 1px solid var(--lb-hairline);">
+                            <p v-if="refExtractionResult.status === 'ok' || refExtractionResult.status === 'already_extracted'" style="color: var(--lb-ink-2);">
+                                <strong>{{ refExtractionResult.total_extracted }}</strong> {{ $t('refs.countReferences') }} &middot;
+                                <strong>{{ refExtractionResult.with_doi }}</strong> {{ $t('refs.countWithDoi') }} &middot;
+                                <strong>{{ refExtractionResult.in_library }}</strong> {{ $t('refs.inLibrary') }}
+                            </p>
+                            <p v-else style="color: var(--lb-ink-2);">{{ refExtractionResult.error || $t('refs.extractionFailed') }}</p>
+                        </div>
+
+                        <div v-if="paperRefs.length" class="space-y-2" style="max-height: 600px; overflow-y: auto;">
+                            <div v-for="ref in paperRefs" :key="ref.id || ref.ref_index"
+                                 class="flex items-start gap-3 p-2 rounded-lg text-sm group"
+                                 style="border: 1px solid var(--lb-hairline); transition: background .12s;"
+                                 onmouseover="this.style.background='var(--lb-bg-soft)'"
+                                 onmouseout="this.style.background='transparent'">
+                                <span class="lb-mono flex-shrink-0" style="font-size: 11px; color: var(--lb-mute); margin-top: 2px; min-width: 24px; text-align: right;">[{{ ref.ref_index }}]</span>
+                                <div class="flex-1 min-w-0">
+                                    <p class="font-medium leading-snug" style="color: var(--lb-ink); font-family: var(--lb-font-serif); font-size: 14px;">
+                                        <router-link v-if="ref.matched_paper_id" :to="'/paper/' + ref.matched_paper_id"
+                                                     style="color: var(--lb-accent-ink); text-decoration: none;">{{ ref.title || $t('papers.untitled') }}</router-link>
+                                        <span v-else>{{ ref.title || $t('papers.untitled') }}</span>
+                                    </p>
+                                    <p class="text-xs mt-0.5" style="color: var(--lb-ink-3);">
+                                        <span v-if="ref.authors" style="font-style: italic;">{{ ref.authors }}</span>
+                                        <span v-if="ref.year"> ({{ ref.year }})</span>
+                                        <span v-if="ref.journal"> &middot; {{ ref.journal }}</span>
+                                    </p>
+                                    <p v-if="ref.doi" class="lb-mono text-xs mt-0.5">
+                                        <a :href="'https://doi.org/' + ref.doi" target="_blank" style="color: var(--lb-accent-ink);">{{ ref.doi }}</a>
+                                    </p>
+                                    <p v-else-if="ref.title" class="text-xs mt-0.5">
+                                        <a :href="refScholarUrl(ref)" target="_blank" style="color: var(--lb-accent-ink);" :title="$t('refs.scholarTitle')">{{ $t('refs.scholarLink') }} &#8599;</a>
+                                    </p>
+                                </div>
+                                <div class="flex items-center gap-2 flex-shrink-0">
+                                    <span v-if="ref.matched_paper_id" class="lb-tag lb-tag-cat" style="font-size: 10px;" :title="$t('refs.matchTooltip', { percent: Math.round((ref.match_confidence || 0) * 100) })">{{ $t('refs.inLibrary') }}</span>
+                                    <span v-else-if="ref.doi" class="lb-tag" style="font-size: 10px;">DOI</span>
+                                    <span v-else class="lb-tag" style="font-size: 10px; color: var(--lb-mute);">{{ $t('refs.external') }}</span>
+                                    <button @click="startEditRef(ref)" class="opacity-0 group-hover:opacity-100 transition-all" style="color: var(--lb-mute);" :title="$t('common.edit')">
+                                        <span v-html="icons.edit"></span>
+                                    </button>
+                                    <button @click="deleteRef(ref)" class="opacity-0 group-hover:opacity-100 transition-all" style="color: var(--lb-mute);" :title="$t('common.delete')">
+                                        <span v-html="icons.trash"></span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                        <p v-else-if="!extractingRefs" class="text-sm" style="color: var(--lb-mute);">
+                            {{ $t('refs.noneYet') }}
+                        </p>
+                    </section>
+
+                        <div v-if="b === 'metadata'" class="lb-aside-block" data-testid="block-metadata">
+                            <h5 class="lb-aside-h">{{ $t('detail.metadata') }}</h5>
+                            <dl class="lb-aside-dl">
+                                <dt>{{ $t('common.year') }}</dt><dd>{{ paper.year || '&mdash;' }}</dd>
+                                <dt>Journal</dt><dd>{{ paper.journal || '&mdash;' }}</dd>
+                                <dt>{{ $t('common.publisher') }}</dt><dd>{{ paper.publisher || '&mdash;' }}</dd>
+                                <dt>DOI</dt><dd class="lb-mono lb-truncate" :title="paper.doi">{{ paper.doi || '&mdash;' }}</dd>
+                                <dt>ISBN</dt><dd class="lb-mono lb-truncate" :title="paper.isbn">{{ paper.isbn || '&mdash;' }}</dd>
+                                <dt>{{ $t('common.citations') }}</dt><dd>{{ paper.cited_by_count != null ? paper.cited_by_count : '&mdash;' }}</dd>
+                                <dt>{{ $t('detail.citeKey') }}</dt>
+                                <dd v-if="!editingCiteKey" class="lb-mono lb-truncate" :title="paper.cite_key">
+                                    {{ paper.cite_key || '&mdash;' }}
+                                    <button @click="startEditCiteKey" class="text-xs ml-1" style="color: var(--lb-mute); cursor: pointer;" :title="$t('detail.editCiteKey')">&#9998;</button>
+                                </dd>
+                                <dd v-else>
+                                    <input v-model="citeKeyDraft" @keyup.enter="saveCiteKey" @keydown.esc.stop="editingCiteKey = false"
+                                           class="lb-input lb-mono" style="font-size: 12px; padding: 2px 6px; width: 100%;"
+                                           :disabled="citeKeySaving" ref="citeKeyInput" />
+                                    <div class="flex gap-1 mt-1">
+                                        <button @click="saveCiteKey" :disabled="citeKeySaving" class="lb-tag" style="cursor:pointer;">{{ citeKeySaving ? '...' : 'OK' }}</button>
+                                        <button @click="editingCiteKey = false" class="lb-tag" style="cursor:pointer;">{{ $t('common.cancel') }}</button>
+                                    </div>
+                                    <p v-if="citeKeyError" class="text-xs mt-1" style="color: var(--lb-danger);">{{ citeKeyError }}</p>
+                                </dd>
+                            </dl>
+                        </div>
+
+                        <div v-if="b === 'categories'" class="lb-aside-block" data-testid="block-categories">
+                            <div class="flex items-center justify-between">
+                                <h5 class="lb-aside-h">{{ $t('sidebar.categories') }}</h5>
+                                <div class="relative">
+                                    <button @click="showCatAdd = !showCatAdd"
+                                            class="lb-modal-close" style="width:22px;height:22px;font-weight:600;" :title="$t('categories.add')">+</button>
+                                    <div v-if="showCatAdd" class="absolute right-0 top-full mt-1 z-30 p-2 lb-cat-picker-pop"
+                                         style="background: var(--lb-bg-elev); border: 1px solid var(--lb-hairline); border-radius: 8px; box-shadow: var(--lb-shadow-lg);">
+                                        <category-picker :categories="allCategories" :assigned-ids="assignedCategoryIds" :busy="categoryPickerBusy"
+                                                         @assign="assignPickedCategory" @create="createPickedCategory"
+                                                         @close="showCatAdd = false" />
+                                    </div>
+                                    <div v-if="showCatAdd" class="fixed inset-0 z-20" @click="showCatAdd=false"></div>
+                                </div>
+                            </div>
+                            <div class="lb-aside-tags">
+                                <button v-for="cat in paper.categories" :key="cat.id" class="lb-tag lb-tag-cat" style="cursor:pointer;" @click="removeCategory(cat.id)" :title="$t('categories.removeTooltip', { name: cat.name })">
+                                    {{ cat.name }} <span style="opacity:.5;">&times;</span>
+                                </button>
+                                <span v-if="!paper.categories || !paper.categories.length" class="text-xs italic" style="color: var(--lb-mute);">{{ $t('common.none') }}</span>
+                            </div>
+                        </div>
+
+                        <template v-if="b === 'collections'">
+                        <!-- Sammlungen (#201): where this Item is curated, with its note there -->
+                        <div class="lb-aside-block" data-testid="detail-collections">
+                            <div class="flex items-center justify-between">
+                                <h5 class="lb-aside-h">{{ $t('collections.heading') }}</h5>
+                                <button @click="showCollectionPicker = true" data-testid="detail-add-to-collection"
+                                        class="lb-modal-close" style="width:22px;height:22px;font-weight:600;"
+                                        :title="$t('collections.detail.add')">+</button>
+                            </div>
+                            <ul v-if="paper.collections && paper.collections.length" class="lb-coll-detail-list">
+                                <li v-for="c in paper.collections" :key="c.id" :data-collection-id="c.id">
+                                    <div class="lb-coll-detail-row">
+                                        <router-link :to="{ name: 'collection', params: { id: c.id } }" class="lb-tag lb-tag-cat">{{ c.name }}</router-link>
+                                        <span v-if="c.archived" class="lb-coll-detail-archived">{{ $t('collections.archivedBadge') }}</span>
+                                        <button class="lb-coll-detail-btn" @click="startCollectionNote(c)" :title="$t('collections.detail.noteEdit')"
+                                                data-testid="detail-collection-note-edit">&#9998;</button>
+                                        <button class="lb-coll-detail-btn" @click="removeFromCollection(c)"
+                                                :title="$t('collections.detail.remove', { name: c.name })">&times;</button>
+                                    </div>
+                                    <div v-if="collectionNoteDraft && collectionNoteDraft.id === c.id">
+                                        <input v-model="collectionNoteDraft.note" class="lb-input" style="font-size: 12px; padding: 4px 6px;"
+                                               data-testid="detail-collection-note-input"
+                                               :placeholder="$t('collections.detail.notePlaceholder')"
+                                               @keyup.enter="saveCollectionNote" @keydown.esc.stop="collectionNoteDraft = null" />
+                                        <div class="flex gap-1 mt-1">
+                                            <button @click="saveCollectionNote" class="lb-tag" style="cursor:pointer;"
+                                                    data-testid="detail-collection-note-save">{{ $t('common.save') }}</button>
+                                            <button @click="collectionNoteDraft = null" class="lb-tag" style="cursor:pointer;">{{ $t('common.cancel') }}</button>
+                                        </div>
+                                    </div>
+                                    <p v-else-if="c.note" class="lb-coll-note">{{ c.note }}</p>
+                                </li>
+                            </ul>
+                            <span v-else class="text-xs italic" style="color: var(--lb-mute);">{{ $t('common.none') }}</span>
+                        </div>
+                        <collection-picker v-if="showCollectionPicker" :paper-ids="[paper.id]"
+                                           @close="showCollectionPicker = false" @done="onAddedToCollection" />
+                        </template>
+
+                </template>
+
+                <!-- Add-on slot "item-detail-aside" (#190): keyed on the Item id,
+                     so navigating to another Item remounts the component. -->
+                <template v-if="zone.slots">
                     <div v-for="s in detailAsideSlots" :key="s.key + ':' + paper.id"
                          class="lb-aside-block" :data-addon-slot="s.key">
                         <component :is="s.component" :item-id="paper.id" :cite-key="paper.cite_key || ''" />
                     </div>
-                </aside>
+                </template>
+                </component>
             </div>
 
                 <!-- PDF-Verarbeitungsoptionen (nach Dateiauswahl, vor Upload) -->
@@ -2294,7 +5653,7 @@ const PaperDetail = {
                                 {{ $t('attach.suggestedChapter') }}
                                 <strong v-if="bookInfo.printed_start">{{ $t('papers.pagesAbbr') }} {{ bookInfo.printed_start }}&ndash;{{ bookInfo.printed_end }}</strong>
                                 <strong v-else>{{ $t('attach.chapterPages', { count: bookInfo.chapter_pages }) }}</strong>
-                                &middot; Cover + {{ bookInfo.chapter_pages }} Seiten
+                                &middot; {{ $t('attach.coverPlusPages', { count: bookInfo.chapter_pages }) }}
                             </p>
                             <p class="text-xs mt-1" style="color: var(--lb-mute);">
                                 {{ $t('attach.detection', { method: bookInfo.method }) }} ({{ bookInfo.confidence === 'high' ? $t('attach.detectionSure') : $t('attach.detectionUnsure') }})
@@ -2518,9 +5877,13 @@ const PaperDetail = {
             generatingAbstract: false,
             actionMenuOpen: false,
             bibtexCopied: false,
-            // Metadaten-Spalte im Zwei-Spalten-Band (1100-1440px). Darueber und
-            // darunter entscheidet das Stylesheet, der Schalter ist dort weg.
-            metaOpen: false,
+            // Side panel (#230). Between 1100 and 1440 px it folds away; a click
+            // on a tab opens it, a click on the active tab closes it. Above and
+            // below that band the stylesheet decides and this flag is ignored.
+            sideOpen: false,
+            // The tab picked last, remembered per browser as the id of its
+            // first block (an index would point elsewhere after a re-layout).
+            sideTabChoice: lsGet(DETAIL_TAB_KEY) || '',
             attachingPdf: false,
             // PDF-Verarbeitungsoptionen (Modal nach Dateiauswahl)
             showAttachModal: false,
@@ -2541,9 +5904,20 @@ const PaperDetail = {
             citeKeySaving: false,
             citeKeyError: '',
             showCatAdd: false,
+            categoryPickerBusy: false,
+            // Collections (#201)
+            showCollectionPicker: false,
+            collectionNoteDraft: null,
             refExtractionResult: null,
             paperRefs: [],
             pdfPage: null,
+            // Preview (#229): page indicator, and the file's Stand once it
+            // changed while the view was open (the preview URL then carries it).
+            pdfState: { page: null, pages: null },
+            pdfVersion: null,
+            // Annotations read from the PDF (#229): { status, data, error }.
+            annotations: { status: 'idle', data: null, error: '' },
+            activeAnnotationId: null,
             refProgress: { percent: 0, message: '', current: 0, total: 0, found: null, error: null },
             editingRef: null,
             editRefData: { title: '', authors: '', year: null, doi: '', journal: '' },
@@ -2556,15 +5930,68 @@ const PaperDetail = {
         detailAsideSlots() {
             return addonSlots('item-detail-aside');
         },
-        availableCategories() {
-            if (!this.paper || !this.allCategories) return [];
-            const assigned = new Set((this.paper.categories || []).map(c => c.id));
-            return this.allCategories.filter(c => !assigned.has(c.id));
+        // --- Detail layout (#230): which block sits where ------------------
+        layout() {
+            return uiPrefs.detailLayout;
+        },
+        annotationCount() {
+            const data = this.annotations.data;
+            return data && data.annotations ? data.annotations.length : 0;
+        },
+        notesFilled() {
+            return !!((this.paper && this.paper.notes) || '').trim();
+        },
+        // The tab shown: the one picked last (found by its first block),
+        // else the one holding Notes, else the first.
+        activeTab() {
+            const tabs = this.layout.tabs;
+            if (!tabs.length) return -1;
+            const picked = tabs.findIndex((tab) => tab.blocks[0] === this.sideTabChoice);
+            if (picked >= 0) return picked;
+            const withNotes = tabs.findIndex((tab) => tab.blocks.includes('notes'));
+            return withNotes >= 0 ? withNotes : 0;
+        },
+        // The tab bar. A tab without a name is called after its first block; a
+        // name the user gave is shown exactly as stored. A number for
+        // References/Annotations, a dot for notes that are not empty.
+        tabItems() {
+            return this.layout.tabs.map((tab, index) => ({
+                index,
+                label: tab.name || t('detail.block.' + tab.blocks[0]),
+                count: (tab.blocks.includes('references') ? this.paperRefs.length : 0)
+                    + (tab.blocks.includes('annotations') ? this.annotationCount : 0),
+                dot: tab.blocks.includes('notes') && this.notesFilled,
+                active: index === this.activeTab,
+            }));
+        },
+        // One zone per column: the main column and a panel per tab. The Add-on
+        // slot sits with Metadata (or in the first tab; without tabs, in the
+        // main column), the OCR / validation results above the shown content.
+        zones() {
+            const tabs = this.layout.tabs;
+            const slotTab = tabs.length ? Math.max(tabs.findIndex((tab) => tab.blocks.includes('metadata')), 0) : -1;
+            const items = this.tabItems;
+            return [{
+                key: 'main', kind: 'main', blocks: this.layout.main, active: true,
+                banners: !tabs.length, slots: !tabs.length, label: '',
+            }].concat(tabs.map((tab, index) => ({
+                key: 'tab' + index, kind: 'tab', index, blocks: tab.blocks,
+                active: index === this.activeTab, banners: index === this.activeTab,
+                slots: index === slotTab, label: items[index].label,
+            })));
+        },
+        assignedCategoryIds() {
+            return ((this.paper && this.paper.categories) || []).map((c) => c.id);
         },
         scholarUrl() {
             if (!this.paper) return '';
             const q = (this.paper.title || this.paper.doi || '').trim();
             return 'https://scholar.google.com/scholar?q=' + encodeURIComponent(q);
+        },
+        previewUrl() {
+            if (!this.paper) return '';
+            return '/api/papers/' + this.paper.id + '/pdf'
+                + (this.pdfVersion ? '?v=' + encodeURIComponent(this.pdfVersion) : '');
         },
         notesHtml() {
             const notes = this.paper && this.paper.notes;
@@ -2604,6 +6031,14 @@ const PaperDetail = {
             this.close();
         };
         window.addEventListener('keydown', this._escHandler);
+        // Back from the PDF reader (#229): the window gets the focus again or
+        // becomes visible - read the annotations anew, never on a timer.
+        this._returnHandler = () => {
+            if (document.visibilityState === 'hidden') return;
+            this.loadAnnotations({ quiet: true });
+        };
+        window.addEventListener('focus', this._returnHandler);
+        document.addEventListener('visibilitychange', this._returnHandler);
         // Focus mode (#161): the sidebar folds to its icon rail while a paper is
         // open and unfolds again on close. The sidebar owns that decision — and
         // never writes the stored preference for it.
@@ -2611,6 +6046,11 @@ const PaperDetail = {
     },
     unmounted() {
         if (this._escHandler) window.removeEventListener('keydown', this._escHandler);
+        if (this._returnHandler) {
+            window.removeEventListener('focus', this._returnHandler);
+            document.removeEventListener('visibilitychange', this._returnHandler);
+        }
+        clearTimeout(this._jumpTimer);
         this.teardownNotes();
         window.dispatchEvent(new CustomEvent('lb-focus-mode', { detail: { on: false } }));
     },
@@ -2623,6 +6063,14 @@ const PaperDetail = {
             if (on) this.teardownNotes();
             else this.$nextTick(() => this.openNotes());
         },
+        // The notes editor was laid out while its panel was hidden: measure it
+        // again once the panel shows.
+        activeTab() {
+            this.$nextTick(() => { if (this._notesCm) this._notesCm.refresh(); });
+        },
+        sideOpen() {
+            this.$nextTick(() => { if (this._notesCm) this._notesCm.refresh(); });
+        },
     },
     methods: {
         close() {
@@ -2633,11 +6081,33 @@ const PaperDetail = {
                 this.$router.push('/');
             }
         },
+        // A template ref inside the blocks' v-for arrives as an array.
+        blockRef(name) {
+            const ref = this.$refs[name];
+            return Array.isArray(ref) ? ref[0] : ref;
+        },
+        // Tab click (#230): select the tab and show the panel; a click on the
+        // shown tab folds it again - but only where it can fold (1100-1440 px).
+        pickTab(index) {
+            const tab = this.layout.tabs[index];
+            if (!tab) return;
+            if (index === this.activeTab && this.sideOpen && this.sideCollapsible()) {
+                this.sideOpen = false;
+                return;
+            }
+            this.sideTabChoice = tab.blocks[0];
+            lsSet(DETAIL_TAB_KEY, this.sideTabChoice);
+            this.sideOpen = true;
+        },
+        sideCollapsible() {
+            if (typeof window.matchMedia !== 'function') return true;
+            return !window.matchMedia('(min-width: 1440px)').matches;
+        },
         startEditCiteKey() {
             this.citeKeyDraft = this.paper.cite_key || '';
             this.citeKeyError = '';
             this.editingCiteKey = true;
-            this.$nextTick(() => { if (this.$refs.citeKeyInput) this.$refs.citeKeyInput.focus(); });
+            this.$nextTick(() => { const el = this.blockRef('citeKeyInput'); if (el) el.focus(); });
         },
         async saveCiteKey() {
             if (this.citeKeySaving) return;
@@ -2681,7 +6151,7 @@ const PaperDetail = {
             this.teardownNotes();
         },
         mountNotesEditor() {
-            const textarea = this.$refs.notesInput;
+            const textarea = this.blockRef('notesInput');
             if (!textarea) return;
             if (typeof CodeMirror === 'undefined' || !CodeMirror.fromTextArea) {
                 textarea.focus();
@@ -2793,12 +6263,28 @@ const PaperDetail = {
             this.validateProposal = null;
             this.editingMeta = false;
             this.pdfPage = this.$route.query.page ? parseInt(this.$route.query.page) : null;
+            const switching = !this.paper || String(this.paper.id) !== String(this.$route.params.id);
+            if (switching) {
+                // Another Item: its own preview, list and Stand.
+                this.pdfState = { page: null, pages: null };
+                this.activeAnnotationId = null;
+                this.annotations = { status: 'idle', data: null, error: '' };
+            }
             try {
                 const id = this.$route.params.id;
                 const [paper, categories] = await Promise.all([
                     api(`/api/papers/${id}`),
                     api('/api/categories'),
                 ]);
+                // The preview URL carries the file's Stand from the first
+                // load on: a copy of an older file a browser kept under the
+                // bare URL (the iframe before #229 let it cache) never shows.
+                // It changes together with the paper, never ahead of the
+                // fetch: the outgoing Item's preview would reopen on the bare URL.
+                if (switching || paper.pdf_modified) {
+                    this.pdfVersion = paper.pdf_modified || null;
+                    this._stand = paper.pdf_modified ? { id: paper.id, value: paper.pdf_modified } : null;
+                }
                 this.paper = paper;
                 this.allCategories = categories;
                 // Initialize custom values
@@ -2817,6 +6303,74 @@ const PaperDetail = {
             this.loading = false;
             // Load references in background
             this.loadReferences();
+            // ... and the annotations: the view never waits for a long PDF.
+            this.loadAnnotations();
+        },
+        // --- Annotations + preview (#229) -----------------------------------
+        // `quiet`: a refresh on return from the reader keeps the list on
+        // screen instead of the placeholder rows, and runs only once at a time.
+        async loadAnnotations({ quiet = false } = {}) {
+            const paper = this.paper;
+            if (!paper || !paper.filename) return;
+            if (quiet && this._annotationsBusy) return;
+            const ticket = (this._annotationsTicket = (this._annotationsTicket || 0) + 1);
+            this._annotationsBusy = true;
+            const keep = quiet && this.annotations.status === 'ready';
+            if (!keep) this.annotations = { status: 'loading', data: null, error: '' };
+            let next = null;
+            try {
+                const resp = await fetch(`/api/papers/${paper.id}/annotations`);
+                if (resp.status === 409) {
+                    next = { status: 'unreadable', data: null, error: '' };
+                } else if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    next = { status: 'error', data: null, error: translateDetail(err.detail, resp.status) };
+                } else {
+                    next = { status: 'ready', data: await resp.json(), error: '' };
+                }
+            } catch (e) {
+                console.error('annotations.load', e);
+                next = keep ? null : { status: 'error', data: null, error: t('annotations.state.failed') };
+            }
+            if (ticket !== this._annotationsTicket) return;   // a newer read (or Item) took over
+            this._annotationsBusy = false;
+            if (!next || !this.paper || this.paper.id !== paper.id) return;
+            if (next.data) this.noteStand(paper.id, next.data.file_modified);
+            this.annotations = next;
+            const ids = new Set(((next.data && next.data.annotations) || []).map((a) => a.id));
+            if (this.activeAnnotationId && !ids.has(this.activeAnnotationId)) this.activeAnnotationId = null;
+        },
+        // The file's Stand: when it moved on (the reader saved), the preview
+        // URL takes the new one and the preview loads the file again.
+        noteStand(paperId, stand) {
+            if (this._stand && this._stand.id === paperId && stand && this._stand.value !== stand) {
+                this.pdfVersion = stand;
+            }
+            this._stand = { id: paperId, value: stand };
+        },
+        onPdfPage(state) {
+            this.pdfState = { page: state.page, pages: state.pages };
+        },
+        zoomPdf(step) {
+            if (this.$refs.pdfPreview) this.$refs.pdfPreview.zoom(step);
+        },
+        jumpToAnnotation(entry) {
+            this.activeAnnotationId = entry.id;
+            const go = () => {
+                if (this.$refs.pdfPreview) this.$refs.pdfPreview.goTo(entry.page, entry.rect);
+            };
+            // Stacked layout (< 1100 px): first up to the preview, then the
+            // jump, so it never happens out of sight.
+            const stacked = typeof window.matchMedia === 'function'
+                && window.matchMedia('(max-width: 1099px)').matches;
+            const panel = this.$refs.pdfPanel;
+            clearTimeout(this._jumpTimer);
+            if (stacked && panel && panel.scrollIntoView) {
+                panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                this._jumpTimer = setTimeout(go, 380);
+            } else {
+                go();
+            }
         },
         async openInApp() {
             try {
@@ -2862,7 +6416,7 @@ const PaperDetail = {
                 });
                 if (!resp.ok) {
                     const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.detail || 'HTTP ' + resp.status);
+                    throw new Error(translateDetail(err.detail, resp.status));
                 }
                 const data = await resp.json();
                 this.pendingPdfFile = null;
@@ -2933,7 +6487,7 @@ const PaperDetail = {
                     await this.extractReferences();
                 }
             } catch (e) {
-                alert('Verarbeitung fehlgeschlagen: ' + e.message);
+                alert(t('attach.processingFailed', { message: e.message }));
             } finally {
                 this.attachBusy = false;
                 this.attachingPdf = false;
@@ -2953,7 +6507,7 @@ const PaperDetail = {
                 });
                 if (!resp.ok) {
                     const err = await resp.json().catch(() => ({ detail: 'error.noOaPdf' }));
-                    throw new Error(err.detail || 'HTTP ' + resp.status);
+                    throw new Error(translateDetail(err.detail, resp.status));
                 }
                 await this.load();
                 window.dispatchEvent(new CustomEvent('refresh-sidebar'));
@@ -2999,7 +6553,7 @@ const PaperDetail = {
                 }
                 this.validateProposal = proposal;
             } catch (e) {
-                alert('Validierung fehlgeschlagen: ' + e.message);
+                alert(t('validate.failed', { message: e.message }));
             }
             this.validating = false;
         },
@@ -3047,7 +6601,7 @@ const PaperDetail = {
                 window.dispatchEvent(new CustomEvent('refresh-sidebar'));
                 this.closeProposal();
             } catch (e) {
-                alert('Uebernahme fehlgeschlagen: ' + e.message);
+                alert(t('validate.applyFailed', { message: e.message }));
             }
             this.applyingProposal = false;
         },
@@ -3070,8 +6624,12 @@ const PaperDetail = {
                     }
                 }
                 window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+                // OCR rewrote the PDF: the preview moves to the new Stand the
+                // Item reports, even when the annotations cannot be read.
+                if (this.paper.pdf_modified) this.noteStand(this.paper.id, this.paper.pdf_modified);
+                this.loadAnnotations();
             } catch (e) {
-                alert('OCR fehlgeschlagen: ' + e.message);
+                alert(t('ocr.failed', { message: e.message }));
             }
             this.ocrRunning = false;
         },
@@ -3097,8 +6655,8 @@ const PaperDetail = {
                     this.editMeta.abstract = data.abstract;
                     this.paper.abstract = data.abstract;
                     this.paper.abstract_source = data.source;
-                    const sourceLabels = { crossref: 'CrossRef', pdf: 'PDF (KI-Extraktion)', generated: 'KI-generiert' };
-                    alert(`Abstract erfolgreich geladen!\nQuelle: ${sourceLabels[data.source] || data.source}`);
+                    const sourceLabels = { crossref: 'CrossRef', pdf: t('abstract.source.pdf'), generated: t('abstract.source.generated') };
+                    alert(t('abstract.loaded', { source: sourceLabels[data.source] || data.source }));
                 } else {
                     alert(data.message ? translateDetail(data.message) : t('abstract.noneFound'));
                 }
@@ -3133,6 +6691,32 @@ const PaperDetail = {
                 alert(t('error.saveFailed', { message: e.message }));
             }
         },
+        async assignPickedCategory(id) {
+            this.categoryPickerBusy = true;
+            this.selectedCategoryId = id;
+            await this.addCategory();
+            this.categoryPickerBusy = false;
+            this.showCatAdd = false;
+        },
+        // "Create “X”": the new category, then at once on this item.
+        async createPickedCategory({ name, parentId }) {
+            this.categoryPickerBusy = true;
+            try {
+                const res = await api('/api/categories', {
+                    method: 'POST', body: JSON.stringify({ name, parent_id: parentId }),
+                });
+                await api(`/api/papers/${this.paper.id}/categories`, {
+                    method: 'POST', body: JSON.stringify({ category_id: res.id }),
+                });
+                this.showCatAdd = false;
+                await this.load();
+                this.refreshSidebar();
+            } catch (e) {
+                alert(t('error.generic', { message: e.message }));
+            } finally {
+                this.categoryPickerBusy = false;
+            }
+        },
         async addCategory() {
             if (!this.selectedCategoryId) return;
             try {
@@ -3156,10 +6740,55 @@ const PaperDetail = {
                 alert(t('error.generic', { message: e.message }));
             }
         },
+        async onAddedToCollection() {
+            this.showCollectionPicker = false;
+            await this.reloadCollections();
+        },
+        async reloadCollections() {
+            try {
+                const fresh = await api(`/api/papers/${this.paper.id}`);
+                this.paper.collections = fresh.collections || [];
+            } catch (e) {}
+        },
+        startCollectionNote(c) {
+            this.collectionNoteDraft = { id: c.id, note: c.note || '' };
+        },
+        async saveCollectionNote() {
+            const draft = this.collectionNoteDraft;
+            if (!draft) return;
+            try {
+                await api(`/api/collections/${draft.id}/items/${this.paper.id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ note: draft.note }),
+                });
+                this.collectionNoteDraft = null;
+                await this.reloadCollections();
+            } catch (e) {
+                alert(t('error.generic', { message: e.message }));
+            }
+        },
+        async removeFromCollection(c) {
+            try {
+                await api(`/api/collections/${c.id}/items`, {
+                    method: 'DELETE',
+                    body: JSON.stringify({ paper_ids: [this.paper.id] }),
+                });
+                await this.reloadCollections();
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            } catch (e) {
+                alert(t('error.generic', { message: e.message }));
+            }
+        },
         async deletePaper() {
-            if (!confirm(t('papers.deleteConfirm'))) return;
+            // Name the Collections the Item would leave (#201).
+            const inCollections = (this.paper.collections || []).length;
+            const question = inCollections
+                ? tn('papers.deleteConfirmCollections', inCollections)
+                : t('papers.deleteConfirm');
+            if (!confirm(question)) return;
             try {
                 await api(`/api/papers/${this.paper.id}`, { method: 'DELETE' });
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
                 this.$router.push('/');
             } catch (e) {
                 alert(t('error.generic', { message: e.message }));
@@ -3194,10 +6823,16 @@ const PaperDetail = {
         async extractReferences(force = false) {
             this.extractingRefs = true;
             this.refExtractionResult = null;
-            this.refProgress = { percent: 0, message: 'Starte...', current: 0, total: 0, found: null, error: null };
+            this.refProgress = { percent: 0, message: t('common.starting'), current: 0, total: 0, found: null, error: null };
             try {
                 const url = `/api/papers/${this.paper.id}/extract-references?force=${force}`;
                 const response = await fetch(url, { method: 'POST' });
+                // A refusal (no PDF on disk, unknown item) is JSON, not a
+                // stream: without this it would end the spinner in silence.
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}));
+                    throw new Error(translateDetail(err.detail, response.status));
+                }
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
@@ -3265,7 +6900,7 @@ const PaperDetail = {
             }
         },
         async deleteRef(ref) {
-            if (!confirm(`Referenz "${(ref.title || '').substring(0, 60)}" wirklich loeschen?`)) return;
+            if (!confirm(t('refs.deleteConfirm', { title: (ref.title || '').substring(0, 60) }))) return;
             try {
                 await api(`/api/papers/${this.paper.id}/references/${ref.id}`, { method: 'DELETE' });
                 this.paperRefs = this.paperRefs.filter(r => r.id !== ref.id);
@@ -3343,9 +6978,7 @@ const CategoryPlanner = {
             <div v-else-if="activeTab === 'tree'" class="bg-white rounded-xl border border-gray-200 shadow-sm">
                 <div class="p-4 border-b border-gray-100">
                     <p class="text-xs text-gray-500">
-                        Ziehe Kategorien per Drag & Drop, um sie zu verschieben.
-                        Lege sie auf eine andere Kategorie, um sie als Unterkategorie zuzuordnen.
-                        Lege sie in den Bereich &laquo;Oberste Ebene&raquo;, um sie zur Hauptkategorie zu machen.
+                        {{ $t('planner.dragHint') }}
                     </p>
                 </div>
 
@@ -3655,7 +7288,7 @@ const CategoryPlanner = {
             this.dragNode = node;
             e.dataTransfer.effectAllowed = 'move';
             e.dataTransfer.setData('text/plain', String(node.id));
-            this.dragStatus = 'Ziehe: ' + node.name;
+            this.dragStatus = t('planner.dragging', { name: node.name });
         },
         onDragEnd() {
             this.dragNode = null;
@@ -3669,7 +7302,7 @@ const CategoryPlanner = {
             if (type === 'root') {
                 this.dropTarget = 'root';
                 this.dropTargetNode = null;
-                this.dragStatus = this.dragNode.name + ' → Oberste Ebene';
+                this.dragStatus = t('planner.dragToRoot', { name: this.dragNode.name });
             } else if (node && node.id !== this.dragNode.id) {
                 this.dropTarget = 'node';
                 this.dropTargetNode = node;
@@ -3830,7 +7463,7 @@ const CategoryPlanner = {
             const childCount = this.countDescendants(node);
             let msg = t('categories.deleteConfirm', { name: node.name });
             if (childCount > 0) {
-                msg += ' ' + childCount + ' Unterkategorie(n) werden ebenfalls entfernt.';
+                msg += ' ' + tn('categories.deleteChildCount', childCount);
             }
             if (!confirm(msg)) return;
             try {
@@ -3856,10 +7489,418 @@ const CategoryPlanner = {
 
 
 // =============================================================================
+// Target collection of an import (#203, #227)
+// =============================================================================
+// One picker for the PDF upload and the DOI list. The parent owns the choice
+// (`v-model:target`: '' none, a collection id, or 'new'; `v-model:new-name`).
+// The picker loads the active collections and applies a link's
+// `?collection=` (`applyLink`, on creation and whenever the parent passes a
+// new link): only an active collection can be preselected — an archived,
+// deleted or unknown one falls back to "No collection" with a visible hint.
+// `resolve()` turns the choice into a collection id BEFORE the import's first
+// write (collection_membership's check_target rule): a new collection is
+// created there, so a failure stops the import before any Item exists.
+const ImportTargetPicker = {
+    name: 'ImportTargetPicker',
+    props: {
+        target: { type: String, default: '' },
+        newName: { type: String, default: '' },
+        testid: { type: String, required: true },
+        labelledby: { type: String, default: '' },
+        disabled: { type: Boolean, default: false },
+        error: { type: String, default: '' },
+    },
+    emits: ['update:target', 'update:newName'],
+    template: `
+        <div :data-testid="testid">
+            <select v-model="choice" class="lb-input w-full" :disabled="disabled"
+                    :aria-labelledby="labelledby || null" :data-testid="testid + '-select'">
+                <option value="">{{ $t('import.target.none') }}</option>
+                <option v-for="c in collections" :key="c.id" :value="String(c.id)">{{ c.name }}</option>
+                <option value="new">{{ $t('import.target.new') }}</option>
+            </select>
+            <input v-if="choice === 'new'" v-model="name" class="lb-input w-full mt-2" :disabled="disabled"
+                   :data-testid="testid + '-new-name'" :aria-label="$t('import.target.new')"
+                   :placeholder="$t('collections.namePlaceholder')" />
+            <p class="text-xs text-gray-400 mt-1">{{ $t('import.target.hint') }}</p>
+            <p v-if="unavailable" class="text-xs mt-1" style="color: var(--lb-danger);" role="status"
+               :data-testid="testid + '-unavailable'">{{ $t('import.target.unavailable') }}</p>
+            <p v-if="error" class="text-xs mt-1" style="color: var(--lb-danger);" :data-testid="testid + '-error'">{{ error }}</p>
+        </div>
+    `,
+    data() {
+        // `current` mirrors the choice at once: the prop only follows on the
+        // parent's next render, and `resolve()` may run before that.
+        return { collections: [], current: this.target, unavailable: false, pending: null };
+    },
+    computed: {
+        choice: {
+            get() { return this.current; },
+            set(value) { this.unavailable = false; this.choose(value); },
+        },
+        name: {
+            get() { return this.newName; },
+            set(value) { this.$emit('update:newName', value); },
+        },
+    },
+    watch: {
+        target(value) { this.current = value; },
+    },
+    created() {
+        this.loaded = this.load();
+        this.applyLink(this.$route.query);
+    },
+    methods: {
+        async load() {
+            try {
+                this.collections = await api('/api/collections');
+            } catch (e) {
+                this.collections = [];
+            }
+        },
+        choose(value) {
+            this.current = value;
+            this.$emit('update:target', value);
+        },
+        known(id) { return this.collections.some((c) => String(c.id) === String(id)); },
+        nameOf(id) {
+            const c = this.collections.find((x) => String(x.id) === String(id));
+            return c ? c.name : '';
+        },
+        // A link's `?collection=` wins. A DOI list without one means "No
+        // collection": the list of one publication must not land in the
+        // collection of the one before. Otherwise a choice that is no active
+        // collection (any more) is reset.
+        applyLink(query) {
+            this.pending = (async () => {
+                await this.loaded;
+                const wanted = query.collection ? String(query.collection) : '';
+                if (wanted) {
+                    this.unavailable = !this.known(wanted);
+                    this.choose(this.unavailable ? '' : wanted);
+                } else if (query.dois || !this.known(this.current)) {
+                    this.unavailable = false;
+                    this.choose('');
+                }
+            })();
+            return this.pending;
+        },
+        // Before the first write: the chosen collection's id, a new one
+        // created now, or null for "No collection".
+        async resolve() {
+            await this.pending;
+            if (this.current !== 'new') return this.current || null;
+            const created = await api('/api/collections', {
+                method: 'POST', body: JSON.stringify({ name: this.newName }),
+            });
+            this.collections = [...this.collections, created];
+            this.choose(String(created.id));
+            this.$emit('update:newName', '');
+            return String(created.id);
+        },
+    },
+};
+
+
+// =============================================================================
+// DOI list import (#227)
+// =============================================================================
+// A pasted list of DOIs, or one handed over by a link:
+// `/import?dois=<doi>&dois=<doi>[&collection=<id>]` — any page or Add-on may
+// link there, and the link alone creates nothing. The preview asks the DOI
+// existence check what is new and what the library already holds; only the
+// click creates, through the batch endpoint for DOIs (enrichment and a
+// best-effort open-access PDF included). Like every import (#203) the target
+// collection takes every Item of the list, the ones already there too.
+
+// The intake's DOI rule (bibtex_import.normalize_doi + lower(), pinned on both
+// sides by tests/fixtures/doi_vectors.json): a resolver link or `doi:` in
+// front and full stops behind dropped, lower case.
+const DOI_PREFIX = /^(?:doi:\s*|(?:https?:\/\/)?(?:[a-z0-9-]+\.)*doi\.org\/)/i;
+const DOI_SHAPE = /^10\.\d{4,}(?:\.\d+)*\/\S+$/;
+// A list breaks at whitespace, and at a comma or semicolon only where a new
+// DOI starts: inside a DOI both are characters (Wiley's SICI DOIs carry `;`).
+const DOI_SPLIT = /[,;]\s*(?=10\.\d{4,}\/|doi:|https?:\/\/|(?:[a-z0-9-]+\.)*doi\.org\/)|\s+/i;
+const DOI_BATCH_SIZE = 10;  // one progress step per batch request
+
+function normalizeDoi(raw) {
+    return String(raw || '').trim().replace(DOI_PREFIX, '').replace(/\.+$/, '').toLowerCase();
+}
+
+// The pieces of a list, a separator left at a piece's end dropped.
+function doiTokens(text) {
+    return String(text || '').split(DOI_SPLIT).map((s) => s.replace(/[,;]+$/, '')).filter(Boolean);
+}
+
+// One preview row per DOI, normalized as the server will see it; the same
+// DOI once; anything that is no DOI kept as `invalid`.
+function doiRows(text) {
+    const seen = new Set();
+    const rows = [];
+    for (const token of doiTokens(text)) {
+        const doi = normalizeDoi(token);
+        if (!doi || seen.has(doi)) continue;
+        seen.add(doi);
+        rows.push({ doi, state: DOI_SHAPE.test(doi) ? 'new' : 'invalid', paperId: null, pdf: '' });
+    }
+    return rows;
+}
+
+// `?dois=` repeated (one DOI each) or as one list: one piece per line.
+function doisFromQuery(value) {
+    const parts = Array.isArray(value) ? value : [value];
+    return parts.flatMap((p) => doiTokens(p)).join('\n');
+}
+
+const DoiImportSection = {
+    name: 'DoiImportSection',
+    components: { ImportTargetPicker },
+    template: `
+        <section class="mb-6 bg-white rounded-lg border border-gray-200 p-4" data-testid="import-doi-section"
+                 aria-labelledby="import-doi-heading">
+            <h3 id="import-doi-heading" class="text-sm font-medium text-gray-900">{{ $t('import.doi.heading') }}</h3>
+            <p id="import-doi-hint" class="text-xs text-gray-500 mb-3">{{ $t('import.doi.hint') }}</p>
+            <textarea v-model="text" rows="4" class="lb-input lb-mono w-full" spellcheck="false"
+                      aria-labelledby="import-doi-heading" aria-describedby="import-doi-hint"
+                      :placeholder="$t('import.doi.placeholder')" :disabled="busy"
+                      data-testid="import-doi-input"></textarea>
+            <div class="mt-3 flex flex-wrap items-start gap-3">
+                <div class="flex-1" style="min-width: 14rem;">
+                    <p id="import-doi-target-label" class="lb-field-label block mb-1">{{ $t('import.target.heading') }}</p>
+                    <import-target-picker ref="target" v-model:target="target" v-model:new-name="newName"
+                                          testid="import-doi-target" labelledby="import-doi-target-label" :disabled="busy" />
+                </div>
+                <button type="button" @click="check" :disabled="!hasText || busy" data-testid="import-doi-check"
+                        class="flex-shrink-0 bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-40"
+                        style="margin-top: 1.25rem;">
+                    {{ $t('import.doi.check') }}
+                </button>
+            </div>
+
+            <div v-if="phase === 'checking'" class="mt-4 flex items-center gap-2 text-sm text-gray-600" role="status">
+                <span class="spinner" style="width:14px;height:14px;border-width:2px;"></span>{{ $t('import.doi.checking') }}
+            </div>
+            <div v-else-if="phase !== 'edit' && rows.length" class="mt-4" aria-live="polite">
+                <p v-if="phase === 'result'" class="text-sm text-gray-700" data-testid="import-doi-result">
+                    {{ $t('import.doi.result', { created: count('created'), existing: count('existing') }) }}
+                </p>
+                <p v-else class="text-sm text-gray-700" data-testid="import-doi-summary">
+                    {{ $tn('import.doi.summary', checkedCount, { existing: count('existing'), fresh: count('new') }) }}
+                </p>
+                <p v-if="phase === 'result' && count('failed')" class="text-xs mt-1" style="color: var(--lb-danger);">
+                    {{ $tn('import.doi.errors', count('failed')) }}
+                </p>
+                <p v-if="collectionLine" class="text-xs text-gray-600 mt-1" data-testid="import-doi-collection">{{ collectionLine }}</p>
+                <p v-if="count('invalid')" class="text-xs text-gray-500 mt-1" data-testid="import-doi-invalid">
+                    {{ $tn('import.doi.invalid', count('invalid')) }}
+                </p>
+                <ul class="lb-coll-picker-list mt-2" style="max-height: 16rem;" data-testid="import-doi-rows">
+                    <li v-for="r in rows" :key="r.doi" class="flex items-center gap-2 text-xs text-gray-600"
+                        data-testid="import-doi-row" :data-state="r.state">
+                        <span class="lb-pill lb-doi-state" :class="'is-' + r.state">{{ $t('import.doi.state.' + r.state) }}</span>
+                        <span class="font-mono truncate flex-1" data-testid="import-doi-value">{{ r.doi }}</span>
+                        <span v-if="r.pdf === 'fetched'" class="text-gray-400 flex-shrink-0">{{ $t('import.doi.withPdf') }}</span>
+                        <router-link v-if="r.paperId" :to="{ name: 'paper', params: { id: r.paperId } }"
+                                     class="text-accent hover:underline flex-shrink-0">{{ $t('import.openItem') }}</router-link>
+                    </li>
+                </ul>
+                <div v-if="phase === 'creating'" class="mt-3 flex items-center gap-2 text-sm text-gray-600" role="status"
+                     data-testid="import-doi-progress">
+                    <span class="spinner" style="width:14px;height:14px;border-width:2px;"></span>
+                    {{ $t('import.doi.creating', { done: progress.done, total: progress.total }) }}
+                </div>
+                <template v-else-if="phase === 'preview'">
+                    <p v-if="!count('new') && !target" class="text-xs text-gray-500 mt-3" data-testid="import-doi-nothing">
+                        {{ $t('import.doi.nothingNew') }}
+                    </p>
+                    <div v-else class="mt-3 flex justify-end">
+                        <button type="button" @click="commit" :disabled="!canCommit" data-testid="import-doi-commit"
+                                class="bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-40">
+                            {{ count('new') ? $tn('import.doi.commit', count('new')) : $t('import.doi.addOnly') }}
+                        </button>
+                    </div>
+                </template>
+            </div>
+            <p v-if="error" class="text-xs mt-2" style="color: var(--lb-danger);" data-testid="import-doi-error">{{ error }}</p>
+            <!-- A link that arrived while Items were being created waits here:
+                 the finished import's result stays until the user opens it. -->
+            <div v-if="queued" class="mt-3 flex flex-wrap items-center gap-3 text-xs text-gray-600" role="status"
+                 data-testid="import-doi-queued">
+                <span>{{ $t('import.doi.queued') }}</span>
+                <button v-if="phase !== 'creating'" type="button" @click="applyLink" data-testid="import-doi-open-queued"
+                        class="bg-white border border-gray-300 text-gray-700 px-3 py-1.5 rounded-lg text-sm font-medium hover:bg-gray-50">
+                    {{ $t('import.doi.openQueued') }}
+                </button>
+            </div>
+        </section>
+    `,
+    data() {
+        return {
+            text: '', rows: [], phase: 'edit', // 'edit' | 'checking' | 'preview' | 'creating' | 'result'
+            target: '', newName: '', progress: { done: 0, total: 0 },
+            collection: null, error: '', queued: false,
+        };
+    },
+    computed: {
+        hasText() { return doiTokens(this.text).length > 0; },
+        busy() { return this.phase === 'checking' || this.phase === 'creating'; },
+        checkedCount() { return this.rows.filter((r) => r.state !== 'invalid').length; },
+        canCommit() {
+            if (this.phase !== 'preview') return false;
+            if (this.target === 'new' && !this.newName.trim()) return false;
+            return this.count('new') > 0 || (!!this.target && this.count('existing') > 0);
+        },
+        collectionLine() {
+            const c = this.collection;
+            return c ? t(c.added ? 'import.target.added' : 'import.target.already', { name: c.name }) : '';
+        },
+    },
+    watch: {
+        // A changed list is a new question: the old preview no longer answers it.
+        text() {
+            if (this.phase === 'preview' || this.phase === 'result') this.reset();
+        },
+        // Another link into the import page while it is open (the picker
+        // took the first one itself when it was created).
+        '$route.fullPath'() {
+            if (this.$route.name !== 'import') return;
+            if (this.phase === 'creating') {
+                this.queued = true;  // the list being created stays; this one follows
+                return;
+            }
+            this.applyLink();
+        },
+    },
+    created() {
+        this._ticket = 0;
+        this.prefill();
+    },
+    methods: {
+        count(state) { return this.rows.filter((r) => r.state === state).length; },
+        reset() {
+            this.phase = 'edit';
+            this.rows = [];
+            this.collection = null;
+            this.error = '';
+        },
+        // A link replaces what the page showed: result and error go, the
+        // link's collection and list come in.
+        applyLink() {
+            this.queued = false;
+            this.reset();
+            if (this.$refs.target) this.$refs.target.applyLink(this.$route.query);
+            this.prefill();
+        },
+        // A link hands over the list (`?dois=`): the preview runs at once —
+        // it only reads.
+        prefill() {
+            const dois = this.$route.query.dois;
+            if (!dois) return;
+            this.text = doisFromQuery(dois);
+            this.check();
+        },
+        // Only the latest check may set the preview; a list that changed
+        // while the library was asked is asked about again.
+        async check() {
+            if (this.phase === 'creating') return;
+            const text = this.text;
+            const ticket = ++this._ticket;
+            const rows = doiRows(text);
+            this.reset();
+            if (!rows.length) return;
+            this.rows = rows;
+            this.phase = 'checking';
+            const dois = rows.filter((r) => r.state !== 'invalid').map((r) => r.doi);
+            let found = {};
+            try {
+                if (dois.length) {
+                    found = (await api('/api/papers/by-doi/exists', {
+                        method: 'POST', body: JSON.stringify({ dois }),
+                    })).papers || {};
+                }
+            } catch (e) {
+                if (ticket !== this._ticket) return;
+                this.reset();
+                this.error = e.message;
+                return;
+            }
+            if (ticket !== this._ticket) return;
+            if (this.text !== text) {
+                this.check();
+                return;
+            }
+            for (const r of this.rows) {
+                if (r.state === 'invalid' || !found[r.doi]) continue;
+                r.state = 'existing';
+                r.paperId = found[r.doi];
+            }
+            this.phase = 'preview';
+        },
+        async commit() {
+            if (!this.canCommit) return;
+            this.error = '';
+            const fresh = this.rows.filter((r) => r.state === 'new');
+            this.progress = { done: 0, total: fresh.length };  // this run's, from the start
+            this.phase = 'creating';
+            let collectionId = null;
+            try {
+                collectionId = await this.$refs.target.resolve();  // before the first write
+            } catch (e) {
+                // Nothing was created; the error stays until the next list is opened.
+                this.phase = 'preview';
+                this.error = e.message;
+                return;
+            }
+            for (let i = 0; i < fresh.length; i += DOI_BATCH_SIZE) {
+                const batch = fresh.slice(i, i + DOI_BATCH_SIZE);
+                try {
+                    const res = await api('/api/papers/by-doi/batch', {
+                        method: 'POST', body: JSON.stringify({ items: batch.map((r) => ({ doi: r.doi })) }),
+                    });
+                    (res.results || []).forEach((out, j) => {
+                        const r = batch[j];
+                        if (!r || !out.paper_id) return;
+                        r.paperId = out.paper_id;
+                        r.state = out.created ? 'created' : 'existing';
+                        r.pdf = out.pdf || '';
+                    });
+                } catch (e) {
+                    this.error = e.message;
+                }
+                // What the batch did not answer for was not created.
+                batch.filter((r) => r.state === 'new').forEach((r) => { r.state = 'failed'; });
+                this.progress.done += batch.length;
+            }
+            await this.assignTo(collectionId);
+            this.phase = 'result';
+            window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+        },
+        // Every Item of the list — created now or there before — into the target.
+        async assignTo(collectionId) {
+            const ids = [...new Set(this.rows.filter((r) => r.paperId).map((r) => r.paperId))];
+            if (!collectionId || !ids.length) return;
+            try {
+                const res = await api(`/api/collections/${collectionId}/items`, {
+                    method: 'POST', body: JSON.stringify({ paper_ids: ids }),
+                });
+                this.collection = {
+                    name: this.$refs.target ? this.$refs.target.nameOf(collectionId) : '',
+                    added: (res.added_ids || []).length > 0,
+                };
+            } catch (e) {
+                this.error = e.message;
+            }
+        },
+    },
+};
+
+
+// =============================================================================
 // ImportPage Component
 // =============================================================================
 
 const ImportPage = {
+    components: { BibImportDialog, DoiImportSection, ImportTargetPicker },
     template: `
         <div class="p-6 max-w-4xl mx-auto">
             <h2 class="text-xl font-semibold text-gray-900 mb-2">PDF Import</h2>
@@ -3887,6 +7928,23 @@ const ImportPage = {
                     <p class="text-xs text-gray-400">{{ $t('import.multipleFiles') }}</p>
                 </div>
             </div>
+
+            <!-- BibTeX/.tex in eine Sammlung (#203) -->
+            <div class="mb-6 flex items-center justify-between gap-3 bg-white rounded-lg border border-gray-200 p-4" data-testid="import-bib-section">
+                <div>
+                    <p class="text-sm font-medium text-gray-900">{{ $t('bibImport.heading') }}</p>
+                    <p class="text-xs text-gray-500">{{ $t('bibImport.hint') }}</p>
+                </div>
+                <button @click="showBibImport = true" data-testid="import-bib-open"
+                        class="flex-shrink-0 bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50">
+                    {{ $t('bibImport.open') }}
+                </button>
+            </div>
+            <bib-import-dialog v-if="showBibImport" :collection-id="$route.query.collection || null"
+                               @close="showBibImport = false" />
+
+            <!-- DOI list (#227); a link may prefill it: ?dois=…&collection=… -->
+            <doi-import-section />
 
             <!-- Upload Results (completed papers) -->
             <div v-if="uploadResults.length" class="mb-6">
@@ -3922,7 +7980,7 @@ const ImportPage = {
                         class="inline-flex items-center gap-1.5 bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
                     <span v-if="importing" class="spinner" style="width:14px;height:14px;border-width:2px;border-top-color:#fff;"></span>
                     <span v-else v-html="icons.upload"></span>
-                    {{ importing ? 'Importiere...' : 'Alle importieren' }}
+                    {{ importing ? $t('import.importing') : $t('import.importAll') }}
                 </button>
             </div>
 
@@ -3977,7 +8035,7 @@ const ImportPage = {
                     <!-- Header -->
                     <div class="px-6 py-4 border-b border-gray-100 flex items-center justify-between">
                         <h3 class="text-lg font-semibold text-gray-900">
-                            {{ uploadDialogPhase === 'options' ? 'Import-Optionen' : uploadDialogPhase === 'processing' ? 'Importiere...' : 'Import abgeschlossen' }}
+                            {{ uploadDialogPhase === 'options' ? $t('import.dialog.options') : uploadDialogPhase === 'processing' ? $t('import.importing') : $t('import.dialog.done') }}
                         </h3>
                         <button v-if="uploadDialogPhase !== 'processing'" @click="closeUploadDialog"
                                 class="text-gray-400 hover:text-gray-600 transition-colors">
@@ -4027,9 +8085,16 @@ const ImportPage = {
                                 </div>
                             </label>
                         </div>
+                        <!-- Zielsammlung (#203): auch erkannte Dubletten landen darin -->
+                        <h4 id="upload-target-label" class="text-sm font-semibold text-gray-800 mb-2">{{ $t('import.target.heading') }}</h4>
+                        <import-target-picker ref="uploadTarget" class="mb-6" v-model:target="uploadTarget"
+                                              v-model:new-name="uploadNewCollectionName" testid="upload-target"
+                                              labelledby="upload-target-label" :error="uploadTargetError" />
                         <div class="flex justify-end gap-2">
                             <button @click="closeUploadDialog" class="px-4 py-2 text-sm text-gray-600 border border-gray-300 rounded-lg hover:bg-gray-50">{{ $t('common.cancel') }}</button>
-                            <button @click="startSmartUpload" class="px-5 py-2 text-sm text-white bg-accent rounded-lg hover:bg-accent-ink font-medium">{{ $t('import.action') }}</button>
+                            <button @click="startSmartUpload" :disabled="uploadTarget === 'new' && !uploadNewCollectionName.trim()"
+                                    data-testid="upload-start"
+                                    class="px-5 py-2 text-sm text-white bg-accent rounded-lg hover:bg-accent-ink font-medium disabled:opacity-40">{{ $t('import.action') }}</button>
                         </div>
                     </div>
 
@@ -4066,9 +8131,10 @@ const ImportPage = {
                                     <router-link :to="{name: 'paper', params: {id: res.duplicate_paper_id}}"
                                                  class="text-xs font-medium text-accent hover:text-accent-ink hover:underline"
                                                  @click.native="closeUploadDialog">
-                                        {{ res.duplicate_title || 'Paper oeffnen' }} &rarr;
+                                        {{ res.duplicate_title || $t('import.openItem') }} &rarr;
                                     </router-link>
                                 </div>
+                                <p v-if="res.collection" class="text-xs mt-1" data-testid="upload-result-collection">{{ uploadCollectionText(res.collection) }}</p>
                             </div>
                             <!-- Success Result -->
                             <template v-else>
@@ -4111,6 +8177,7 @@ const ImportPage = {
                                     </span>
                                 </div>
                                 <div v-else class="ml-11 mb-3 text-xs text-gray-400">{{ $t('import.noCategoriesAssigned') }}</div>
+                                <p v-if="res.collection" class="ml-11 mb-3 text-xs text-gray-600" data-testid="upload-result-collection">{{ uploadCollectionText(res.collection) }}</p>
 
                                 <!-- AI steps that failed at the provider (rate limit, key, host):
                                      the server-side log is invisible to the user, so the empty
@@ -4119,6 +8186,8 @@ const ImportPage = {
                                      class="ml-11 mb-3 p-2.5 rounded-lg bg-accent-soft border border-accent-soft text-xs text-accent-ink">
                                     <p class="font-medium">{{ llmFailureSummary(res.llm_failures) }}</p>
                                     <p class="mt-1 opacity-80">{{ $t('import.llm.affectedSteps', { steps: llmFailureSteps(res.llm_failures) }) }}</p>
+                                    <router-link to="/settings/ai-models" class="inline-block mt-1 font-medium underline"
+                                                 data-testid="import-llm-settings-link">{{ $t('import.llm.openAiModels') }} →</router-link>
                                 </div>
 
                                 <div v-if="res.abstract" class="ml-11 mb-3">
@@ -4129,7 +8198,7 @@ const ImportPage = {
                                     <router-link :to="{name: 'paper', params: {id: res.paper_id}}"
                                                  class="inline-flex items-center gap-1 text-xs text-accent hover:text-accent-ink font-medium"
                                                  @click.native="closeUploadDialog">
-                                        Paper oeffnen &rarr;
+                                        {{ $t('import.openItem') }} &rarr;
                                     </router-link>
                                 </div>
                             </template>
@@ -4162,6 +8231,12 @@ const ImportPage = {
             currentUploadFile: '',
             currentUploadFileIdx: 0,
             uploadDialogResults: [],
+            // Target Collection (#203): '' none, a collection id, or 'new'
+            // (ImportTargetPicker loads the collections and applies ?collection=).
+            uploadTarget: '',
+            uploadNewCollectionName: '',
+            uploadTargetError: '',
+            showBibImport: false,
         };
     },
     created() {
@@ -4193,13 +8268,26 @@ const ImportPage = {
             this.uploadDialogResults = [];
             this.uploadSteps = [];
             this.uploadProgress = 0;
+            this.uploadTargetError = '';
+            this.uploadNewCollectionName = '';
             this.showUploadDialog = true;
+        },
+        uploadCollectionText(c) {
+            return t(c.added ? 'import.target.added' : 'import.target.already', { name: c.name });
         },
         closeUploadDialog() {
             this.showUploadDialog = false;
             this.uploadQueue = [];
         },
         async startSmartUpload() {
+            let collectionId = null;
+            this.uploadTargetError = '';
+            try {
+                collectionId = await this.$refs.uploadTarget.resolve();  // before the first write
+            } catch (e) {
+                this.uploadTargetError = e.message;
+                return;
+            }
             this.uploadDialogPhase = 'processing';
             this.uploadDialogResults = [];
             const files = this.uploadQueue;
@@ -4217,6 +8305,7 @@ const ImportPage = {
                         do_abstract: this.uploadOpts.abstract,
                         do_validate: this.uploadOpts.validate,
                     });
+                    if (collectionId) params.set('collection_id', collectionId);
 
                     let resp;
                     if (files[i]._inputFolder) {
@@ -4236,7 +8325,7 @@ const ImportPage = {
 
                     if (!resp.ok) {
                         const err = await resp.json().catch(() => ({}));
-                        throw new Error(err.detail || 'HTTP ' + resp.status);
+                        throw new Error(translateDetail(err.detail, resp.status));
                     }
 
                     // SSE-like reader
@@ -4276,7 +8365,8 @@ const ImportPage = {
                                     this.uploadSteps.push({ message: translateDetail(data.message), error: true });
                                     lastResult = { error: translateDetail(data.message), filename: files[i].name,
                                         duplicate_paper_id: data.duplicate_paper_id,
-                                        duplicate_title: data.duplicate_title };
+                                        duplicate_title: data.duplicate_title,
+                                        collection: data.collection || null };
                                 }
                             } catch (e) { /* ignore parse errors */ }
                         }
@@ -4668,6 +8758,7 @@ const MigratePage = {
                     <div class="lb-migrate-tile"><span class="lb-migrate-tile-num">{{ runCounts.matched }}</span><span>{{ $t('migrate.result.matched') }}</span></div>
                     <div class="lb-migrate-tile"><span class="lb-migrate-tile-num">{{ runCounts.attached }}</span><span>{{ $t('migrate.result.attached') }}</span></div>
                     <div class="lb-migrate-tile"><span class="lb-migrate-tile-num">{{ runCounts.failed }}</span><span>{{ $t('migrate.result.failed') }}</span></div>
+                    <div v-if="runCounts.collections" class="lb-migrate-tile" data-testid="migrate-result-collections"><span class="lb-migrate-tile-num">{{ runCounts.collections }}</span><span>{{ $t('migrate.result.collections') }}</span></div>
                 </div>
 
                 <div v-if="runResults.length" class="border border-gray-200 rounded-lg overflow-hidden max-h-96 overflow-y-auto mb-5">
@@ -4743,7 +8834,7 @@ const MigratePage = {
             runPercent: 0,
             runSteps: [],
             runResults: [],
-            runCounts: { created: 0, matched: 0, attached: 0, failed: 0 },
+            runCounts: { created: 0, matched: 0, attached: 0, failed: 0, collections: 0 },
             runId: '',
             runError: '',
             missingAttachments: 0,
@@ -4967,6 +9058,7 @@ const MigratePage = {
                     matched: complete.matched || 0,
                     attached: complete.attached || 0,
                     failed: complete.failed || 0,
+                    collections: complete.collections_created || 0,
                 };
                 this.missingAttachments = this.isPdfFolder ? 0 : ((this.analysis && this.analysis.attachments_missing) || 0);
             }
@@ -5062,54 +9154,51 @@ const MigratePage = {
 
 
 // =============================================================================
-// SettingsPage Component
-// =============================================================================
-
-// =============================================================================
 // Add-on settings section (slot "settings", #190)
 // -----------------------------------------------------------------------------
-// The settings of one installed Add-on, in its Marketplace slide-over (#193;
-// Settings no longer carries Add-on cards). The values live in
+// The settings of one installed Add-on, on its page under Settings → Add-ons
+// (#207; before that in its Marketplace slide-over, #193). The values live in
 // the Add-on's own namespace of plugins.json (GET/PUT /api/plugins/{id}/
 // settings). An Add-on that registers a "settings" component gets
 // `{addonId, fields, values, save}` and draws its own form; otherwise the core
 // renders the Manifest's declared fields: string, path (text), bool
 // (checkbox), secret (masked — never sent back, only `key_hint` shown; an
-// empty secret input means "unchanged" and goes out as null).
+// empty secret input means "unchanged" and goes out as null). Once loaded it
+// emits `loaded` with whether there is anything to show, so the page can say
+// "no settings" instead of an empty heading.
 // =============================================================================
 
 const AddonSettingsSection = {
     props: { addonId: { type: String, required: true } },
+    emits: ['loaded'],
     template: `
-        <div v-if="loaded && (custom || fields.length)" class="mt-2 mb-2 pl-3 border-l-2 border-gray-100"
+        <div v-if="loaded && (custom || fields.length)" class="lb-set-card lb-set-pad"
              :data-testid="'addon-settings-' + addonId">
-            <h4 class="text-xs font-semibold uppercase text-mute mb-2">{{ $t('marketplace.settings') }}</h4>
             <component v-if="custom" :is="custom.component" :addon-id="addonId"
                        :fields="fields" :values="values" :save="save" />
-            <form v-else class="space-y-3" @submit.prevent="saveGeneric">
+            <form v-else class="lb-set-fields" @submit.prevent="saveGeneric">
                 <div v-for="f in fields" :key="f.key">
                     <label v-if="f.type === 'bool'" class="inline-flex items-center gap-2 text-sm text-gray-700">
                         <input type="checkbox" v-model="drafts[f.key]" :data-field="f.key" />
                         {{ fieldLabel(f) }}
                     </label>
-                    <template v-else>
-                        <label class="block text-sm font-medium text-gray-700 mb-1" :for="inputId(f)">{{ fieldLabel(f) }}</label>
+                    <div v-else class="lb-field">
+                        <label class="lb-set-label" :for="inputId(f)">{{ fieldLabel(f) }}</label>
                         <input :id="inputId(f)" :data-field="f.key" v-model="drafts[f.key]"
                                :type="f.type === 'secret' ? 'password' : 'text'" autocomplete="off"
                                :placeholder="f.type === 'secret' && secretSet(f) ? $t('settings.addons.secretKeep') : ''"
-                               class="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
-                        <p v-if="f.type === 'secret' && secretSet(f)" class="text-xs text-gray-500 mt-1" :data-secret-hint="f.key">
+                               class="lb-input" />
+                        <p v-if="f.type === 'secret' && secretSet(f)" class="lb-set-hint" :data-secret-hint="f.key">
                             {{ $t('settings.addons.secretStored', { hint: values[f.key].key_hint }) }}
                         </p>
-                    </template>
+                    </div>
                 </div>
-                <div class="flex items-center gap-3">
-                    <button type="submit" :disabled="saving" :data-testid="'addon-settings-save-' + addonId"
-                            class="px-3 py-1.5 text-sm rounded-lg border border-gray-300 hover:bg-gray-50">
+                <div class="lb-set-actions">
+                    <button type="submit" :disabled="saving" :data-testid="'addon-settings-save-' + addonId" class="lb-btn">
                         {{ $t('settings.addons.save') }}
                     </button>
-                    <span v-if="saved" class="text-xs text-gray-500">{{ $t('settings.addons.saved') }}</span>
-                    <span v-if="error" class="text-xs text-red-600">{{ error }}</span>
+                    <span v-if="saved" class="lb-set-saved">{{ $t('settings.addons.saved') }}</span>
+                    <span v-if="error" class="lb-set-error">{{ error }}</span>
                 </div>
             </form>
         </div>
@@ -5121,6 +9210,11 @@ const AddonSettingsSection = {
         custom() {
             return addonSlots('settings').find((s) => s.addon === this.addonId) || null;
         },
+    },
+    watch: {
+        // Any further edit takes the "Saved" back (SPA-13). Synchronous, so
+        // the drafts a save writes back clear it before the save sets it.
+        drafts: { deep: true, flush: 'sync', handler() { this.saved = false; } },
     },
     created() {
         this.load();
@@ -5134,6 +9228,7 @@ const AddonSettingsSection = {
                 this.fields = [];
             }
             this.loaded = true;
+            this.$emit('loaded', !!(this.custom || this.fields.length));
         },
         apply(data) {
             this.fields = Array.isArray(data.fields) ? data.fields : [];
@@ -5195,808 +9290,1722 @@ const AddonSettingsSection = {
     },
 };
 
-const SettingsPage = {
+// =============================================================================
+// Settings (#207, PRD #206)
+// -----------------------------------------------------------------------------
+// A frame with the section list on the left in four groups (Settings, Add-ons,
+// Maintenance, System) and one address per section: /settings/<slug>, an
+// Add-on's page under /settings/addons/<id>; /settings and unknown slugs land
+// on General. Each section is its own component below; the frame only draws
+// the list, the head every section shares (group · title · one sentence) and
+// the Add-on entries. Sections sit under <keep-alive>, so switching sections
+// keeps their state — an unsaved AI-model draft, a running refresh — the way
+// the former tabs of the one big page did.
+// =============================================================================
+
+const SETTINGS_ICON_PATHS = {
+    general: '<path d="M21 4h-7"/><path d="M10 4H3"/><path d="M21 12h-9"/><path d="M8 12H3"/><path d="M21 20h-5"/><path d="M12 20H3"/><path d="M14 2v4"/><path d="M8 10v4"/><path d="M16 18v4"/>',
+    appearance: '<circle cx="12" cy="12" r="9"/><path d="M12 3v18"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',
+    library: '<path d="m16 6 4 14"/><path d="M12 6v14"/><path d="M8 8v12"/><path d="M4 4v16"/>',
+    sources: '<circle cx="12" cy="12" r="9"/><path d="M12 3a13 13 0 0 0 0 18 13 13 0 0 0 0-18"/><path d="M3 12h18"/>',
+    'ai-models': '<path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15v4"/><path d="M17 17h4"/>',
+    'custom-fields': '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18"/><path d="M9 20V10"/>',
+    diagnosis: '<path d="M11 2v2"/><path d="M5 2v2"/><path d="M5 3H4a2 2 0 0 0-2 2v4a6 6 0 0 0 12 0V5a2 2 0 0 0-2-2h-1"/><path d="M8 15a6 6 0 0 0 12 0v-3"/><circle cx="20" cy="10" r="2"/>',
+    refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+    backup: '<rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>',
+    about: '<circle cx="12" cy="12" r="9"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
+    export: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
+    plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+    external: '<path d="M7 17 17 7"/><path d="M8 7h9v9"/>',
+    back: '<path d="m15 18-6-6 6-6"/>',
+};
+const SETTINGS_ICONS = Object.fromEntries(Object.entries(SETTINGS_ICON_PATHS).map(([k, paths]) => [k,
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+    + ' stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + paths + '</svg>']));
+
+// Which Marketplace cards have a page under Settings → Add-ons: installed and
+// running. The Marketplace's "Settings →" link asks the same question, so it
+// never points at a page that would fall back to General.
+function addonHasSettingsPage(card) {
+    return !!(card && card.installed && card.addon_state === 'active' && !card.pending_removal);
+}
+
+// "Official" only for the index's own artifact — the Zustimmungsdialog's rule:
+// a Bundle from a file or a Dev-Suchpfad counts as third-party, whatever the
+// index says about the id.
+function addonIsOfficial(card) {
+    const origin = card.origin || (card.source === 'dev' ? 'dev' : 'index');
+    return card.trust === 'official' && !!card.in_index && origin === 'index';
+}
+
+// An Add-on's icon from the Marketplace cache, or its initial on a tile.
+const AddonIcon = {
+    name: 'AddonIcon',
+    props: {
+        addon: { type: Object, required: true },
+        size: { type: Number, default: 16 },
+    },
     template: `
-        <div class="p-6 max-w-3xl mx-auto">
-            <h2 class="text-xl font-semibold text-gray-900 mb-6">{{ $t('nav.settings') }}</h2>
+        <img v-if="addon.icon && !failed" :src="url" alt="" class="lb-addon-icon" :style="box" @error="failed = true" />
+        <span v-else class="lb-addon-icon is-letter" :style="box" aria-hidden="true">{{ initial }}</span>
+    `,
+    data() {
+        return { failed: false };
+    },
+    computed: {
+        url() {
+            return '/api/marketplace/assets/' + this.addon.icon.split('/').map(encodeURIComponent).join('/');
+        },
+        initial() {
+            return String(this.addon.name || this.addon.id || '?').trim().charAt(0).toUpperCase();
+        },
+        box() {
+            const px = this.size + 'px';
+            return {
+                width: px, height: px,
+                fontSize: Math.round(this.size * 0.56) + 'px',
+                borderRadius: Math.round(this.size / 4) + 'px',
+            };
+        },
+    },
+};
 
-            <!-- Tab Navigation -->
-            <div class="flex border-b border-gray-200 mb-6 flex-wrap">
-                <button @click="activeTab = 'general'"
-                        class="px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px"
-                        :class="activeTab === 'general' ? 'border-accent text-accent' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'">
-                    {{ $t('settings.tabGeneral') }}
-                </button>
-                <button @click="activeTab = 'llm'"
-                        data-testid="llm-tab"
-                        class="px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px"
-                        :class="activeTab === 'llm' ? 'border-accent text-accent' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'">
-                    {{ $t('settings.tabLlm') }}
-                </button>
-                <button @click="activeTab = 'appearance'"
-                        class="px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px"
-                        :class="activeTab === 'appearance' ? 'border-accent text-accent' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'">
-                    {{ $t('settings.tabAppearance') }}
-                </button>
-                <button @click="activeTab = 'columns'"
-                        class="px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px"
-                        :class="activeTab === 'columns' ? 'border-accent text-accent' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'">
-                    {{ $t('settings.tabColumns') }}
-                </button>
-                <button @click="activeTab = 'export'"
-                        class="px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px"
-                        :class="activeTab === 'export' ? 'border-accent text-accent' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'">
-                    {{ $t('settings.tabExportImport') }}
-                </button>
-                <button @click="activeTab = 'license'"
-                        data-testid="license-tab"
-                        class="px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px"
-                        :class="activeTab === 'license' ? 'border-accent text-accent' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'">
-                    {{ $t('settings.tabLicense') }}
-                </button>
+// --- Autosave (#208) ----------------------------------------------------------
+// Every field of General, Library and Sources saves itself: switches and
+// choices when changed, text fields on blur or Enter. Each shows its own state
+// (saving / "Saved ✓" / the reason) and, on a failure, falls back to what the
+// server holds. Only the changed key travels, so two sections can never undo
+// each other with a stale copy.
+const SettingsFieldStatus = {
+    name: 'SettingsFieldStatus',
+    props: { state: { type: Object, default: () => ({ status: 'idle', message: '' }) } },
+    template: `
+        <span class="lb-set-status" :data-status="state.status" aria-live="polite">
+            <span v-if="state.status === 'saving'" class="lb-set-saving">{{ $t('settings.status.saving') }}</span>
+            <span v-else-if="state.status === 'saved'" class="lb-set-saved">{{ $t('settings.status.saved') }}</span>
+            <span v-else-if="state.status === 'error'" class="lb-set-error" role="alert">{{ state.message }}</span>
+        </span>
+    `,
+};
+
+const SettingsAutosave = {
+    data() {
+        return { fieldStatus: {} };
+    },
+    methods: {
+        fieldState(key) {
+            return this.fieldStatus[key] || { status: 'idle', message: '' };
+        },
+        // Runs a save and reports it at the field `key`. Resolves true when it
+        // stuck; on a failure `undo` puts the display back first.
+        async track(key, run, undo) {
+            this.fieldStatus[key] = { status: 'saving', message: '' };
+            try {
+                await run();
+                this.fieldStatus[key] = { status: 'saved', message: '' };
+                return true;
+            } catch (e) {
+                if (undo) undo();
+                this.fieldStatus[key] = { status: 'error', message: e.message };
+                return false;
+            }
+        },
+        saveSetting(key, body, undo) {
+            return this.track(key, () => api('/api/settings', { method: 'PUT', body: JSON.stringify(body) }), undo);
+        },
+    },
+};
+
+// The text fields of the .env. Placeholders are example values, not text.
+const SETTINGS_ENV_FIELDS = {
+    CROSSREF_MAILTO: { label: 'settings.sources.mailLabel', placeholder: 'you@example.com', type: 'email' },
+    OPENALEX_API_KEY: {
+        label: 'settings.sources.openalex.keyLabel', help: 'settings.sources.openalex.keyHint',
+        placeholderKey: 'settings.sources.openalex.keyPlaceholder', secret: true,
+    },
+    WATCH_INTERVAL: { label: 'settings.library.watchInterval', help: 'settings.library.watchIntervalHint', placeholder: '5', unit: 'settings.library.seconds', numeric: true },
+    MAX_OCR_PAGES: { label: 'settings.library.maxOcrPages', help: 'settings.library.maxOcrPagesHint', placeholder: '5', numeric: true },
+};
+
+// One text field of the .env, labelled and explained from the catalog. It
+// saves itself on blur / Enter and shows its own status; `saved` is the value
+// the server holds, `@saved` hands the new one back to the section.
+const SettingsEnvField = {
+    name: 'SettingsEnvField',
+    components: { SettingsFieldStatus },
+    props: {
+        field: { type: String, required: true },
+        saved: { default: '' },
+        // A secret never comes back from the server (SET-B9): only its hint.
+        hint: { type: String, default: '' },
+    },
+    emits: ['saved'],
+    template: `
+        <div class="lb-field" :data-env-field="field">
+            <div class="lb-set-label-row">
+                <label class="lb-set-label" :for="'env-' + field">{{ $t(def.label) }}</label>
+                <settings-field-status :state="state" :data-field-status="field" />
             </div>
-
-            <!-- ========== Allgemein Tab ========== -->
-            <div v-if="activeTab === 'general'">
-
-                <!-- Wartung -->
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('settings.maintenance') }}</h3>
-                    <p class="text-sm text-gray-500 mb-5">{{ $t('settings.maintenanceHint') }}</p>
-
-                    <!-- Komplett-Refresh -->
-                    <div class="mb-5 pb-5 border-b border-gray-100">
-                        <p class="text-sm font-medium text-gray-700 mb-1">{{ $t('settings.fullRefresh') }}</p>
-                        <p class="text-xs text-gray-400 mb-3">{{ $t('settings.maintenanceDetail') }}</p>
-                        <button @click="fullRefresh"
-                                :disabled="fullRefreshRunning"
-                                class="flex items-center gap-2 bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-50 transition-colors">
-                            <div v-if="fullRefreshRunning" class="spinner" style="width:14px;height:14px;border-width:2px;border-color:white transparent transparent transparent"></div>
-                            <span v-else v-html="icons.refresh"></span>
-                            {{ $t('settings.startFullRefresh') }}
-                        </button>
-
-                        <!-- Fortschrittsanzeige -->
-                        <div v-if="fullRefreshRunning || fullRefreshDone" class="mt-4">
-                            <div class="flex items-center justify-between text-xs text-gray-500 mb-1">
-                                <span>{{ fullRefreshMessage }}</span>
-                                <span>{{ fullRefreshPercent }}%</span>
-                            </div>
-                            <div class="w-full bg-gray-200 rounded-full h-2 mb-3">
-                                <div class="bg-accent h-2 rounded-full transition-all duration-300"
-                                     :style="{ width: fullRefreshPercent + '%' }"></div>
-                            </div>
-                            <!-- Statistiken -->
-                            <div v-if="fullRefreshStats" class="grid grid-cols-3 gap-2 text-xs">
-                                <div class="bg-gray-50 rounded-lg p-2 text-center">
-                                    <div class="font-semibold text-gray-800">{{ fullRefreshStats.page_count }}</div>
-                                    <div class="text-gray-500">{{ $t('settings.statPageCount') }}</div>
-                                </div>
-                                <div class="bg-gray-50 rounded-lg p-2 text-center">
-                                    <div class="font-semibold text-gray-800">{{ fullRefreshStats.validated }}</div>
-                                    <div class="text-gray-500">{{ $t('detail.metadata') }}</div>
-                                </div>
-                                <div class="bg-gray-50 rounded-lg p-2 text-center">
-                                    <div class="font-semibold text-gray-800">{{ fullRefreshStats.abstracts }}</div>
-                                    <div class="text-gray-500">{{ $t('settings.statAbstracts') }}</div>
-                                </div>
-                                <div class="bg-gray-50 rounded-lg p-2 text-center">
-                                    <div class="font-semibold text-gray-800">{{ fullRefreshStats.categorized }}</div>
-                                    <div class="text-gray-500">{{ $t('settings.statCategorised') }}</div>
-                                </div>
-                                <div class="bg-gray-50 rounded-lg p-2 text-center">
-                                    <div class="font-semibold text-gray-800">{{ fullRefreshStats.openalex }}</div>
-                                    <div class="text-gray-500">OpenAlex</div>
-                                </div>
-                                <div class="bg-gray-50 rounded-lg p-2 text-center">
-                                    <div class="font-semibold text-gray-800">{{ fullRefreshStats.chunks }}</div>
-                                    <div class="text-gray-500">{{ $t('settings.statRagChunks') }}</div>
-                                </div>
-                            </div>
-                            <p v-if="fullRefreshDone" class="text-sm text-accent font-medium mt-3">✓ {{ $t('settings.refreshDone') }}</p>
-                            <p v-if="fullRefreshStats && fullRefreshStats.errors > 0" class="text-xs text-accent mt-1">{{ $t('settings.refreshErrors', { count: fullRefreshStats.errors }) }}</p>
-                        </div>
-                    </div>
-
-                    <!-- Nur Seitenanzahl -->
-                    <div class="flex items-center gap-3">
-                        <button @click="updatePageCounts"
-                                :disabled="pageCountUpdating || fullRefreshRunning"
-                                class="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-200 disabled:opacity-50 transition-colors">
-                            <div v-if="pageCountUpdating" class="spinner" style="width:14px;height:14px;border-width:2px"></div>
-                            <span v-else v-html="icons.refresh"></span>
-                            {{ $t('settings.pageCountOnly') }}
-                        </button>
-                        <span v-if="pageCountResult" class="text-sm" :class="pageCountResult.ok ? 'text-accent' : 'text-accent'">
-                            {{ pageCountResult.msg }}
-                        </span>
-                    </div>
-
-                    <!-- Verknüpfungen neu aufbauen -->
-                    <div class="flex items-center gap-3 mt-3 pt-3 border-t border-gray-100">
-                        <button @click="rebuildLinks"
-                                :disabled="rebuildLinksRunning || fullRefreshRunning"
-                                class="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-200 disabled:opacity-50 transition-colors">
-                            <div v-if="rebuildLinksRunning" class="spinner" style="width:14px;height:14px;border-width:2px"></div>
-                            <span v-else>🔗</span>
-                            {{ $t('settings.rebuildLinks') }}
-                        </button>
-                        <span v-if="rebuildLinksResult" class="text-sm" :class="rebuildLinksResult.ok ? 'text-accent' : 'text-accent'">
-                            {{ rebuildLinksResult.msg }}
-                        </span>
-                    </div>
-
-                    <!-- Semantischer Index -->
-                    <div class="mt-3 pt-3 border-t border-gray-100">
-                        <p class="text-sm font-medium text-gray-700 mb-1">{{ $t('settings.semanticIndex') }}</p>
-                        <p class="text-xs text-gray-400 mb-3">
-                            <template v-if="embStatus && embStatus.model">
-                                {{ $t('settings.embedStatus', { model: embStatus.model, indexed: embStatus.indexed, total: embStatus.total, chunksIndexed: embStatus.chunks_indexed, chunksTotal: embStatus.chunks_total }) }}
-                            </template>
-                            <template v-else>
-                                {{ $t('settings.embedNotConfigured') }}
-                            </template>
-                        </p>
-                        <div class="flex items-center gap-3 flex-wrap">
-                            <button @click="reindexEmbeddings('papers')"
-                                    :disabled="embRunning || fullRefreshRunning"
-                                    class="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-200 disabled:opacity-50 transition-colors">
-                                <div v-if="embRunning === 'papers'" class="spinner" style="width:14px;height:14px;border-width:2px"></div>
-                                <span v-else>🧭</span>
-                                {{ $t('settings.indexItems') }}
-                            </button>
-                            <button @click="reindexEmbeddings('chunks')"
-                                    :disabled="embRunning || fullRefreshRunning"
-                                    class="flex items-center gap-2 bg-gray-100 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-200 disabled:opacity-50 transition-colors">
-                                <div v-if="embRunning === 'chunks'" class="spinner" style="width:14px;height:14px;border-width:2px"></div>
-                                <span v-else>🧩</span>
-                                {{ $t('settings.indexPassages') }}
-                            </button>
-                            <span v-if="embResult" class="text-sm text-accent">{{ embResult.msg }}</span>
-                        </div>
-                        <p v-if="embRunning" class="text-xs text-gray-400 mt-2">
-                            {{ $t('settings.indexRunningHint') }}
-                        </p>
-                    </div>
-                </section>
-
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('settings.configuration') }}</h3>
-                    <p class="text-sm text-gray-500 mb-5">{{ $t('settings.envHint') }}</p>
-
-                    <!-- PDF-Schutz Toggle -->
-                    <div class="flex items-center justify-between mb-5 pb-5 border-b border-gray-100">
-                        <div>
-                            <p class="text-sm font-medium text-gray-700">{{ $t('settings.unlockPdfs') }}</p>
-                            <p class="text-xs text-gray-400 mt-0.5">{{ $t('settings.unlockPdfsHint') }}</p>
-                        </div>
-                        <button @click="toggleUnlockPdfs"
-                                class="relative w-14 h-7 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2"
-                                :class="unlockPdfs ? 'bg-accent' : 'bg-gray-300'">
-                            <span class="lb-knob absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
-                                  :class="unlockPdfs ? 'translate-x-7' : 'translate-x-0'">
-                                <svg v-if="unlockPdfs" xmlns="http://www.w3.org/2000/svg" class="text-accent" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
-                                <svg v-else xmlns="http://www.w3.org/2000/svg" class="text-gray-400" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-                            </span>
-                        </button>
-                    </div>
-
-                    <div class="space-y-4">
-                        <div v-for="field in fields" :key="field.key">
-                            <label class="block text-sm font-medium text-gray-700 mb-1">{{ field.label }}</label>
-                            <input v-model="settings[field.key]"
-                                   :type="field.secret ? 'password' : 'text'"
-                                   :placeholder="field.placeholder"
-                                   class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm
-                                          focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
-                            <p class="text-xs text-gray-400 mt-1">{{ field.help }}</p>
-                        </div>
-                    </div>
-
-                    <div class="flex items-center gap-3 mt-5">
-                        <button @click="saveSettings"
-                                class="bg-accent text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink transition-colors">
-                            {{ $t('common.save') }}
-                        </button>
-                        <span v-if="settingsSaved" class="text-accent text-sm save-success">{{ $t('settings.saved') }}</span>
-                    </div>
-                </section>
+            <div class="lb-set-input-row">
+                <input :id="'env-' + field" class="lb-input" :class="{ 'lb-set-narrow': def.numeric }"
+                       :type="def.secret ? 'password' : (def.type || 'text')" autocomplete="off"
+                       :inputmode="def.numeric ? 'numeric' : null"
+                       v-model="draft" :placeholder="placeholder"
+                       @blur="commit" @keydown.enter.prevent="commit" />
+                <span v-if="def.unit" class="lb-set-hint">{{ $t(def.unit) }}</span>
+                <button v-if="def.secret && hint" type="button" class="lb-btn lb-btn-ghost"
+                        :data-testid="'env-remove-' + field"
+                        @mousedown.prevent @click="removeSecret">{{ $t('settings.secret.remove') }}</button>
             </div>
+            <p v-if="def.help" class="lb-set-hint">{{ $t(def.help) }}</p>
+        </div>
+    `,
+    data() {
+        return { draft: this.saved == null ? '' : String(this.saved), state: { status: 'idle', message: '' } };
+    },
+    computed: {
+        def() {
+            return SETTINGS_ENV_FIELDS[this.field];
+        },
+        held() {
+            return this.saved == null ? '' : String(this.saved);
+        },
+        placeholder() {
+            if (this.def.secret && this.hint) return t('settings.secret.saved', { hint: this.hint });
+            return this.def.placeholderKey ? t(this.def.placeholderKey) : this.def.placeholder;
+        },
+    },
+    watch: {
+        held(value) {
+            this.draft = value;
+        },
+    },
+    methods: {
+        // The button prevents mousedown's default so the input keeps its
+        // focus: no blur, hence no second PUT with whatever was typed.
+        async removeSecret() {
+            this.draft = '';
+            await this.save('');
+        },
+        async commit() {
+            const value = this.draft.trim();
+            if (value === this.held) {
+                this.draft = value;
+                return;
+            }
+            await this.save(value);
+        },
+        async save(value) {
+            this.state = { status: 'saving', message: '' };
+            try {
+                await api('/api/settings', { method: 'PUT', body: JSON.stringify({ [this.field]: value }) });
+                // A secret is not kept in the page: the field empties again
+                // and shows the server's new hint.
+                this.draft = this.def.secret ? '' : value;
+                this.state = { status: 'saved', message: '' };
+                this.$emit('saved', this.def.secret ? '' : value);
+            } catch (e) {
+                // Back to the saved value — except for a secret, whose saved
+                // value is never in the page: keep what was typed for a retry.
+                if (!this.def.secret) this.draft = this.held;
+                this.state = { status: 'error', message: e.message };
+            }
+        },
+    },
+};
 
-            <!-- ========== LLM Tab ==========
-                 Drei Rollen (Reasoning / Simple / Embedding), je an EINE
-                 Verbindung + Modell gebunden; darunter die Verbindungen. Ein
-                 Speichern-Button fuer den ganzen Tab: das Dokument ist atomar
-                 (PUT /api/llm/config), es gibt keinen halbgespeicherten Zustand.
-                 Keys kommen nie vom Server (nur has_key/key_hint); api_key null
-                 heisst "unveraendert", "" heisst "entfernen". -->
-            <div v-if="activeTab === 'llm'" data-testid="llm-panel">
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('settings.llm.rolesTitle') }}</h3>
-                    <p class="text-sm text-gray-500 mb-5">{{ $t('settings.llm.rolesHint') }}</p>
-                    <p v-if="!llmDoc.connections.length" data-testid="llm-empty"
-                       class="text-sm text-gray-400 mb-4">{{ $t('settings.llm.emptyState') }}</p>
+// The saved .env as the sections show it. UNLOCK_PDFS defaults to "true".
+async function loadEnvSettings() {
+    try {
+        return await api('/api/settings');
+    } catch (e) {
+        console.error('Settings load error:', e);
+        return {};
+    }
+}
 
-                    <div class="space-y-5">
-                        <div v-for="tier in llmTiers" :key="tier" :data-testid="'llm-role-' + tier">
-                            <div class="flex items-center justify-between mb-1">
-                                <label class="text-sm font-medium text-gray-700">{{ $t('settings.llm.role.' + tier) }}</label>
-                                <span class="text-xs" :class="llmStatus[tier] ? 'text-accent' : 'text-gray-400'">
-                                    {{ llmStatus[tier] ? $t('settings.llm.ready') : $t('settings.llm.notReady') }}
-                                </span>
-                            </div>
-                            <p class="text-xs text-gray-400 mb-2">{{ $t('settings.llm.role.' + tier + 'Help') }}</p>
-                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                                <select v-model="llmDoc.roles[tier].connection_id"
-                                        :disabled="!llmDoc.connections.length"
-                                        @change="onRoleConnectionChange(tier)"
-                                        class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white
-                                               focus:ring-2 focus:ring-accent focus:border-accent outline-none disabled:opacity-50">
-                                    <option value="">{{ $t('settings.llm.noConnection') }}</option>
-                                    <option v-for="c in llmDoc.connections" :key="c.id" :value="c.id">{{ connectionLabel(c) }}</option>
-                                </select>
-                                <!-- Kurze Listen: natives Dropdown. Lange Listen (OpenRouter:
-                                     Hunderte): Combobox — tippen filtert und klappt die Liste
-                                     sofort auf, ein Klick waehlt. Ein natives <select> laesst
-                                     sich nicht per Skript oeffnen, daher das eigene Panel. -->
-                                <select v-if="modelOptions(tier).length && modelOptions(tier).length <= 12"
-                                        v-model="llmDoc.roles[tier].model"
-                                        :data-testid="'llm-model-select-' + tier"
-                                        class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white
-                                               focus:ring-2 focus:ring-accent focus:border-accent outline-none">
-                                    <option value="">{{ $t('settings.llm.noModel') }}</option>
-                                    <option v-for="m in modelOptions(tier)" :key="m" :value="m">{{ m }}</option>
-                                </select>
-                                <div v-else-if="modelOptions(tier).length" class="relative">
-                                    <input :value="llmModelOpen[tier] ? llmModelFilter[tier] : llmDoc.roles[tier].model"
-                                           @focus="openModelPicker(tier)"
-                                           @input="llmModelFilter[tier] = $event.target.value; llmModelOpen[tier] = true"
-                                           @keydown.esc.prevent="closeModelPicker(tier)"
-                                           @keydown.enter.prevent="pickFirstModel(tier)"
-                                           @blur="closeModelPicker(tier)"
-                                           type="text" autocomplete="off"
-                                           :placeholder="$t('settings.llm.modelFilterPlaceholder', { count: modelOptions(tier).length })"
-                                           :data-testid="'llm-model-filter-' + tier"
-                                           class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono
-                                                  focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
-                                    <ul v-if="llmModelOpen[tier]"
-                                        :data-testid="'llm-model-panel-' + tier"
-                                        class="absolute z-20 left-0 right-0 mt-1 max-h-64 overflow-auto bg-white border border-gray-200
-                                               rounded-lg shadow-lg text-sm">
-                                        <li @mousedown.prevent="pickModel(tier, '')"
-                                            class="px-3 py-1.5 text-gray-400 hover:bg-gray-50 cursor-pointer">
-                                            {{ $t('settings.llm.noModel') }}
-                                        </li>
-                                        <li v-for="m in filteredModelOptions(tier)" :key="m"
-                                            @mousedown.prevent="pickModel(tier, m)"
-                                            data-testid="llm-model-option"
-                                            class="px-3 py-1.5 font-mono cursor-pointer hover:bg-gray-50"
-                                            :class="m === llmDoc.roles[tier].model ? 'bg-accent/10 text-accent' : 'text-gray-800'">
-                                            {{ m }}
-                                        </li>
-                                        <li v-if="modelFilterHasNoMatch(tier)" class="px-3 py-1.5 text-gray-400 italic">
-                                            {{ $t('settings.llm.modelFilterNoMatch') }}
-                                        </li>
-                                    </ul>
-                                </div>
-                                <input v-else
-                                       v-model="llmDoc.roles[tier].model"
-                                       :disabled="!llmDoc.roles[tier].connection_id"
-                                       :placeholder="$t('settings.llm.modelPlaceholder')"
-                                       class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm
-                                              focus:ring-2 focus:ring-accent focus:border-accent outline-none disabled:opacity-50" />
-                            </div>
-                            <!-- Leeres Dropdown ohne Begruendung ist eine Sackgasse: der Grund
-                                 steht sonst nur im Log, das im gebauten .exe niemand sieht. -->
-                            <p v-if="llmDoc.roles[tier].connection_id && modelsErrorFor(llmDoc.roles[tier].connection_id)"
-                               class="text-xs text-red-500 mt-1 leading-relaxed">
-                                {{ $t('settings.modelListUnavailableShort') }}<br>{{ modelsErrorFor(llmDoc.roles[tier].connection_id) }}
-                            </p>
-                            <div v-if="tier === 'reasoning'" class="mt-2">
-                                <button @click="suggestModels" :disabled="suggestingModels || !llmDoc.roles.reasoning.connection_id"
-                                        data-testid="llm-suggest"
-                                        class="text-xs px-3 py-1.5 rounded-lg border border-accent text-accent
-                                               hover:bg-accent hover:text-white transition-colors disabled:opacity-50">
-                                    <span v-if="suggestingModels">{{ $t('settings.determining') }}</span>
-                                    <span v-else>✨ {{ $t('settings.suggestModels') }}</span>
-                                </button>
-                                <p v-if="modelSuggestion" class="text-xs text-gray-500 mt-2 leading-relaxed">
-                                    <span class="font-medium">{{ $t('settings.suggestion') }} {{ modelSuggestion.source === 'llm' ? $t('settings.suggestionFromAi') : $t('settings.suggestionFromPattern') }}:</span><br>
-                                    {{ $t('settings.llm.role.reasoning') }}: <span class="font-mono">{{ modelSuggestion.reasoning }}</span>
-                                    <template v-if="modelSuggestion.reasoning_reason"> — {{ modelSuggestion.reasoning_reason }}</template><br>
-                                    {{ $t('settings.llm.role.fast') }}: <span class="font-mono">{{ modelSuggestion.fast }}</span>
-                                    <template v-if="modelSuggestion.fast_reason"> — {{ modelSuggestion.fast_reason }}</template>
-                                </p>
-                                <p v-if="modelSuggestError" class="text-xs text-red-500 mt-2">{{ modelSuggestError }}</p>
-                            </div>
+// A restart of the frozen app: 'running' once it has been asked, 'unavailable'
+// when running from source. Anything else throws with the server's reason.
+async function requestAppRestart() {
+    const resp = await fetch('/api/app/restart', { method: 'POST' });
+    if (resp.ok) return 'running';
+    const err = await resp.json().catch(() => ({}));
+    if (err.detail && err.detail.code === 'error.restart_unavailable') return 'unavailable';
+    throw new Error(translateDetail(err.detail, resp.status));
+}
+
+// Reloads the page as soon as the restarted process answers again.
+// After about a minute it gives up and calls `onGiveUp` (SPA-12): a dialog
+// waiting for the restart must never trap the page.
+function reloadWhenAppIsBack(started, onGiveUp) {
+    setTimeout(async () => {
+        try {
+            const resp = await fetch('/api/stats');
+            if (resp.ok) {
+                window.location.reload();
+                return;
+            }
+        } catch (e) { /* not up yet */ }
+        if (Date.now() - started < 60000) reloadWhenAppIsBack(started, onGiveUp);
+        else if (onGiveUp) onGiveUp();
+    }, 1000);
+}
+
+
+// --- Recompute technical data (#213) -----------------------------------------
+// Refresh block ②, the search index hint (AI models) and the link-mode hint
+// (Library) all start the same run: POST /api/maintenance/recompute, one run at
+// a time. One store, so each of the three places shows the same truth — a run
+// started from a hint is visible (and cancellable) in Refresh, too. `source`
+// names who started it; a hint only shows the result of its own run.
+const RECOMPUTE_STEPS = ['page_counts', 'citations', 'passages', 'search_index', 'category_folders'];
+const recomputeRun = reactive({
+    state: 'idle',      // idle | running | done
+    source: '',         // 'refresh' | 'search-index' | 'link-mode'
+    steps: [],
+    step: '',
+    current: 0,
+    total: 0,
+    percent: 0,
+    stats: {},
+    errors: 0,
+    error: '',
+});
+let recomputeAbort = null;
+
+// Resolves true when the run finished (its numbers are in the store), false
+// when it was refused, failed or cancelled (the reason, if any, in `error`).
+async function startRecompute(steps, source) {
+    if (recomputeRun.state === 'running') return false;
+    Object.assign(recomputeRun, {
+        state: 'running', source, steps: [...steps], step: steps[0] || '',
+        current: 0, total: 0, percent: 0, stats: {}, errors: 0, error: '',
+    });
+    recomputeAbort = new AbortController();
+    let done = null;
+    try {
+        const resp = await fetch('/api/maintenance/recompute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ steps }),
+            signal: recomputeAbort.signal,
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(translateDetail(err.detail, resp.status));
+        }
+        await readSseStream(resp, (evt) => {
+            if (evt.type === 'progress') {
+                Object.assign(recomputeRun, {
+                    steps: evt.steps || recomputeRun.steps, step: evt.step,
+                    current: evt.current, total: evt.total, percent: evt.percent, stats: evt.stats || {},
+                });
+            } else if (evt.type === 'done') {
+                done = evt;
+            } else if (evt.type === 'error') {
+                recomputeRun.error = translateDetail(evt.message);
+            }
+        });
+    } catch (e) {
+        // Cancelling aborts the request: the server stops after the item it
+        // is on, and the run simply ends without numbers.
+        if (e.name !== 'AbortError') recomputeRun.error = e.message;
+    }
+    recomputeAbort = null;
+    if (done) {
+        Object.assign(recomputeRun, {
+            state: 'done', steps: done.steps || recomputeRun.steps, stats: done.stats || {},
+            errors: done.errors || 0, percent: 100,
+        });
+        return true;
+    }
+    recomputeRun.state = 'idle';
+    return false;
+}
+
+function cancelRecompute() {
+    if (recomputeAbort) recomputeAbort.abort();
+}
+
+function recomputeStat(step) {
+    return (recomputeRun.stats && recomputeRun.stats[step]) || { updated: 0, errors: 0 };
+}
+
+function formatCount(n) {
+    return Number(n || 0).toLocaleString(uiLocale());
+}
+
+// The search index as GET /api/maintenance/embeddings/status reports it:
+// 'off' (no embedding role), 'stale' (vectors of another model), 'incomplete'
+// (items or passages without a vector) or 'ready'.
+function searchIndexState(status) {
+    if (!status || !status.model) return 'off';
+    if (status.stale) return 'stale';
+    if ((status.indexed || 0) < (status.total || 0) || (status.chunks_indexed || 0) < (status.chunks_total || 0)) {
+        return 'incomplete';
+    }
+    return 'ready';
+}
+
+const RECOMPUTE_ICONS = {
+    refresh: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>',
+    warn: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>',
+    check: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>',
+};
+
+
+// --- Settings → General ------------------------------------------------------
+const SettingsGeneralSection = {
+    name: 'SettingsGeneralSection',
+    components: { SettingsFieldStatus },
+    mixins: [SettingsAutosave],
+    template: `
+        <div class="lb-set-body" data-settings-section="general">
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('settings.general.lookHeading') }}</h2>
+                <div class="lb-set-card">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.language') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.languageHint') }}</div>
                         </div>
-                    </div>
-                </section>
-
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('settings.llm.connectionsTitle') }}</h3>
-                    <p class="text-sm text-gray-500 mb-5">{{ $t('settings.llm.connectionsHint') }}</p>
-
-                    <div v-for="c in llmDoc.connections" :key="c.id"
-                         :data-testid="'llm-connection-' + c.id"
-                         class="border border-gray-200 rounded-lg p-4 mb-3">
-                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                            <div>
-                                <label class="block text-xs font-medium text-gray-700 mb-1">{{ $t('settings.llm.label') }}</label>
-                                <input v-model="c.label" data-testid="llm-conn-label"
-                                       :placeholder="providerLabel(c.provider)"
-                                       class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm
-                                              focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
-                            </div>
-                            <div>
-                                <label class="block text-xs font-medium text-gray-700 mb-1">{{ $t('settings.field.provider') }}</label>
-                                <select v-model="c.provider" data-testid="llm-conn-provider"
-                                        @change="invalidateModels(c)"
-                                        class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white
-                                               focus:ring-2 focus:ring-accent focus:border-accent outline-none">
-                                    <option v-for="p in availableProviders" :key="p.id" :value="p.id">{{ p.label }}</option>
-                                </select>
-                            </div>
-                            <div class="sm:col-span-2">
-                                <label class="block text-xs font-medium text-gray-700 mb-1">{{ $t('settings.field.baseUrl') }}</label>
-                                <input v-model="c.base_url" data-testid="llm-conn-base-url"
-                                       @change="invalidateModels(c)"
-                                       :placeholder="providerBaseUrl(c.provider) || 'http://localhost:11434/v1'"
-                                       class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono
-                                              focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
-                                <p class="text-xs text-gray-400 mt-1">{{ $t('settings.llm.baseUrlHelp') }}</p>
-                            </div>
-                            <div class="sm:col-span-2">
-                                <label class="block text-xs font-medium text-gray-700 mb-1">{{ $t('settings.field.apiKey') }}</label>
-                                <div class="flex items-center gap-2">
-                                    <input type="password" data-testid="llm-conn-api-key"
-                                           :value="c.api_key === null ? '' : c.api_key"
-                                           @input="c.api_key = $event.target.value; invalidateModels(c)"
-                                           :placeholder="c.api_key === null && c.has_key
-                                               ? $t('settings.llm.apiKeyUnchanged', { hint: c.key_hint })
-                                               : $t('settings.llm.apiKeyNone')"
-                                           class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm
-                                                  focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
-                                    <button v-if="c.has_key && c.api_key === null" @click="c.api_key = ''"
-                                            class="text-xs text-gray-500 hover:text-gray-700 underline whitespace-nowrap">
-                                        {{ $t('settings.llm.apiKeyRemove') }}
-                                    </button>
-                                </div>
-                                <p class="text-xs text-gray-400 mt-1">{{ $t('settings.llm.apiKeyHelp') }}</p>
-                            </div>
-                        </div>
-                        <div class="flex items-center gap-3 mt-3 flex-wrap">
-                            <button @click="loadModelsFor(c)" :disabled="llmModelsLoading[c.id]"
-                                    data-testid="llm-conn-load-models"
-                                    class="text-xs px-3 py-1.5 rounded-lg bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:opacity-50 transition-colors">
-                                <span v-if="llmModelsLoading[c.id]">{{ $t('settings.determining') }}</span>
-                                <span v-else>{{ $t('settings.llm.loadModels') }}</span>
-                            </button>
-                            <span v-if="llmModels[c.id] && llmModels[c.id].models.length" class="text-xs text-accent">
-                                ✓ {{ $t('settings.llm.modelsLoaded', { count: llmModels[c.id].models.length }) }}
-                            </span>
-                            <span v-else-if="llmModels[c.id] && llmModels[c.id].error" class="text-xs text-red-500">
-                                {{ llmModels[c.id].error }}
-                            </span>
-                            <span class="flex-1"></span>
-                            <span v-if="boundRolesOf(c.id).length" class="text-xs text-gray-400">
-                                {{ $t('settings.llm.removeBoundHint', { roles: boundRolesOf(c.id).map(r => $t('settings.llm.role.' + r)).join(', ') }) }}
-                            </span>
-                            <button @click="removeConnection(c)" :disabled="boundRolesOf(c.id).length > 0"
-                                    data-testid="llm-conn-remove"
-                                    class="text-xs text-red-600 hover:underline disabled:opacity-40 disabled:cursor-not-allowed">
-                                {{ $t('settings.llm.remove') }}
-                            </button>
-                        </div>
-                    </div>
-
-                    <button @click="addConnection" data-testid="llm-add-connection"
-                            class="text-sm px-4 py-2 rounded-lg border border-dashed border-gray-300 text-gray-600 hover:border-accent hover:text-accent transition-colors w-full">
-                        + {{ $t('settings.llm.addConnection') }}
-                    </button>
-                </section>
-
-                <div class="flex items-center gap-3">
-                    <button @click="saveLlmConfig" :disabled="llmSaving" data-testid="llm-save"
-                            class="bg-accent text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink transition-colors disabled:opacity-50">
-                        {{ $t('common.save') }}
-                    </button>
-                    <span v-if="llmSaved" class="text-accent text-sm save-success">{{ $t('settings.saved') }}</span>
-                    <span v-if="llmError" data-testid="llm-error" class="text-sm text-red-500">{{ llmError }}</span>
-                </div>
-            </div>
-
-            <!-- ========== Erscheinungsbild Tab ========== -->
-            <div v-if="activeTab === 'appearance'">
-                <!-- Sprache (ADR-0018). Wirkt sofort: beide Kataloge liegen im
-                     Speicher, ein Neustart waere hier reine Schikane. -->
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <div class="flex items-center justify-between gap-4">
-                        <div>
-                            <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('settings.language') }}</h3>
-                            <p class="text-sm text-gray-500">{{ $t('settings.languageHint') }}</p>
-                        </div>
-                        <select :value="$lang()" @change="changeLanguage($event.target.value)"
-                                class="border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white focus:ring-2 focus:ring-accent focus:border-accent outline-none">
-                            <option value="en">{{ $t('settings.languageEn') }}</option>
-                            <option value="de">{{ $t('settings.languageDe') }}</option>
-                        </select>
-                    </div>
-                </section>
-
-                <!-- Dark Mode -->
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <div class="flex items-center justify-between">
-                        <div>
-                            <h3 class="text-base font-semibold text-gray-900 mb-1">Dark Mode</h3>
-                            <p class="text-sm text-gray-500">{{ $t('settings.darkModeHint') }}</p>
-                        </div>
-                        <button @click="toggleDarkMode"
-                                class="relative w-14 h-7 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2"
-                                :class="darkMode ? 'bg-accent' : 'bg-gray-300'">
-                            <span class="lb-knob absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
-                                  :class="darkMode ? 'translate-x-7' : 'translate-x-0'">
-                                <svg v-if="darkMode" xmlns="http://www.w3.org/2000/svg" class="text-accent" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-                                <svg v-else xmlns="http://www.w3.org/2000/svg" class="text-accent" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-                            </span>
-                        </button>
-                    </div>
-                </section>
-
-                <!-- Thesis-Modus Toggle -->
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <div class="flex items-center justify-between">
-                        <div>
-                            <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('nav.thesis') }}</h3>
-                            <p class="text-sm text-gray-500">{{ $t('settings.thesisModeHint') }}</p>
-                        </div>
-                        <button @click="toggleThesisMode"
-                                class="relative w-14 h-7 rounded-full transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2"
-                                :class="thesisMode ? 'bg-accent' : 'bg-gray-300'">
-                            <span class="lb-knob absolute left-0.5 top-0.5 w-6 h-6 bg-white rounded-full shadow transform transition-transform duration-200 flex items-center justify-center"
-                                  :class="thesisMode ? 'translate-x-7' : 'translate-x-0'">
-                                <svg v-if="thesisMode" xmlns="http://www.w3.org/2000/svg" class="text-accent" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-                                <svg v-else xmlns="http://www.w3.org/2000/svg" class="text-gray-400" style="width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-                            </span>
-                        </button>
-                    </div>
-                </section>
-
-                <!-- Icon Import -->
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('settings.icon') }}</h3>
-                    <p class="text-sm text-gray-500 mb-4">{{ $t('settings.customIconHint') }}</p>
-
-                    <div class="flex items-start gap-6">
-                        <div class="flex-shrink-0">
-                            <div class="w-20 h-20 rounded-xl border-2 border-dashed border-gray-300 flex items-center justify-center bg-gray-50 overflow-hidden">
-                                <img v-if="customIconPath" :src="customIconPath" class="w-full h-full object-contain" />
-                                <span v-else v-html="icons.image" class="text-gray-300"></span>
-                            </div>
-                        </div>
-                        <div class="flex-1">
-                            <div class="flex items-center gap-2 mb-3">
-                                <label class="inline-flex items-center gap-2 bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink cursor-pointer transition-colors">
-                                    <span v-html="icons.upload"></span>
-                                    {{ $t('settings.uploadIcon') }}
-                                    <input type="file" accept=".png,.ico,.svg,.jpg,.jpeg,.webp" @change="uploadIcon" class="hidden" />
-                                </label>
-                                <button v-if="customIconPath" @click="deleteIcon"
-                                        class="inline-flex items-center gap-2 bg-white border border-accent-soft text-accent px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-soft transition-colors">
-                                    <span v-html="icons.trash"></span>
-                                    {{ $t('common.remove') }}
+                        <div class="lb-set-control">
+                            <settings-field-status :state="fieldState('UI_LANGUAGE')" data-field-status="UI_LANGUAGE" />
+                            <div class="lb-segmented" role="radiogroup" :aria-label="$t('settings.language')">
+                                <button v-for="lang in ['en', 'de']" :key="lang" type="button" role="radio"
+                                        class="lb-seg" :class="{ 'is-on': $lang() === lang }"
+                                        :aria-checked="$lang() === lang ? 'true' : 'false'"
+                                        :data-testid="'settings-language-' + lang" @click="changeLanguage(lang)">
+                                    {{ lang === 'en' ? $t('settings.languageEn') : $t('settings.languageDe') }}
                                 </button>
                             </div>
-                            <p class="text-xs text-gray-400">{{ $t('settings.iconFormats') }}</p>
                         </div>
                     </div>
-                </section>
-
-                <div class="mt-4 text-xs text-gray-400 text-center">
-                    {{ $t('settings.appearanceAutosaved') }}
                 </div>
+            </section>
+
+            <section class="lb-set-block">
+                <div>
+                    <h2 class="lb-set-h">{{ $t('settings.general.featuresHeading') }}</h2>
+                    <p class="lb-set-sub">{{ $t('settings.general.featuresHint') }}</p>
+                </div>
+                <div class="lb-set-card">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.thesisMode') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.thesisModeHint') }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <settings-field-status :state="fieldState('thesisMode')" data-field-status="thesisMode" />
+                            <button type="button" role="switch" class="lb-set-switch" :class="{ 'is-on': prefs.thesisMode }"
+                                    :aria-checked="prefs.thesisMode ? 'true' : 'false'" :aria-label="$t('settings.thesisMode')"
+                                    data-testid="settings-thesis-mode" @click="toggleThesisMode"><span></span></button>
+                        </div>
+                    </div>
+                    <div v-if="autostart.available" class="lb-set-row" data-testid="settings-autostart-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.general.autostart') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.general.autostartHint') }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <settings-field-status :state="fieldState('autostart')" data-field-status="autostart" />
+                            <button type="button" role="switch" class="lb-set-switch" :class="{ 'is-on': autostart.enabled }"
+                                    :aria-checked="autostart.enabled ? 'true' : 'false'" :aria-label="$t('settings.general.autostart')"
+                                    data-testid="settings-autostart" @click="toggleAutostart"><span></span></button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <p class="lb-set-note">{{ $t('settings.autosaveNote') }}</p>
+        </div>
+    `,
+    data() {
+        // "Start with Windows" (#214): the Windows .exe only. The truth is the
+        // Windows entry itself, so the state is read from the server, never kept.
+        return { autostart: { available: false, enabled: false } };
+    },
+    computed: {
+        prefs() {
+            return uiPrefs;
+        },
+    },
+    // Read again whenever the section shows (it lives under <keep-alive>): the
+    // tray menu or Task Manager may have switched the entry in the meantime.
+    async activated() {
+        try {
+            const state = await api('/api/system/autostart');
+            this.autostart = { available: !!state.available, enabled: !!state.enabled };
+        } catch (e) { /* no answer: the switch simply stays hidden */ }
+    },
+    methods: {
+        // Shown at once, put back when the server refuses; the answer is what
+        // the Windows entry holds afterwards.
+        toggleAutostart() {
+            const before = this.autostart.enabled;
+            this.autostart.enabled = !before;
+            return this.track('autostart', async () => {
+                const state = await api('/api/system/autostart', {
+                    method: 'PUT', body: JSON.stringify({ enabled: !before }),
+                });
+                this.autostart.enabled = !!state.enabled;
+            }, () => { this.autostart.enabled = before; });
+        },
+        // Language: shown first (both catalogs are in memory), then saved - a
+        // slow PUT must not hold the UI, and a refused one puts it back.
+        changeLanguage(lang) {
+            const before = uiLang.value;
+            if (lang === before) return;
+            setUiLang(lang);
+            return this.saveSetting('UI_LANGUAGE', { UI_LANGUAGE: lang }, () => setUiLang(before));
+        },
+        toggleThesisMode() {
+            return this.track('thesisMode', () => setUiPref('thesisMode', !uiPrefs.thesisMode));
+        },
+    },
+};
+
+
+// --- Settings → Appearance (#231) --------------------------------------------
+// Light or dark, and the detail layout: a collapsed row with a summary that
+// opens into a drag-and-drop editor. Dragging and the ··· menu both end in
+// layoutMove / layoutShift; every change is one PUT of DETAIL_LAYOUT through
+// setDetailLayout, which also updates uiPrefs so an open detail view follows.
+const LAYOUT_ICON_GRIP = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>';
+const LAYOUT_ICON_MORE = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></svg>';
+
+const LayoutCard = {
+    name: 'LayoutCard',
+    props: {
+        id: { type: String, required: true },
+        hidden: { type: Boolean, default: false },
+        line: { type: Boolean, default: false },
+        dim: { type: Boolean, default: false },
+        menuOpen: { type: Boolean, default: false },
+        actions: { type: Array, default: () => [] },
+    },
+    emits: ['grab', 'release', 'over', 'put', 'toggle'],
+    template: `
+        <div class="lb-lay-slot" :class="{ 'is-hidden': hidden }" :data-block="id"
+             @dragover="$emit('over', $event)" @drop="$emit('put', $event)">
+            <div v-if="line" class="lb-lay-line" data-testid="layout-line"></div>
+            <div class="lb-lay-card" :class="{ 'is-hidden': hidden, 'is-dim': dim }" draggable="true"
+                 @dragstart="$emit('grab', $event)" @dragend="$emit('release', $event)">
+                <span class="lb-lay-grip" v-html="grip"></span>
+                <span class="lb-lay-text">
+                    <span class="lb-lay-name">{{ $t('detail.block.' + id) }}</span>
+                    <span v-if="!hidden" class="lb-lay-note">{{ $t('settings.appearance.note.' + id) }}</span>
+                </span>
+                <button type="button" class="lb-lay-more" aria-haspopup="menu" :data-testid="'layout-menu-' + id"
+                        :aria-label="$t('settings.appearance.menu.label', { block: $t('detail.block.' + id) })"
+                        :aria-expanded="menuOpen ? 'true' : 'false'" @click="$emit('toggle')" v-html="more"></button>
             </div>
-
-            <!-- ========== Spalten Tab ========== -->
-            <div v-if="activeTab === 'columns'">
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('settings.customColumns') }}</h3>
-                    <p class="text-sm text-gray-500 mb-5">
-                        {{ $t('settings.customColumnsHint') }}
-                    </p>
-
-                    <!-- Existing fields -->
-                    <div v-if="customFields.length" class="space-y-2 mb-5">
-                        <div v-for="cf in customFields" :key="cf.id"
-                             class="flex items-center gap-3 bg-gray-50 rounded-lg p-3">
-                            <span v-html="icons.columns" class="text-gray-400 flex-shrink-0"></span>
-                            <div class="flex-1 min-w-0">
-                                <p class="text-sm font-medium text-gray-900">{{ cf.name }}</p>
-                                <p class="text-xs text-gray-400">
-                                    {{ $t('settings.fieldType') }}: {{ fieldTypeLabel(cf.field_type) }}
-                                    <span v-if="cf.options"> &middot; {{ $t('settings.optionsLabel') }}: {{ cf.options }}</span>
-                                </p>
-                            </div>
-                            <button @click="deleteField(cf)"
-                                    class="p-1.5 text-gray-400 hover:text-accent rounded transition-colors">
-                                <span v-html="icons.trash"></span>
-                            </button>
-                        </div>
-                    </div>
-                    <div v-else class="text-sm text-gray-400 mb-5">
-                        {{ $t('settings.noCustomColumns') }}
-                    </div>
-
-                    <!-- Add new field -->
-                    <div class="border-t border-gray-200 pt-5">
-                        <h4 class="text-sm font-medium text-gray-900 mb-3">{{ $t('settings.addField') }}</h4>
-                        <div class="grid grid-cols-2 gap-3 mb-3">
-                            <div>
-                                <label class="block text-xs text-gray-500 mb-1">{{ $t('common.name') }}</label>
-                                <input v-model="newField.name" :placeholder="$t('settings.fieldNamePlaceholder')"
-                                       class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
-                            </div>
-                            <div>
-                                <label class="block text-xs text-gray-500 mb-1">{{ $t('settings.fieldType') }}</label>
-                                <select v-model="newField.field_type"
-                                        class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white focus:ring-2 focus:ring-accent focus:border-accent outline-none">
-                                    <option value="text">{{ $t('settings.fieldTypeText') }}</option>
-                                    <option value="number">{{ $t('settings.fieldTypeNumber') }}</option>
-                                    <option value="progress">{{ $t('settings.fieldTypeProgressRange') }}</option>
-                                    <option value="select">{{ $t('settings.fieldTypeSelect') }}</option>
-                                </select>
-                            </div>
-                        </div>
-                        <div v-if="newField.field_type === 'select'" class="mb-3">
-                            <label class="block text-xs text-gray-500 mb-1">{{ $t('settings.optionsCommaSeparated') }}</label>
-                            <input v-model="newField.options" :placeholder="$t('settings.optionsPlaceholder')"
-                                   class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
-                        </div>
-                        <button @click="createField" :disabled="!newField.name"
-                                class="inline-flex items-center gap-1.5 bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
-                            <span v-html="icons.plus"></span>
-                            {{ $t('settings.createField') }}
-                        </button>
-                    </div>
-                </section>
-            </div>
-
-            <!-- ========== Export/Import Tab ========== -->
-            <div v-if="activeTab === 'export'">
-                <!-- Export Section -->
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">RIS Export</h3>
-                    <p class="text-sm text-gray-500 mb-4">{{ $t('settings.risExportHint') }}</p>
-
-                    <!-- Export Filters -->
-                    <div class="grid grid-cols-2 gap-3 mb-4">
-                        <div>
-                            <label class="block text-xs text-gray-500 mb-1">{{ $t('filters.category') }}</label>
-                            <select v-model="exportCategoryId" @change="loadExportPreview"
-                                    class="w-full border border-gray-300 rounded-lg px-3 py-1.5 text-sm bg-white focus:ring-2 focus:ring-accent focus:border-accent outline-none">
-                                <option value="">{{ $t('filters.allCategories') }}</option>
-                                <option v-for="c in allCategories" :key="c.id" :value="c.id">{{ c.name }}</option>
-                            </select>
-                        </div>
-                    </div>
-
-                    <div class="flex items-center gap-3 mb-4">
-                        <a :href="exportUrl" download="literatur_export.ris"
-                           class="inline-flex items-center gap-2 bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink transition-colors">
-                            <span v-html="icons.download"></span>
-                            {{ $t('ris.exportFile') }}
-                        </a>
-                        <a :href="bibtexExportUrl" download="literatur_export.bib"
-                           class="inline-flex items-center gap-2 bg-white border border-accent text-accent px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-soft transition-colors">
-                            <span v-html="icons.download"></span>
-                            BibTeX exportieren (.bib)
-                        </a>
-                        <span class="text-sm font-semibold text-gray-700">{{ $tn('common.itemCount', exportPreview.count ?? stats.paper_count ?? 0) }}</span>
-                        <span v-if="exportCategoryId" class="text-xs text-gray-400">{{ $t('settings.filtered') }}</span>
-                    </div>
-
-                    <!-- Export Preview -->
-                    <div v-if="exportPreview.papers && exportPreview.papers.length > 0" class="border border-gray-200 rounded-lg overflow-hidden">
-                        <div class="bg-gray-50 px-4 py-2 border-b border-gray-200 flex items-center justify-between">
-                            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ $t('settings.previewCount', { count: exportPreview.count }) }}</span>
-                            <button @click="exportPreviewExpanded = !exportPreviewExpanded" class="text-xs text-accent hover:text-accent-ink">
-                                {{ exportPreviewExpanded ? 'Einklappen' : 'Alle anzeigen' }}
-                            </button>
-                        </div>
-                        <div class="max-h-64 overflow-y-auto" :class="{ 'max-h-none': exportPreviewExpanded }">
-                            <table class="w-full text-sm">
-                                <tbody>
-                                    <tr v-for="paper in exportPreview.papers" :key="paper.id" class="border-b border-gray-100 hover:bg-gray-50">
-                                        <td class="px-4 py-1.5 text-gray-800 truncate max-w-md">{{ paper.title || $t('papers.untitled') }}</td>
-                                        <td class="px-4 py-1.5 text-gray-500 truncate max-w-[180px]">{{ paper.authors || '' }}</td>
-                                        <td class="px-4 py-1.5 text-gray-400 w-16 text-center">{{ paper.year || '-' }}</td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </section>
-
-                <!-- Coming from another manager: the wizard does the whole
-                     move (preview, PDFs, collections, undo); the single-file
-                     RIS upload below stays for the one-off case. -->
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('settings.migrateLink') }}</h3>
-                    <p class="text-sm text-gray-500 mb-4">{{ $t('settings.migrateLinkHint') }}</p>
-                    <router-link to="/migrate" data-testid="settings-migrate-link"
-                                 class="inline-flex items-center gap-2 bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink transition-colors">
-                        {{ $t('settings.migrateOpen') }}
-                    </router-link>
-                </section>
-
-                <!-- Import Section -->
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">RIS Import</h3>
-                    <p class="text-sm text-gray-500 mb-4">{{ $t('ris.importHint') }}</p>
-
-                    <div class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center"
-                         :class="{ 'border-accent bg-accent-soft': dragOver }"
-                         @dragover.prevent="dragOver = true"
-                         @dragleave="dragOver = false"
-                         @drop.prevent="handleDrop">
-                        <div v-if="!importing">
-                            <span v-html="icons.upload" class="inline-block text-gray-400 mb-3" style="width:32px;height:32px;"></span>
-                            <p class="text-sm text-gray-600 mb-2">{{ $t('ris.dropHint') }}</p>
-                            <label class="inline-flex items-center gap-2 bg-white border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm font-medium hover:bg-gray-50 cursor-pointer transition-colors">
-                                <span v-html="icons.upload"></span>
-                                {{ $t('ris.chooseFile') }}
-                                <input type="file" accept=".ris" @change="handleFileSelect" class="hidden" />
-                            </label>
-                        </div>
-                        <div v-else class="flex items-center justify-center gap-3">
-                            <div class="spinner"></div>
-                            <span class="text-sm text-gray-600">{{ $t('ris.importing') }}</span>
-                        </div>
-                    </div>
-
-                    <div v-if="importResult" class="mt-5">
-                        <div class="p-4 rounded-lg" :class="importResult.errors > 0 ? 'bg-accent-soft border border-accent-soft' : 'bg-accent-soft border border-accent-soft'">
-                            <p class="font-medium text-sm mb-2" :class="importResult.errors > 0 ? 'text-accent-ink' : 'text-accent-ink'">
-                                {{ $t('ris.importDone') }}
-                            </p>
-                            <div class="text-sm space-y-0.5" :class="importResult.errors > 0 ? 'text-accent-ink' : 'text-accent-ink'">
-                                <p>{{ $t('ris.resultTotal', { count: importResult.total }) }}</p>
-                                <p>{{ $t('ris.resultImported', { count: importResult.imported }) }}</p>
-                                <p v-if="importResult.skipped">{{ $t('ris.resultSkipped', { count: importResult.skipped }) }}</p>
-                                <p v-if="importResult.errors">{{ $t('ris.resultErrors', { count: importResult.errors }) }}</p>
-                            </div>
-                        </div>
-                    </div>
-                </section>
-            </div>
-
-            <!-- ========== Lizenz Tab (ADR-0015) ========== -->
-            <div v-if="activeTab === 'license'" data-testid="license-panel">
-                <section class="bg-white rounded-xl border border-gray-200 shadow-sm p-6 mb-6">
-                    <h3 class="text-base font-semibold text-gray-900 mb-1">{{ $t('license.keyHeading') }}</h3>
-
-                    <!-- Aktiviert: einmal geprüft, danach nie wieder online. -->
-                    <div v-if="licenseActivated" data-testid="license-activated"
-                         class="flex items-center gap-2 mt-4 text-sm text-accent-ink bg-accent-soft border border-accent-soft rounded-lg px-4 py-3">
-                        <span>✓</span>
-                        <span class="font-medium">{{ $t('license.activated') }}<span v-if="licenseKeyMasked"> — {{ $t('license.keyMasked', { key: licenseKeyMasked }) }}</span>.</span>
-                    </div>
-                    <p v-if="licenseActivated" class="text-sm text-gray-500 mt-3">
-                        {{ $t('license.checkedOnce') }}
-                    </p>
-
-                    <!-- Noch nicht aktiviert: Eingabe + Kauflink. -->
-                    <template v-else>
-                        <!-- Laufende Testphase (#144). Fehlt sie — Quellinstallation —
-                             steht hier nichts: dort gibt es nichts abzuzaehlen. -->
-                        <p v-if="licenseTrial && !licenseTrial.expired"
-                           data-testid="license-trial"
-                           class="text-sm text-accent-ink bg-accent-soft border border-accent-soft rounded-lg px-4 py-3 mb-4">
-                            {{ $tn('license.trialRunning', licenseTrial.days_remaining) }}
-                        </p>
-                        <!-- Altbestand aus dem früheren Shop: der Weg zum kostenlosen
-                             Code steht hier, nicht erst hinter einer Sperre. -->
-                        <p v-if="licenseLegacyNote"
-                           data-testid="license-legacy-note"
-                           class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-4 py-3 mb-4">
-                            {{ licenseLegacyNote }}
-                        </p>
-                        <p class="text-sm text-gray-500 mb-5">
-                            {{ $t('license.enterKeyHint') }}
-                        </p>
-                        <div class="flex gap-3 items-start mb-3">
-                            <input v-model="licenseKey"
-                                   data-testid="license-key-input"
-                                   type="text"
-                                   spellcheck="false"
-                                   placeholder="LB--XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
-                                   @keyup.enter="activateLicense"
-                                   class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-accent focus:border-accent outline-none" />
-                            <button @click="activateLicense"
-                                    data-testid="license-activate"
-                                    :disabled="licenseLoading || !licenseKey"
-                                    class="bg-accent text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-accent-ink disabled:opacity-50 transition-colors">
-                                <span v-if="licenseLoading">{{ $t('license.activating') }}</span>
-                                <span v-else>{{ $t('license.activate') }}</span>
-                            </button>
-                        </div>
-                        <p v-if="licenseCheckoutUrl" class="text-sm text-gray-500">
-                            {{ $t('gate.noLicenseYet') }}
-                            <a :href="licenseCheckoutUrl" target="_blank" rel="noopener"
-                               data-testid="license-buy-link"
-                               class="text-accent underline">{{ $t('license.buy') }}</a>
-                        </p>
-                    </template>
-
-                    <p v-if="licenseMessage"
-                       data-testid="license-message"
-                       class="text-sm mt-3"
-                       :class="licenseError ? 'text-red-600' : 'text-accent'">
-                        {{ licenseMessage }}
-                    </p>
-                </section>
+            <div v-if="menuOpen" class="lb-lay-menu" :class="{ 'is-left': hidden }" role="menu">
+                <button v-for="a in actions" :key="a.key" type="button" role="menuitem" class="lb-lay-menu-item"
+                        :data-action="a.key" @click="a.run()">{{ a.label }}</button>
             </div>
         </div>
     `,
     data() {
+        return { grip: LAYOUT_ICON_GRIP, more: LAYOUT_ICON_MORE };
+    },
+};
+
+const SettingsAppearanceSection = {
+    name: 'SettingsAppearanceSection',
+    components: { SettingsFieldStatus, LayoutCard },
+    mixins: [SettingsAutosave],
+    template: `
+        <div class="lb-set-body" data-settings-section="appearance">
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('settings.appearance.themeHeading') }}</h2>
+                <div class="lb-set-card">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.appearance.theme') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.appearance.themeHint') }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <settings-field-status :state="fieldState('darkMode')" data-field-status="darkMode" />
+                            <div class="lb-set-themes" role="radiogroup" :aria-label="$t('settings.appearance.theme')">
+                                <button v-for="mode in ['light', 'dark']" :key="mode" type="button" role="radio"
+                                        class="lb-set-theme" :class="['is-' + mode, { 'is-on': prefs.darkMode === (mode === 'dark') }]"
+                                        :aria-checked="prefs.darkMode === (mode === 'dark') ? 'true' : 'false'"
+                                        :data-testid="'settings-theme-' + mode" @click="setTheme(mode === 'dark')">
+                                    <span class="lb-set-theme-preview" aria-hidden="true">
+                                        <i></i><i></i><i></i>
+                                    </span>
+                                    <span class="lb-set-theme-name">
+                                        <span class="lb-set-theme-dot"></span>
+                                        {{ mode === 'dark' ? $t('settings.appearance.themeDark') : $t('settings.appearance.themeLight') }}
+                                    </span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('settings.appearance.detailHeading') }}</h2>
+                <div class="lb-set-card">
+                    <button type="button" class="lb-lay-head" data-testid="layout-toggle"
+                            :aria-expanded="open ? 'true' : 'false'" aria-controls="layout-editor" @click="toggleOpen">
+                        <span class="lb-lay-head-text">
+                            <span class="lb-set-label">{{ $t('settings.appearance.layout') }}</span>
+                            <span class="lb-set-hint" data-testid="layout-summary">{{ summary }}</span>
+                        </span>
+                        <span class="lb-lay-head-end">
+                            <settings-field-status :state="fieldState('detailLayout')" data-field-status="detailLayout" />
+                            <span class="lb-btn" data-testid="layout-toggle-label">{{ open ? $t('settings.appearance.done') : $t('settings.appearance.customize') }}</span>
+                            <span class="lb-lay-chevron" :class="{ 'is-open': open }" aria-hidden="true">&#9662;</span>
+                        </span>
+                    </button>
+                    <div v-if="open" id="layout-editor" class="lb-lay-editor" data-testid="layout-editor">
+                        <div class="lb-lay-bar">
+                            <p class="lb-set-hint">{{ $t('settings.appearance.intro') }}</p>
+                            <button type="button" class="lb-btn" data-testid="layout-reset" @click="reset">{{ $t('settings.appearance.reset') }}</button>
+                        </div>
+                        <div class="lb-lay-zones">
+                            <div class="lb-lay-zone is-left">
+                                <span class="lb-lay-eyebrow">{{ $t('settings.appearance.zone.left') }}</span>
+                                <div class="lb-lay-pdf">
+                                    <span>{{ $t('settings.appearance.zone.pdf') }}</span>
+                                    <span class="lb-lay-note">{{ $t('settings.appearance.zone.pdfStays') }}</span>
+                                </div>
+                            </div>
+
+                            <div class="lb-lay-zone is-main" data-zone="main">
+                                <span class="lb-lay-eyebrow">{{ $t('settings.appearance.zone.main') }}</span>
+                                <div class="lb-lay-fixed">{{ $t('settings.appearance.zone.title') }}</div>
+                                <layout-card v-for="id in layout.main" :key="id" :id="id"
+                                             :line="lineAt('main::' + id)" :dim="drag === id"
+                                             :menu-open="menuFor === id" :actions="actionsFor(id)"
+                                             @grab="grab($event, id)" @release="release"
+                                             @over="cardOver($event, 'main::' + id)"
+                                             @put="cardPut($event, { zone: 'main', before: id })"
+                                             @toggle="toggleMenu(id)" />
+                                <div class="lb-lay-drop" :class="dropClass('main:end')" data-testid="layout-drop-main"
+                                     @dragover.prevent.stop="over = 'main:end'" @drop.prevent.stop="put({ zone: 'main' })">
+                                    {{ $t('settings.appearance.zone.dropEnd') }}
+                                </div>
+                            </div>
+
+                            <div class="lb-lay-zone is-side" data-zone="side">
+                                <span class="lb-lay-eyebrow">{{ $t('settings.appearance.zone.side') }}</span>
+                                <p v-if="!layout.tabs.length" class="lb-lay-empty">{{ $t('settings.appearance.zone.noTabs') }}</p>
+                                <div v-for="(tab, ti) in layout.tabs" :key="ti" class="lb-lay-tab" :data-tab="ti">
+                                    <div class="lb-lay-tab-head">
+                                        <input type="text" class="lb-lay-tabname"
+                                               :maxlength="maxName" @dragover.prevent.stop @drop.prevent.stop
+                                               :value="tab.name" :placeholder="tabFallback(tab)"
+                                               :aria-label="$t('settings.appearance.zone.tabName', { n: ti + 1 })"
+                                               :title="$t('settings.appearance.zone.tabNameHint')"
+                                               :data-testid="'layout-tabname-' + ti" @change="rename(ti, $event.target.value, $event.target)" />
+                                        <span class="lb-lay-note">{{ $t('settings.appearance.zone.tab', { n: ti + 1 }) }}</span>
+                                    </div>
+                                    <layout-card v-for="id in tab.blocks" :key="id" :id="id"
+                                                 :line="lineAt('tab:' + ti + ':' + id)" :dim="drag === id"
+                                                 :menu-open="menuFor === id" :actions="actionsFor(id)"
+                                                 @grab="grab($event, id)" @release="release"
+                                                 @over="cardOver($event, 'tab:' + ti + ':' + id)"
+                                                 @put="cardPut($event, { zone: 'tab', tab: ti, before: id })"
+                                                 @toggle="toggleMenu(id)" />
+                                    <div class="lb-lay-drop is-small" :class="dropClass('tab:' + ti + ':end')"
+                                         :data-testid="'layout-drop-tab-' + ti"
+                                         @dragover.prevent.stop="over = 'tab:' + ti + ':end'" @drop.prevent.stop="put({ zone: 'tab', tab: ti })">
+                                        {{ $t('settings.appearance.zone.dropTab') }}
+                                    </div>
+                                </div>
+                                <div v-if="layout.tabs.length < maxTabs" class="lb-lay-drop is-newtab" :class="dropClass('newtab')"
+                                     data-testid="layout-drop-newtab"
+                                     @dragover.prevent.stop="over = 'newtab'" @drop.prevent.stop="put({ zone: 'newtab' })">
+                                    {{ $t('settings.appearance.zone.dropNewTab') }}
+                                </div>
+                                <span v-else class="lb-lay-note" data-testid="layout-tabs-full">{{ $t('settings.appearance.zone.tabsFull') }}</span>
+                            </div>
+                        </div>
+
+                        <div class="lb-lay-hidden" data-zone="hidden">
+                            <span class="lb-lay-eyebrow">{{ $t('settings.appearance.zone.hidden') }}</span>
+                            <div class="lb-lay-hidden-row">
+                                <layout-card v-for="id in layout.hidden" :key="id" :id="id" hidden
+                                             :line="lineAt('hidden::' + id)" :dim="drag === id"
+                                             :menu-open="menuFor === id" :actions="actionsFor(id)"
+                                             @grab="grab($event, id)" @release="release"
+                                             @over="cardOver($event, 'hidden::' + id)"
+                                             @put="cardPut($event, { zone: 'hidden', before: id })"
+                                             @toggle="toggleMenu(id)" />
+                                <div class="lb-lay-drop is-hide" :class="dropClass('hidden:end')" data-testid="layout-drop-hidden"
+                                     @dragover.prevent.stop="over = 'hidden:end'" @drop.prevent.stop="put({ zone: 'hidden' })">
+                                    {{ $t('settings.appearance.zone.dropHidden') }}
+                                </div>
+                            </div>
+                        </div>
+
+                        <ul class="lb-lay-hints">
+                            <li>{{ $t('settings.appearance.hint.fixed') }}</li>
+                            <li>{{ $t('settings.appearance.hint.tabs') }}</li>
+                            <li>{{ $t('settings.appearance.hint.narrow') }}</li>
+                            <li>{{ $t('settings.appearance.hint.menu') }}</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <p class="lb-set-note">{{ $t('settings.autosaveNote') }}</p>
+        </div>
+    `,
+    data() {
+        const rules = detailRules();
+        return { open: false, drag: null, over: null, menuFor: null, maxTabs: rules.max_tabs, maxName: rules.max_name };
+    },
+    computed: {
+        prefs() {
+            return uiPrefs;
+        },
+        layout() {
+            return uiPrefs.detailLayout;
+        },
+        summary() {
+            const L = this.layout;
+            const names = (ids) => ids.map((id) => t('detail.block.' + id)).join(', ');
+            const parts = [t('settings.appearance.sum.main', {
+                blocks: L.main.length ? names(L.main) : t('settings.appearance.sum.mainNone'),
+            })];
+            parts.push(L.tabs.length
+                ? t('settings.appearance.sum.tabs', { names: L.tabs.map((tab) => this.tabLabel(tab)).join(', ') })
+                : t('settings.appearance.sum.noTabs'));
+            if (L.hidden.length) parts.push(t('settings.appearance.sum.hidden', { blocks: names(L.hidden) }));
+            return parts.join(' · ');
+        },
+    },
+    methods: {
+        setTheme(dark) {
+            if (uiPrefs.darkMode === dark) return;
+            return this.track('darkMode', () => setUiPref('darkMode', dark));
+        },
+        toggleOpen() {
+            this.open = !this.open;
+            this.menuFor = null;
+        },
+        tabFallback(tab) {
+            return tab.blocks.length ? t('detail.block.' + tab.blocks[0]) : '';
+        },
+        tabLabel(tab) {
+            return (tab.name || '').trim() || this.tabFallback(tab);
+        },
+        // Every change ends here: shown at once, saved with the field status,
+        // put back by setDetailLayout when the server refuses.
+        apply(next) {
+            this.drag = null;
+            this.over = null;
+            this.menuFor = null;
+            if (!next) return Promise.resolve(false);
+            return this.track('detailLayout', () => setDetailLayout(next));
+        },
+        move(id, target) {
+            return this.apply(layoutMove(this.layout, id, target));
+        },
+        shift(id, dir) {
+            return this.apply(layoutShift(this.layout, id, dir));
+        },
+        rename(index, value, input) {
+            // Code points, like the server (a plain slice counts UTF-16 units).
+            const name = Array.from(String(value || '').trim()).slice(0, this.maxName).join('').trim();
+            if (input) input.value = name;   // show the cut name even where nothing changes
+            const next = detailLayoutOr(this.layout);
+            if (!next.tabs[index] || next.tabs[index].name === name) return Promise.resolve(false);
+            next.tabs[index].name = name;
+            return this.apply(next);
+        },
+        reset() {
+            return this.apply(detailLayoutOr(detailRules().default));
+        },
+        toggleMenu(id) {
+            this.menuFor = this.menuFor === id ? null : id;
+        },
+        // The ··· menu of one block: the moves that make sense where it sits.
+        actionsFor(id) {
+            const L = this.layout;
+            let zone = 'main';
+            let tab = -1;
+            let list = L.main;
+            if (L.hidden.includes(id)) { zone = 'hidden'; list = L.hidden; }
+            const ti = L.tabs.findIndex((x) => x.blocks.includes(id));
+            if (ti >= 0) { zone = 'tab'; tab = ti; list = L.tabs[ti].blocks; }
+            const pos = list.indexOf(id);
+            const out = [];
+            const add = (key, label, run) => out.push({ key, label, run });
+            if (pos > 0) add('up', t(zone === 'hidden' ? 'settings.appearance.menu.left' : 'settings.appearance.menu.up'), () => this.shift(id, -1));
+            if (pos < list.length - 1) add('down', t(zone === 'hidden' ? 'settings.appearance.menu.right' : 'settings.appearance.menu.down'), () => this.shift(id, 1));
+            if (zone !== 'main') add('main', t('settings.appearance.menu.toMain'), () => this.move(id, { zone: 'main' }));
+            L.tabs.forEach((x, j) => {
+                if (j !== tab) add('tab-' + j, t('settings.appearance.menu.intoTab', { tab: this.tabLabel(x) }), () => this.move(id, { zone: 'tab', tab: j }));
+            });
+            const alone = zone === 'tab' && list.length === 1;
+            if (!alone && L.tabs.length < this.maxTabs) add('newtab', t('settings.appearance.menu.newTab'), () => this.move(id, { zone: 'newtab' }));
+            if (zone !== 'hidden') add('hide', t('settings.appearance.menu.hide'), () => this.move(id, { zone: 'hidden' }));
+            return out;
+        },
+        // --- native drag and drop ------------------------------------------
+        grab(e, id) {
+            try {
+                e.dataTransfer.setData('text/plain', id);
+                e.dataTransfer.effectAllowed = 'move';
+            } catch (x) { /* no dataTransfer: the state below still carries it */ }
+            this.drag = id;
+            this.menuFor = null;
+        },
+        release() {
+            this.drag = null;
+            this.over = null;
+        },
+        cardOver(e, key) {
+            e.preventDefault();
+            e.stopPropagation();
+            this.over = key;
+        },
+        cardPut(e, target) {
+            e.preventDefault();
+            e.stopPropagation();
+            return this.put(target);
+        },
+        put(target) {
+            return this.move(this.drag, target);
+        },
+        lineAt(key) {
+            return !!this.drag && this.over === key && key.split(':').pop() !== this.drag;
+        },
+        dropClass(key) {
+            return { 'is-armed': !!this.drag, 'is-over': !!this.drag && this.over === key };
+        },
+    },
+};
+
+
+// --- Opening the app's folders (#211) ----------------------------------------
+// The server resolves the three named folders (library / settings / logs); the
+// SPA only ever sends the name. A refusal comes back as a code and is shown.
+const SettingsFolders = {
+    data() {
+        return { systemInfo: null, folderError: '' };
+    },
+    methods: {
+        async loadSystemInfo() {
+            try { this.systemInfo = await api('/api/system/info'); } catch (e) { /* paths simply stay blank */ }
+        },
+        async openFolder(name) {
+            this.folderError = '';
+            try {
+                await api('/api/system/open-folder', { method: 'POST', body: JSON.stringify({ folder: name }) });
+            } catch (e) {
+                this.folderError = e.message;
+            }
+        },
+    },
+};
+
+// --- Settings → Library -------------------------------------------------------
+const SETTINGS_LINK_MODES = ['symlink', 'hardlink', 'copy'];
+const SETTINGS_ADVANCED_KEY = 'lbSettingsLibraryAdvanced';
+
+const SettingsLibrarySection = {
+    name: 'SettingsLibrarySection',
+    components: { SettingsEnvField, SettingsFieldStatus },
+    mixins: [SettingsAutosave, SettingsFolders],
+    template: `
+        <div class="lb-set-body" data-settings-section="library">
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('settings.library.storageHeading') }}</h2>
+                <div class="lb-set-card">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.library.baseDir') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.library.baseDirHint') }}</div>
+                            <code class="lb-set-path" data-testid="settings-base-dir">{{ baseDirShown }}</code>
+                        </div>
+                        <div class="lb-set-control">
+                            <button type="button" class="lb-btn" data-testid="settings-base-dir-open" @click="openFolder('library')">
+                                {{ $t('settings.folders.open') }}
+                            </button>
+                            <button type="button" class="lb-btn" data-testid="settings-base-dir-change" @click="openDialog">
+                                {{ $t('settings.library.baseDirChange') }}
+                            </button>
+                        </div>
+                    </div>
+                    <div v-if="folderError" class="lb-set-pad lb-set-divide">
+                        <p class="lb-set-error" role="alert" data-testid="settings-folder-error">{{ folderError }}</p>
+                    </div>
+                    <div class="lb-set-pad lb-set-divide">
+                        <p class="lb-set-hint">{{ $t('settings.library.baseDirNote') }}</p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('settings.library.importHeading') }}</h2>
+                <div class="lb-set-card">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.unlockPdfs') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.unlockPdfsHint') }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <settings-field-status :state="fieldState('UNLOCK_PDFS')" data-field-status="UNLOCK_PDFS" />
+                            <button type="button" role="switch" class="lb-set-switch" :class="{ 'is-on': unlockPdfs }"
+                                    :aria-checked="unlockPdfs ? 'true' : 'false'" :aria-label="$t('settings.unlockPdfs')"
+                                    data-testid="settings-unlock-pdfs" @click="toggleUnlockPdfs"><span></span></button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="lb-set-block">
+                <button type="button" class="lb-set-advanced" data-testid="settings-advanced-toggle"
+                        :aria-expanded="advancedOpen ? 'true' : 'false'" @click="toggleAdvanced">
+                    <span class="lb-set-chevron" :class="{ 'is-open': advancedOpen }" aria-hidden="true">&#9656;</span>
+                    <span class="lb-set-h">{{ $t('settings.library.advanced') }}</span>
+                    <span class="lb-set-count">{{ $t('settings.library.advancedCount', { count: 3 }) }}</span>
+                </button>
+                <div v-if="advancedOpen" class="lb-set-card" data-testid="settings-advanced">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.library.linkMode') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.library.linkModeHint') }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <settings-field-status :state="fieldState('LINK_MODE')" data-field-status="LINK_MODE" />
+                            <div class="lb-segmented" role="radiogroup" :aria-label="$t('settings.library.linkMode')">
+                                <button v-for="mode in linkModes" :key="mode" type="button" role="radio"
+                                        class="lb-seg" :class="{ 'is-on': linkMode === mode }"
+                                        :aria-checked="linkMode === mode ? 'true' : 'false'"
+                                        :data-testid="'settings-link-' + mode" @click="setLinkMode(mode)">
+                                    {{ $t('settings.library.link.' + mode) }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Context hint (#213): a new mode only reaches the folders
+                         with a rebuild — the same recompute as Refresh block 2. -->
+                    <div v-if="linkHint" class="lb-ctx-wrap" data-testid="link-mode-hint" :data-state="linkHint">
+                        <div v-if="linkHint !== 'done'" role="status" class="lb-ctx-hint">
+                            <span class="lb-ctx-icon" v-html="recomputeIcons.refresh"></span>
+                            <div class="lb-ctx-text">
+                                <div class="lb-ctx-title">{{ $t('settings.library.rebuild.title') }}</div>
+                                <div class="lb-ctx-body">{{ $t('settings.library.rebuild.text') }}</div>
+                                <p v-if="linkHintError" class="lb-set-error" role="alert" data-testid="link-mode-error">{{ linkHintError }}</p>
+                            </div>
+                            <div class="lb-ctx-actions">
+                                <button type="button" class="lb-btn-text" data-testid="link-mode-later"
+                                        :disabled="linkRunning" @click="linkHint = ''">
+                                    {{ $t('settings.library.rebuild.later') }}
+                                </button>
+                                <button type="button" class="lb-btn lb-btn-primary" data-testid="link-mode-rebuild"
+                                        :disabled="recomputeBusy" @click="rebuildFolders">
+                                    {{ linkRunning ? $t('settings.library.rebuild.running', { percent: run.percent }) : $t('settings.library.rebuild.now') }}
+                                </button>
+                            </div>
+                        </div>
+                        <div v-else role="status" class="lb-ctx-done" data-testid="link-mode-done">
+                            <span class="lb-ctx-done-icon" v-html="recomputeIcons.check"></span>
+                            {{ $t('settings.library.rebuild.done', {
+                                items: $tn('maintenance.recompute.itemCount', linkDone.items),
+                                errors: $tn('maintenance.recompute.errorCount', linkDone.errors) }) }}
+                        </div>
+                    </div>
+                    <div class="lb-set-pad lb-set-divide">
+                        <settings-env-field field="WATCH_INTERVAL" :saved="env.WATCH_INTERVAL" @saved="env.WATCH_INTERVAL = $event" />
+                    </div>
+                    <div class="lb-set-pad lb-set-divide">
+                        <settings-env-field field="MAX_OCR_PAGES" :saved="env.MAX_OCR_PAGES" @saved="env.MAX_OCR_PAGES = $event" />
+                    </div>
+                </div>
+            </section>
+
+            <div v-if="dialog" class="lb-set-scrim" data-testid="settings-base-dir-dialog" @keydown.esc="closeDialog">
+                <div class="lb-set-dialog" role="dialog" aria-modal="true" aria-labelledby="base-dir-dialog-title">
+                    <h2 id="base-dir-dialog-title" class="lb-set-h">{{ $t('settings.library.dialog.title') }}</h2>
+                    <template v-if="dialog.phase === 'edit'">
+                        <p class="lb-set-hint">{{ $t('settings.library.dialog.body') }}</p>
+                        <div class="lb-field">
+                            <label class="lb-set-label" for="base-dir-new">{{ $t('settings.library.dialog.newFolder') }}</label>
+                            <input id="base-dir-new" class="lb-input lb-mono" type="text" autocomplete="off"
+                                   v-model="dialog.path" data-testid="settings-base-dir-input"
+                                   @keydown.enter.prevent="confirmDialog" />
+                        </div>
+                        <p v-if="dialog.error" class="lb-set-error" role="alert" data-testid="settings-base-dir-error">{{ dialog.error }}</p>
+                        <div class="lb-set-dialog-actions">
+                            <button type="button" class="lb-btn" data-testid="settings-base-dir-cancel" @click="closeDialog">{{ $t('common.cancel') }}</button>
+                            <button type="button" class="lb-btn lb-btn-primary" data-testid="settings-base-dir-confirm"
+                                    :disabled="dialog.busy || !dialog.path.trim()" @click="confirmDialog">
+                                {{ $t('settings.library.dialog.confirm') }}
+                            </button>
+                        </div>
+                    </template>
+                    <template v-else-if="dialog.phase === 'restarting'">
+                        <p class="lb-set-hint" data-testid="settings-base-dir-restarting">{{ $t('settings.library.dialog.restarting') }}</p>
+                    </template>
+                    <template v-else>
+                        <p class="lb-set-hint" data-testid="settings-base-dir-manual">{{ $t('settings.library.dialog.manual') }}</p>
+                        <div class="lb-set-dialog-actions">
+                            <button type="button" class="lb-btn lb-btn-primary" @click="closeDialog">{{ $t('common.close') }}</button>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </div>
+    `,
+    data() {
+        let open = false;
+        try { open = localStorage.getItem(SETTINGS_ADVANCED_KEY) === '1'; } catch (e) { /* closed without storage */ }
         return {
-            activeTab: 'general',
-            settings: {},
-            settingsSaved: false,
-            pageCountUpdating: false,
-            pageCountResult: null,
-            rebuildLinksRunning: false,
-            rebuildLinksResult: null,
-            embStatus: null,
-            embRunning: '',
-            embResult: null,
-            fullRefreshRunning: false,
-            fullRefreshDone: false,
-            fullRefreshMessage: '',
-            fullRefreshPercent: 0,
-            fullRefreshStats: null,
-            unlockPdfs: true,
-            icons,
-            darkMode: localStorage.getItem('darkMode') === 'true',
-            thesisMode: localStorage.getItem('thesisMode') === 'true',
-            customIconPath: null,
-            // Columns
-            customFields: [],
-            newField: { name: '', field_type: 'text', options: '' },
-            // Export/Import
-            stats: {},
-            allCategories: [],
-            exportCategoryId: '',
-            exportPreview: { count: null, papers: [] },
-            exportPreviewExpanded: false,
-            importing: false,
-            importResult: null,
-            dragOver: false,
-            // Lizenz (ADR-0015)
-            licenseKey: '',
-            licenseKeyMasked: '',
-            licenseLoading: false,
-            licenseMessage: '',
-            licenseError: false,
-            licenseActivated: false,
-            licenseCheckoutUrl: '',
-            licenseTrial: null,
-            licenseLegacyNote: '',
-            // LLM-Tab (Verbindungen + Rollen, llm.json)
-            llmTiers: ['reasoning', 'fast', 'embedding'],
-            llmDoc: {
-                connections: [],
-                roles: {
-                    reasoning: { connection_id: '', model: '' },
-                    fast: { connection_id: '', model: '' },
-                    embedding: { connection_id: '', model: '' },
-                },
+            env: {}, advancedOpen: open, dialog: null, linkModes: SETTINGS_LINK_MODES,
+            // '' | 'offer' | 'done' — the context hint after a link-mode change
+            linkHint: '', linkHintError: '', linkDone: { items: 0, errors: 0 },
+            run: recomputeRun, recomputeIcons: RECOMPUTE_ICONS,
+        };
+    },
+    computed: {
+        // The .env holds a path only once it was changed; the default
+        // (~/Literatur) is the server's answer.
+        baseDirShown() {
+            return this.env.LITERATUR_BASE_DIR
+                || (this.systemInfo && this.systemInfo.folders && this.systemInfo.folders.library) || '';
+        },
+        unlockPdfs() {
+            return this.env.UNLOCK_PDFS !== 'false';
+        },
+        // The server sends the mode in effect, also when the .env holds none.
+        linkMode() {
+            return this.env.LINK_MODE || 'symlink';
+        },
+        recomputeBusy() {
+            return this.run.state === 'running';
+        },
+        linkRunning() {
+            return this.run.state === 'running' && this.run.source === 'link-mode';
+        },
+    },
+    async created() {
+        this.loadSystemInfo();
+        this.env = await loadEnvSettings();
+    },
+    methods: {
+        toggleAdvanced() {
+            this.advancedOpen = !this.advancedOpen;
+            try { localStorage.setItem(SETTINGS_ADVANCED_KEY, this.advancedOpen ? '1' : '0'); } catch (e) { /* not remembered */ }
+        },
+        toggleUnlockPdfs() {
+            const before = this.env.UNLOCK_PDFS;
+            const next = this.unlockPdfs ? 'false' : 'true';
+            this.env.UNLOCK_PDFS = next;
+            return this.saveSetting('UNLOCK_PDFS', { UNLOCK_PDFS: next }, () => { this.env.UNLOCK_PDFS = before; });
+        },
+        async setLinkMode(mode) {
+            if (mode === this.linkMode) return;
+            const before = this.env.LINK_MODE;
+            this.env.LINK_MODE = mode;
+            const saved = await this.saveSetting('LINK_MODE', { LINK_MODE: mode }, () => { this.env.LINK_MODE = before; });
+            if (saved) {
+                this.linkHint = 'offer';
+                this.linkHintError = '';
+            }
+            return saved;
+        },
+        // The same run as Refresh block 2, with the one step this setting needs.
+        async rebuildFolders() {
+            this.linkHintError = '';
+            if (await startRecompute(['category_folders'], 'link-mode')) {
+                const stat = recomputeStat('category_folders');
+                this.linkDone = { items: stat.updated, errors: stat.errors };
+                this.linkHint = 'done';
+            } else if (this.run.error) {
+                this.linkHintError = this.run.error;
+            }
+        },
+        // The base folder changes only here: new path, one confirmation, restart.
+        openDialog() {
+            this.dialog = { path: this.env.LITERATUR_BASE_DIR || '', busy: false, error: '', phase: 'edit' };
+        },
+        closeDialog() {
+            this.dialog = null;
+        },
+        async confirmDialog() {
+            const dialog = this.dialog;
+            const path = dialog.path.trim();
+            if (!path || dialog.busy) return;
+            dialog.busy = true;
+            dialog.error = '';
+            try {
+                await api('/api/settings', { method: 'PUT', body: JSON.stringify({ LITERATUR_BASE_DIR: path }) });
+                this.env.LITERATUR_BASE_DIR = path;
+                const outcome = await requestAppRestart();
+                dialog.phase = outcome === 'running' ? 'restarting' : 'manual';
+                if (outcome === 'running') {
+                    // No answer after the wait: the manual phase, with a close button.
+                    reloadWhenAppIsBack(Date.now() + 1500, () => {
+                        if (this.dialog === dialog) dialog.phase = 'manual';
+                    });
+                }
+            } catch (e) {
+                dialog.error = e.message;
+            }
+            dialog.busy = false;
+        },
+    },
+};
+
+
+// --- Settings → Sources -------------------------------------------------------
+// The three services as fixed catalog data: texts are `settings.sources.<id>.*`
+// keys, `mail` marks the ones that use the user's address.
+const SETTINGS_SOURCES = [
+    { id: 'crossref', short: 'CR', mail: true, key: false },
+    { id: 'openalex', short: 'OA', mail: true, key: true },
+    { id: 'arxiv', short: 'aX', mail: false, key: false },
+];
+
+const SettingsSourcesSection = {
+    name: 'SettingsSourcesSection',
+    components: { SettingsEnvField },
+    template: `
+        <div class="lb-set-body" data-settings-section="sources">
+            <section class="lb-set-block">
+                <div>
+                    <h2 class="lb-set-h">{{ $t('settings.sources.mailHeading') }}</h2>
+                    <p class="lb-set-sub">{{ $t('settings.sources.mailHint') }}</p>
+                </div>
+                <div class="lb-set-card lb-set-pad">
+                    <settings-env-field field="CROSSREF_MAILTO" :saved="env.CROSSREF_MAILTO" @saved="env.CROSSREF_MAILTO = $event" />
+                </div>
+            </section>
+
+            <section class="lb-set-block">
+                <div>
+                    <h2 class="lb-set-h">{{ $t('settings.sources.heading') }}</h2>
+                    <p class="lb-set-sub">{{ $t('settings.sources.hint') }}</p>
+                </div>
+                <div class="lb-set-card lb-set-accordion">
+                    <div v-for="src in sources" :key="src.id" class="lb-set-source" :data-testid="'source-' + src.id">
+                        <button type="button" class="lb-set-source-head" :data-testid="'source-head-' + src.id"
+                                :aria-expanded="open === src.id ? 'true' : 'false'" @click="toggle(src.id)">
+                            <span class="lb-set-chevron" :class="{ 'is-open': open === src.id }" aria-hidden="true">&#9656;</span>
+                            <span class="lb-set-source-short">{{ src.short }}</span>
+                            <span class="lb-set-source-text">
+                                <span class="lb-set-label">{{ $t('settings.sources.' + src.id + '.name') }}</span>
+                                <span class="lb-set-hint">{{ $t('settings.sources.' + src.id + '.desc') }}</span>
+                            </span>
+                            <span class="lb-set-badge" :class="{ 'is-ok': src.mail }">
+                                {{ src.mail ? $t('settings.sources.badgeMail') : $t('settings.sources.badgeFree') }}
+                            </span>
+                        </button>
+                        <div v-if="open === src.id" class="lb-set-source-body" :data-testid="'source-body-' + src.id">
+                            <dl class="lb-set-facts">
+                                <dt>{{ $t('settings.sources.access') }}</dt>
+                                <dd>{{ $t('settings.sources.' + src.id + '.access') }}</dd>
+                                <dt>{{ $t('settings.sources.identifier') }}</dt>
+                                <dd>{{ $t('settings.sources.' + src.id + '.ident') }}</dd>
+                                <dt>{{ $t('settings.sources.usedFor') }}</dt>
+                                <dd>{{ $t('settings.sources.' + src.id + '.use') }}</dd>
+                            </dl>
+                            <settings-env-field v-if="src.key" field="OPENALEX_API_KEY" :saved="env.OPENALEX_API_KEY"
+                                                :hint="env.OPENALEX_API_KEY_HINT || ''"
+                                                @saved="reloadEnv" />
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <p class="lb-set-note">{{ $t('settings.autosaveNote') }}</p>
+        </div>
+    `,
+    data() {
+        return { env: {}, open: '', sources: SETTINGS_SOURCES };
+    },
+    async created() {
+        this.env = await loadEnvSettings();
+    },
+    methods: {
+        // After a secret was saved: the server's new hint, never the key. A
+        // failed refetch keeps what the section shows — an empty env would
+        // blank every field (the mailto draft follows its saved value).
+        async reloadEnv() {
+            try {
+                this.env = await api('/api/settings');
+            } catch (e) {
+                console.error('Settings reload error:', e);
+            }
+        },
+        // An accordion: all closed to begin with, one open at a time.
+        toggle(id) {
+            this.open = this.open === id ? '' : id;
+        },
+    },
+};
+
+
+// --- Startup check of the AI models (#209) -----------------------------------
+// At every start the server asks each bound role's connection for its model
+// list, in the background — no chat, no tokens. This store holds the answer
+// for the popup after the boot (App) and for the hint at the top of AI models:
+// one store, so "Check again" there is what the popup would show next.
+// Statuses and details are codes; the sentences live in the catalogs.
+const LLM_TIERS = ['reasoning', 'fast', 'embedding'];
+const LLM_CHECK_PROBLEMS = ['unreachable', 'auth_failed', 'model_missing'];
+const LLM_CHECK_POLL_MS = 1500;
+const LLM_CHECK_POLLS = 20;
+const STARTUP_CHECK_SEEN_KEY = 'lb.startupCheck.seen';
+const llmCheck = reactive({ report: null, rechecking: false });
+// The AI models draft differs from the saved document: the dot at the
+// section's entry in the Settings list (the section lives under <keep-alive>,
+// the frame cannot ask it).
+const aiModelsDraft = reactive({ dirty: false });
+
+let _llmCheckLoading = null;
+
+// The boot's check may still run when the SPA asks: poll until it is done (a
+// few seconds at most), then keep its answer.
+function loadLlmCheck() {
+    if (!_llmCheckLoading) {
+        _llmCheckLoading = (async () => {
+            try {
+                for (let i = 0; i < LLM_CHECK_POLLS; i++) {
+                    llmCheck.report = await api('/api/llm/startup-check');
+                    if (!llmCheck.report || !llmCheck.report.running) break;
+                    await new Promise((resolve) => setTimeout(resolve, LLM_CHECK_POLL_MS));
+                }
+            } catch (e) { /* no check: nothing to report */ }
+            _llmCheckLoading = null;
+            return llmCheck.report;
+        })();
+    }
+    return _llmCheckLoading;
+}
+
+async function recheckLlm() {
+    llmCheck.rechecking = true;
+    try {
+        llmCheck.report = await api('/api/llm/startup-check', { method: 'POST' });
+    } finally {
+        llmCheck.rechecking = false;
+    }
+    return llmCheck.report;
+}
+
+// The roles of a report that do not work right now, in tier order.
+function llmCheckProblems(report) {
+    const roles = (report && report.roles) || {};
+    return LLM_TIERS.filter((tier) => roles[tier] && LLM_CHECK_PROBLEMS.includes(roles[tier].status));
+}
+
+// What the start itself had to correct (an ignored base folder, …): codes
+// with params, one sentence each.
+function startupNotices(report) {
+    return (report && Array.isArray(report.notices)) ? report.notices : [];
+}
+
+// The value "Later" remembers for this session: one check result plus the
+// notices of this start.
+function startupCheckSeenValue(report) {
+    const codes = startupNotices(report).map((n) => n.code).join(',');
+    return codes ? (report.checked_at || '') + '|' + codes : report.checked_at;
+}
+
+function startupNoticeSentence(notice) {
+    const params = { ...(notice.params || {}) };
+    if (params.reason) params.reason = t('startupCheck.notice.' + notice.code + '.reason.' + params.reason);
+    return t('startupCheck.notice.' + notice.code, params);
+}
+
+// One sentence about one checked role, from its detail code.
+function llmCheckSentence(role) {
+    let text = t('startupCheck.detail.' + role.detail_code, {
+        model: role.model, connection: role.connection_label, host: role.host, status: role.http_status || '',
+    });
+    const local = /^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(role.host || '');
+    if (local && (role.detail_code === 'connection' || role.detail_code === 'timeout')) {
+        text += ' ' + t('startupCheck.detail.localHint');
+    }
+    return text;
+}
+
+// "Until you fix this, … are off": what the failing roles serve — the
+// server reads TASK_MODELS backwards — each feature named once.
+function llmCheckFeatures(report) {
+    const roles = (report && report.roles) || {};
+    const names = [];
+    for (const tier of llmCheckProblems(report)) {
+        for (const task of roles[tier].tasks || []) {
+            const name = t('startupCheck.feature.' + task);
+            if (!names.includes(name)) names.push(name);
+        }
+    }
+    return names;
+}
+
+function formatList(items) {
+    try {
+        return new Intl.ListFormat(uiLocale(), { style: 'long', type: 'conjunction' }).format(items);
+    } catch (e) {
+        return items.join(', ');
+    }
+}
+
+function formatCheckedAt(iso) {
+    const d = iso ? new Date(iso) : null;
+    if (!d || isNaN(d.getTime())) return '';
+    return d.toLocaleString(uiLocale(), { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+// A role's state as a colour: the cards and the popup share it.
+function llmStateTone(state) {
+    if (state === 'ready' || state === 'fallback') return 'ok';
+    if (state === 'changed') return 'accent';
+    if (LLM_CHECK_PROBLEMS.includes(state)) return 'danger';
+    return 'mute';
+}
+
+function ssGet(key) {
+    try { return sessionStorage.getItem(key); } catch (e) { return null; }
+}
+function ssSet(key, value) {
+    try { sessionStorage.setItem(key, value); } catch (e) { /* no storage: shown again next load */ }
+}
+
+const AI_MODEL_ICONS = {
+    alert: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>',
+    refresh: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>',
+    spark: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/></svg>',
+    sparkLarge: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15v4"/><path d="M17 17h4"/></svg>',
+    arrow: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>',
+    plus: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>',
+};
+
+// The popup after the boot (#209): shown by App when the Startup check found a
+// role that does not work — never over the license gate or the onboarding.
+const StartupCheckDialog = {
+    name: 'StartupCheckDialog',
+    props: { report: { type: Object, required: true } },
+    emits: ['later', 'open', 'open-library'],
+    template: `
+        <div class="lb-check-scrim" data-testid="startup-check-dialog">
+            <div class="lb-check-dialog" role="alertdialog" aria-modal="true"
+                 aria-labelledby="lb-check-title" aria-describedby="lb-check-desc">
+                <div class="lb-check-head">
+                    <span class="lb-check-icon" v-html="icons.sparkLarge"></span>
+                    <div class="lb-check-head-text">
+                        <h2 id="lb-check-title" class="lb-check-title">{{ problems.length ? $t('startupCheck.title') : $t('startupCheck.noticeTitle') }}</h2>
+                        <p v-if="problems.length" id="lb-check-desc" class="lb-check-desc">{{ $tn('startupCheck.intro', problems.length) }}</p>
+                    </div>
+                </div>
+                <p v-for="(n, i) in notices" :key="'notice-' + i" class="lb-check-impact"
+                   role="alert" :data-testid="'startup-notice-' + n.code">{{ noticeSentence(n) }}</p>
+                <div v-if="problems.length" class="lb-check-roles">
+                    <div v-for="tier in rows" :key="tier" class="lb-check-role"
+                         :data-testid="'startup-check-role-' + tier" :data-status="roles[tier].status">
+                        <span class="lb-check-dot" :class="isProblem(tier) ? 'is-danger' : 'is-ok'"></span>
+                        <div class="lb-check-role-text">
+                            <div class="lb-check-role-name-row">
+                                <span class="lb-check-role-name">{{ $t('settings.llm.role.' + tier) }}</span>
+                                <span class="lb-check-role-conn">{{ connectionText(tier) }}</span>
+                            </div>
+                            <span class="lb-check-role-sentence" :class="{ 'is-quiet': !isProblem(tier) }">{{ sentence(tier) }}</span>
+                        </div>
+                        <span v-if="isProblem(tier)" class="lb-ai-pill is-danger">{{ $t('settings.aiModels.status.' + roles[tier].status) }}</span>
+                    </div>
+                </div>
+                <p v-if="problems.length" class="lb-check-impact" data-testid="startup-check-impact">{{ impact }}</p>
+                <div class="lb-set-dialog-actions">
+                    <button type="button" class="lb-btn" @click="$emit('later')" data-testid="startup-check-later">
+                        {{ $t('startupCheck.later') }}
+                    </button>
+                    <button v-if="!problems.length" type="button" class="lb-btn lb-btn-primary"
+                            @click="$emit('open-library')" data-testid="startup-check-open-library">
+                        {{ $t('startupCheck.openLibrary') }} <span class="lb-check-arrow" v-html="icons.arrow"></span>
+                    </button>
+                    <button v-else type="button" class="lb-btn lb-btn-primary" @click="$emit('open')" data-testid="startup-check-open">
+                        {{ $t('startupCheck.open') }} <span class="lb-check-arrow" v-html="icons.arrow"></span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    `,
+    data() {
+        return { icons: AI_MODEL_ICONS };
+    },
+    computed: {
+        roles() {
+            return this.report.roles || {};
+        },
+        problems() {
+            return llmCheckProblems(this.report);
+        },
+        notices() {
+            return startupNotices(this.report);
+        },
+        // The failing roles first, then the ones that work. An unbound role is
+        // off on purpose and not part of the report.
+        rows() {
+            const bound = LLM_TIERS.filter((tier) => this.roles[tier] && this.roles[tier].status !== 'unbound');
+            return [...bound.filter((x) => this.isProblem(x)), ...bound.filter((x) => !this.isProblem(x))];
+        },
+        impact() {
+            return t('startupCheck.impact', { features: formatList(llmCheckFeatures(this.report)) });
+        },
+    },
+    methods: {
+        isProblem(tier) {
+            return LLM_CHECK_PROBLEMS.includes(this.roles[tier].status);
+        },
+        noticeSentence(n) {
+            return startupNoticeSentence(n);
+        },
+        sentence(tier) {
+            return llmCheckSentence(this.roles[tier]);
+        },
+        connectionText(tier) {
+            const r = this.roles[tier];
+            return r.fallback ? r.connection_label + ' · ' + t('startupCheck.usesReasoning') : r.connection_label;
+        },
+    },
+};
+
+const cloneLlmDoc = (doc) => JSON.parse(JSON.stringify(doc));
+
+
+// --- Settings → AI models -----------------------------------------------------
+// Three roles as cards (connection + model, a status label each), the search
+// index, the connections as a list. One atomic save for the whole section
+// (PUT /api/llm/config, ADR-0019): edits stay a draft until the bar at the
+// bottom saves or discards them, and that bar only exists while the draft
+// differs from the saved document. Keys never come from the server (only
+// has_key/key_hint); api_key null means "unchanged", "" means "remove".
+const SettingsAiModelsSection = {
+    name: 'SettingsAiModelsSection',
+    template: `
+        <div class="lb-set-body" data-settings-section="ai-models" data-testid="llm-panel">
+            <!-- The Startup check (#209): the popup's report, with the time and
+                 a way to check again. -->
+            <div v-if="checkProblems.length" role="alert" class="lb-ai-alert" data-testid="llm-check-alert">
+                <span class="lb-ai-alert-icon" v-html="icons.alert"></span>
+                <div class="lb-ai-alert-text">
+                    <p class="lb-ai-alert-title">{{ $tn('settings.aiModels.check.title', checkProblems.length) }}</p>
+                    <ul class="lb-ai-alert-list">
+                        <li v-for="tier in checkProblems" :key="tier" :data-testid="'llm-check-item-' + tier">
+                            <b>{{ $t('settings.llm.role.' + tier) }}</b>: {{ checkSentence(tier) }}
+                        </li>
+                    </ul>
+                    <p class="lb-ai-alert-time" data-testid="llm-check-time">{{ $t('settings.aiModels.check.checkedAt', { time: checkedAt }) }}</p>
+                </div>
+                <button type="button" class="lb-btn" @click="checkAgain" :disabled="check.rechecking" data-testid="llm-check-again">
+                    <span class="lb-ai-btn-icon" v-html="icons.refresh"></span>
+                    {{ check.rechecking ? $t('settings.aiModels.check.checking') : $t('settings.aiModels.check.again') }}
+                </button>
+            </div>
+            <p v-else-if="recheckedOk" role="status" class="lb-ai-check-ok" data-testid="llm-check-ok">
+                ✓ {{ $t('settings.aiModels.check.allOk') }}
+            </p>
+            <p v-if="checkError" class="lb-set-error">{{ checkError }}</p>
+
+            <section class="lb-set-block">
+                <div class="lb-ai-head">
+                    <div>
+                        <h2 class="lb-set-h">{{ $t('settings.llm.rolesTitle') }}</h2>
+                        <p class="lb-set-sub">{{ $t('settings.llm.rolesHint') }}</p>
+                    </div>
+                    <button type="button" class="lb-btn" @click="suggestModels"
+                            :disabled="suggestingModels || !llmDoc.roles.reasoning.connection_id"
+                            data-testid="llm-suggest">
+                        <span class="lb-ai-btn-icon is-accent" v-html="icons.spark"></span>
+                        {{ suggestingModels ? $t('settings.determining') : $t('settings.suggestModels') }}
+                    </button>
+                </div>
+                <p v-if="modelSuggestion" class="lb-set-hint" data-testid="llm-suggestion">
+                    <span class="font-medium">{{ $t('settings.suggestion') }} {{ modelSuggestion.source === 'llm' ? $t('settings.suggestionFromAi') : $t('settings.suggestionFromPattern') }}:</span><br>
+                    {{ $t('settings.llm.role.reasoning') }}: <span class="font-mono">{{ modelSuggestion.reasoning }}</span>
+                    <template v-if="modelSuggestion.reasoning_reason"> — {{ modelSuggestion.reasoning_reason }}</template><br>
+                    {{ $t('settings.llm.role.fast') }}: <span class="font-mono">{{ modelSuggestion.fast }}</span>
+                    <template v-if="modelSuggestion.fast_reason"> — {{ modelSuggestion.fast_reason }}</template>
+                </p>
+                <p v-if="modelSuggestError" class="lb-set-error">{{ modelSuggestError }}</p>
+                <p v-if="!llmDoc.connections.length" data-testid="llm-empty" class="lb-set-hint">{{ $t('settings.llm.emptyState') }}</p>
+
+                <div class="lb-ai-roles">
+                    <div v-for="tier in llmTiers" :key="tier" :data-testid="'llm-role-' + tier"
+                         class="lb-ai-role" :class="'is-' + roleTone(tier)">
+                        <div class="lb-ai-role-head">
+                            <span class="lb-ai-role-name">{{ $t('settings.llm.role.' + tier) }}</span>
+                            <span class="lb-ai-pill" :class="'is-' + roleTone(tier)"
+                                  :data-testid="'llm-role-status-' + tier" :data-status="roleState(tier)">
+                                <i aria-hidden="true"></i>{{ $t('settings.aiModels.status.' + roleState(tier)) }}
+                            </span>
+                        </div>
+                        <p class="lb-ai-role-help">{{ $t('settings.llm.role.' + tier + 'Help') }}</p>
+                        <div class="lb-ai-field">
+                            <span class="lb-ai-field-label">{{ $t('settings.aiModels.role.connection') }}</span>
+                            <select v-model="llmDoc.roles[tier].connection_id"
+                                    :disabled="!llmDoc.connections.length"
+                                    :aria-label="$t('settings.llm.role.' + tier) + ': ' + $t('settings.aiModels.role.connection')"
+                                    @change="onRoleConnectionChange(tier)"
+                                    class="lb-select lb-ai-control">
+                                <option value="">{{ $t('settings.llm.noConnection') }}</option>
+                                <option v-for="c in llmDoc.connections" :key="c.id" :value="c.id">{{ connectionLabel(c) }}</option>
+                            </select>
+                        </div>
+                        <div class="lb-ai-field">
+                            <span class="lb-ai-field-label">{{ $t('settings.aiModels.role.model') }}</span>
+                            <!-- Short lists: the native dropdown. Long lists (OpenRouter:
+                                 hundreds): a combobox — typing filters and opens the list
+                                 at once, a click picks. A native <select> cannot be opened
+                                 by script, hence the own panel. -->
+                            <select v-if="modelOptions(tier).length && modelOptions(tier).length <= 12"
+                                    v-model="llmDoc.roles[tier].model"
+                                    :data-testid="'llm-model-select-' + tier"
+                                    :aria-label="$t('settings.llm.role.' + tier) + ': ' + $t('settings.aiModels.role.model')"
+                                    class="lb-select lb-ai-control lb-mono">
+                                <option value="">{{ $t('settings.llm.noModel') }}</option>
+                                <option v-for="m in modelOptions(tier)" :key="m" :value="m">{{ m }}</option>
+                            </select>
+                            <div v-else-if="modelOptions(tier).length" class="lb-ai-combo">
+                                <input :value="llmModelOpen[tier] ? llmModelFilter[tier] : llmDoc.roles[tier].model"
+                                       @focus="openModelPicker(tier)"
+                                       @input="llmModelFilter[tier] = $event.target.value; llmModelOpen[tier] = true"
+                                       @keydown.esc.prevent="closeModelPicker(tier)"
+                                       @keydown.enter.prevent="pickFirstModel(tier)"
+                                       @blur="closeModelPicker(tier)"
+                                       type="text" autocomplete="off"
+                                       :placeholder="$t('settings.llm.modelFilterPlaceholder', { count: modelOptions(tier).length })"
+                                       :data-testid="'llm-model-filter-' + tier"
+                                       class="lb-input lb-mono lb-ai-control" />
+                                <ul v-if="llmModelOpen[tier]" :data-testid="'llm-model-panel-' + tier" class="lb-ai-panel">
+                                    <li @mousedown.prevent="pickModel(tier, '')" class="lb-ai-option is-none">
+                                        {{ $t('settings.llm.noModel') }}
+                                    </li>
+                                    <li v-for="m in filteredModelOptions(tier)" :key="m"
+                                        @mousedown.prevent="pickModel(tier, m)"
+                                        data-testid="llm-model-option"
+                                        class="lb-ai-option" :class="{ 'is-on': m === llmDoc.roles[tier].model }">
+                                        {{ m }}
+                                    </li>
+                                    <li v-if="modelFilterHasNoMatch(tier)" class="lb-ai-option is-none">
+                                        {{ $t('settings.llm.modelFilterNoMatch') }}
+                                    </li>
+                                </ul>
+                            </div>
+                            <input v-else
+                                   v-model="llmDoc.roles[tier].model"
+                                   :disabled="!llmDoc.roles[tier].connection_id"
+                                   :placeholder="$t('settings.llm.modelPlaceholder')"
+                                   :aria-label="$t('settings.llm.role.' + tier) + ': ' + $t('settings.aiModels.role.model')"
+                                   class="lb-input lb-mono lb-ai-control" />
+                        </div>
+                        <!-- An empty dropdown without a reason is a dead end: the
+                             reason would otherwise only be in the log. -->
+                        <p v-if="llmDoc.roles[tier].connection_id && modelsErrorFor(llmDoc.roles[tier].connection_id)"
+                           class="lb-ai-role-error">
+                            {{ $t('settings.modelListUnavailableShort') }}<br>{{ modelsErrorFor(llmDoc.roles[tier].connection_id) }}
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Search index (#153, #213): hangs on the embedding model, hence
+                 here. A stale or incomplete index offers the rebuild — the
+                 recompute of Refresh block 2 with its search index step. -->
+            <section class="lb-set-block" data-testid="search-index" :data-state="indexState">
+                <h2 class="lb-set-h">{{ $t('settings.semanticIndex') }}</h2>
+                <div class="lb-set-card lb-set-pad lb-ix">
+                    <p v-if="indexState === 'off'" class="lb-set-hint" data-testid="search-index-off">
+                        {{ $t('settings.index.off') }}
+                    </p>
+                    <template v-else>
+                        <div class="lb-ix-head">
+                            <div class="lb-ix-head-text">
+                                <div class="lb-set-label">{{ $t('settings.index.title') }}</div>
+                                <div class="lb-set-hint">
+                                    {{ $t('settings.index.model') }} <span class="lb-mono" data-testid="search-index-model">{{ embStatus.model }}</span>
+                                </div>
+                            </div>
+                            <span class="lb-ai-pill" :class="'is-' + indexTone" data-testid="search-index-pill" :data-status="indexState">
+                                <i aria-hidden="true"></i>{{ $t('settings.index.state.' + indexState) }}
+                            </span>
+                        </div>
+                        <div v-if="indexHint && !indexRunning" role="status" class="lb-ctx-hint is-warn"
+                             :data-testid="'search-index-hint-' + indexHint">
+                            <span class="lb-ctx-icon" v-html="recomputeIcons.warn"></span>
+                            <div class="lb-ctx-text">
+                                <div class="lb-ctx-title">{{ $t('settings.index.' + indexHint + 'Title') }}</div>
+                                <div class="lb-ctx-body">{{ $t('settings.index.' + indexHint + 'Text', { model: embStatus.stale_model || '' }) }}</div>
+                            </div>
+                            <div class="lb-ctx-actions">
+                                <button type="button" class="lb-btn lb-btn-primary" data-testid="search-index-rebuild"
+                                        :disabled="run.state === 'running'" @click="rebuildIndex">
+                                    {{ $t('settings.index.rebuild') }}
+                                </button>
+                            </div>
+                        </div>
+                        <div class="lb-ix-bars">
+                            <div class="lb-ix-bar" data-testid="search-index-items">
+                                <div class="lb-ix-bar-head">
+                                    <span>{{ $t('settings.index.items') }}</span>
+                                    <span class="lb-mono">{{ formatCount(embStatus.indexed) }} / {{ formatCount(embStatus.total) }}</span>
+                                </div>
+                                <div class="lb-rc-bar"><div :style="{ width: share(embStatus.indexed, embStatus.total) + '%' }"></div></div>
+                            </div>
+                            <div class="lb-ix-bar" data-testid="search-index-passages">
+                                <div class="lb-ix-bar-head">
+                                    <span>{{ $t('settings.index.passages') }}</span>
+                                    <span class="lb-mono">{{ formatCount(embStatus.chunks_indexed) }} / {{ formatCount(embStatus.chunks_total) }}</span>
+                                </div>
+                                <div class="lb-rc-bar"><div :style="{ width: share(embStatus.chunks_indexed, embStatus.chunks_total) + '%' }"></div></div>
+                            </div>
+                        </div>
+                        <div v-if="indexRunning" class="lb-ix-running" data-testid="search-index-running">
+                            <span>{{ $t('settings.index.running', { percent: run.step === 'search_index' ? run.percent : 0 }) }}</span>
+                            <button type="button" class="lb-btn" data-testid="search-index-cancel" @click="cancelIndex">{{ $t('common.cancel') }}</button>
+                        </div>
+                        <p v-if="indexError" class="lb-set-error" role="alert" data-testid="search-index-error">{{ indexError }}</p>
+                    </template>
+                </div>
+            </section>
+
+            <section class="lb-set-block">
+                <div>
+                    <h2 class="lb-set-h">{{ $t('settings.llm.connectionsTitle') }}</h2>
+                    <p class="lb-set-sub">{{ $t('settings.llm.connectionsHint') }}</p>
+                </div>
+
+                <div v-if="llmDoc.connections.length" class="lb-set-card">
+                    <div v-for="c in llmDoc.connections" :key="c.id" :data-testid="'llm-connection-' + c.id" class="lb-ai-conn">
+                        <div class="lb-ai-conn-row">
+                            <span class="lb-ai-conn-short" aria-hidden="true">{{ initials(c) }}</span>
+                            <div class="lb-ai-conn-text">
+                                <div class="lb-ai-conn-name-row">
+                                    <span class="lb-ai-conn-name">{{ connectionLabel(c) }}</span>
+                                    <span v-for="r in boundRolesOf(c.id)" :key="r" class="lb-ai-chip">{{ $t('settings.llm.role.' + r) }}</span>
+                                </div>
+                                <span class="lb-ai-conn-meta" data-testid="llm-conn-summary">{{ connectionMeta(c) }}</span>
+                                <span v-if="llmModels[c.id] && llmModels[c.id].models.length" class="lb-ai-conn-ok">
+                                    ✓ {{ $t('settings.llm.modelsLoaded', { count: llmModels[c.id].models.length }) }}
+                                </span>
+                                <span v-else-if="llmModels[c.id] && llmModels[c.id].error" class="lb-set-error">
+                                    {{ llmModels[c.id].error }}
+                                </span>
+                            </div>
+                            <div class="lb-ai-conn-actions">
+                                <button type="button" class="lb-btn" @click="loadModelsFor(c)" :disabled="llmModelsLoading[c.id]"
+                                        :title="$t('settings.llm.loadModels')" data-testid="llm-conn-load-models">
+                                    {{ llmModelsLoading[c.id] ? $t('settings.determining') : $t('settings.aiModels.conn.loadModels') }}
+                                </button>
+                                <button type="button" class="lb-btn" @click="toggleEdit(c)" :aria-expanded="isEditing(c) ? 'true' : 'false'"
+                                        data-testid="llm-conn-edit">
+                                    {{ isEditing(c) ? $t('settings.aiModels.conn.done') : $t('common.edit') }}
+                                </button>
+                            </div>
+                        </div>
+                        <div v-if="isEditing(c)" class="lb-ai-conn-form" data-testid="llm-conn-form">
+                            <div class="lb-ai-form-grid">
+                                <div class="lb-field">
+                                    <label class="lb-field-label" :for="'llm-label-' + c.id">{{ $t('settings.llm.label') }}</label>
+                                    <input :id="'llm-label-' + c.id" v-model="c.label" data-testid="llm-conn-label"
+                                           :placeholder="providerLabel(c.provider)" class="lb-input" />
+                                </div>
+                                <div class="lb-field">
+                                    <label class="lb-field-label" :for="'llm-provider-' + c.id">{{ $t('settings.field.provider') }}</label>
+                                    <select :id="'llm-provider-' + c.id" v-model="c.provider" data-testid="llm-conn-provider"
+                                            @change="invalidateModels(c)" class="lb-select">
+                                        <option v-for="p in availableProviders" :key="p.id" :value="p.id">{{ p.label }}</option>
+                                    </select>
+                                </div>
+                                <div class="lb-field lb-ai-span">
+                                    <label class="lb-field-label" :for="'llm-url-' + c.id">{{ $t('settings.field.baseUrl') }}</label>
+                                    <input :id="'llm-url-' + c.id" v-model="c.base_url" data-testid="llm-conn-base-url"
+                                           @input="invalidateModels(c)"
+                                           :placeholder="providerBaseUrl(c.provider) || 'http://localhost:11434/v1'"
+                                           class="lb-input lb-mono" />
+                                    <p class="lb-set-note">{{ $t('settings.llm.baseUrlHelp') }}</p>
+                                </div>
+                                <div class="lb-field lb-ai-span">
+                                    <label class="lb-field-label" :for="'llm-key-' + c.id">{{ $t('settings.field.apiKey') }}</label>
+                                    <div class="lb-set-input-row">
+                                        <input :id="'llm-key-' + c.id" type="password" data-testid="llm-conn-api-key"
+                                               :value="c.api_key === null ? '' : c.api_key"
+                                               @input="c.api_key = $event.target.value; invalidateModels(c)"
+                                               :placeholder="c.api_key === null && c.has_key
+                                                   ? $t('settings.llm.apiKeyUnchanged', { hint: c.key_hint })
+                                                   : $t('settings.llm.apiKeyNone')"
+                                               class="lb-input" />
+                                        <button v-if="c.has_key && c.api_key === null" type="button"
+                                                @click="c.api_key = ''; invalidateModels(c)"
+                                                class="lb-btn-text">
+                                            {{ $t('settings.llm.apiKeyRemove') }}
+                                        </button>
+                                    </div>
+                                    <p class="lb-set-note">{{ $t('settings.llm.apiKeyHelp') }}</p>
+                                </div>
+                            </div>
+                            <div class="lb-ai-form-foot">
+                                <span v-if="boundRolesOf(c.id).length" class="lb-set-note">
+                                    {{ $t('settings.llm.removeBoundHint', { roles: boundRolesOf(c.id).map(r => $t('settings.llm.role.' + r)).join(', ') }) }}
+                                </span>
+                                <button type="button" @click="removeConnection(c)" :disabled="boundRolesOf(c.id).length > 0"
+                                        data-testid="llm-conn-remove" class="lb-btn-text lb-ai-remove">
+                                    {{ $t('settings.llm.remove') }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <button type="button" @click="addConnection" data-testid="llm-add-connection" class="lb-ai-add">
+                    <span v-html="icons.plus"></span>
+                    {{ $t('settings.llm.addConnection') }}
+                </button>
+            </section>
+
+            <!-- One save for the whole section, only while the draft differs from
+                 the saved document (#209). -->
+            <div v-if="dirty" class="lb-ai-bar" role="region" :aria-label="$tn('settings.aiModels.bar.label', changeSummary.length)"
+                 data-testid="llm-save-bar">
+                <div class="lb-ai-bar-text">
+                    <span class="lb-ai-bar-dot" aria-hidden="true"></span>
+                    <span class="lb-ai-bar-label">{{ $tn('settings.aiModels.bar.label', changeSummary.length) }}</span>
+                    <span class="lb-ai-bar-summary" data-testid="llm-save-summary">{{ summaryText }}</span>
+                </div>
+                <span v-if="llmError" data-testid="llm-error" class="lb-set-error">{{ llmError }}</span>
+                <div class="lb-ai-bar-actions">
+                    <button type="button" class="lb-btn" @click="discardDraft" :disabled="llmSaving" data-testid="llm-discard">
+                        {{ $t('settings.aiModels.bar.discard') }}
+                    </button>
+                    <button type="button" class="lb-btn lb-btn-primary" @click="saveLlmConfig" :disabled="llmSaving" data-testid="llm-save">
+                        {{ $t('common.save') }}
+                    </button>
+                </div>
+            </div>
+            <p v-else-if="llmSaved" role="status" class="lb-ai-saved" data-testid="llm-saved">✓ {{ $t('settings.aiModels.saved') }}</p>
+        </div>
+    `,
+    data() {
+        const emptyDoc = () => ({
+            connections: [],
+            roles: {
+                reasoning: { connection_id: '', model: '' },
+                fast: { connection_id: '', model: '' },
+                embedding: { connection_id: '', model: '' },
             },
+        });
+        return {
+            // Connections + roles (llm.json): the draft and the saved document.
+            llmTiers: LLM_TIERS,
+            llmDoc: emptyDoc(),
+            savedDoc: emptyDoc(),
             llmStatus: {},
             llmModels: {},          // connection id -> { models, error }
             llmModelFilter: { reasoning: '', fast: '', embedding: '' },
             llmModelOpen: { reasoning: false, fast: false, embedding: false },
             llmModelsLoading: {},
+            editing: {},            // connection id -> its form is open
             llmSaving: false,
             llmSaved: false,
             llmError: '',
@@ -6004,63 +11013,119 @@ const SettingsPage = {
             suggestingModels: false,
             modelSuggestion: null,
             modelSuggestError: '',
+            // Startup check
+            check: llmCheck,
+            recheckedOk: false,
+            checkError: '',
+            icons: AI_MODEL_ICONS,
+            // Search index
+            embStatus: null,
+            indexError: '',
+            run: recomputeRun,
+            recomputeIcons: RECOMPUTE_ICONS,
         };
     },
     computed: {
-        exportUrl() {
-            let url = '/api/export/ris?';
-            if (this.exportCategoryId) url += `category_id=${this.exportCategoryId}&`;
-            return url;
+        dirty() {
+            return this.signature(this.llmDoc) !== this.signature(this.savedDoc);
         },
-        bibtexExportUrl() {
-            let url = '/api/export/bibtex?';
-            if (this.exportCategoryId) url += `category_id=${this.exportCategoryId}&`;
-            return url;
+        // What the bar names: per role "from → to", connections added, removed
+        // or edited.
+        changeSummary() {
+            const out = [];
+            const before = this.savedDoc;
+            const after = this.llmDoc;
+            for (const tier of this.llmTiers) {
+                const a = before.roles[tier];
+                const b = after.roles[tier];
+                if (a.connection_id === b.connection_id && a.model === b.model) continue;
+                const sameConn = a.connection_id === b.connection_id;
+                out.push(t('settings.aiModels.bar.role', {
+                    role: t('settings.llm.role.' + tier),
+                    from: this.bindingText(before, a, sameConn),
+                    to: this.bindingText(after, b, sameConn),
+                }));
+            }
+            const savedById = Object.fromEntries(before.connections.map((c) => [c.id, c]));
+            const draftIds = new Set(after.connections.map((c) => c.id));
+            for (const c of after.connections) {
+                const old = savedById[c.id];
+                if (!old) {
+                    out.push(t('settings.aiModels.bar.added', { name: this.connectionLabel(c) }));
+                } else if (this.connSignature(old) !== this.connSignature(c)) {
+                    out.push(t('settings.aiModels.bar.edited', { name: this.connectionLabel(c) }));
+                }
+            }
+            for (const c of before.connections) {
+                if (!draftIds.has(c.id)) out.push(t('settings.aiModels.bar.removed', { name: this.connectionLabel(c) }));
+            }
+            return out;
         },
-        // Die .env-Felder tragen uebersetzten Text, also sind sie computed und
-        // nicht data: `data()` laeuft einmal, ein Sprachwechsel danach wuerde
-        // die Beschriftungen nie wieder anfassen.
-        fields() {
-            return [
-                { key: 'LITERATUR_BASE_DIR', label: t('settings.field.baseDir'), secret: false,
-                  placeholder: 'C:\\Users\\...\\Library', help: t('settings.field.baseDirHelp') },
-                { key: 'LINK_MODE', label: t('settings.field.linkMode'), secret: false,
-                  placeholder: 'symlink', help: t('settings.field.linkModeHelp') },
-                { key: 'CROSSREF_MAILTO', label: t('settings.field.crossrefMail'), secret: false,
-                  placeholder: 'you@example.com', help: t('settings.field.crossrefMailHelp') },
-                { key: 'OPENALEX_API_KEY', label: t('settings.field.openalexKey'), secret: true,
-                  placeholder: t('settings.field.openalexKeyPlaceholder'),
-                  help: t('settings.field.openalexKeyHelp') },
-                { key: 'WATCH_INTERVAL', label: t('settings.field.watchInterval'), secret: false,
-                  placeholder: '5', help: t('settings.field.watchIntervalHelp') },
-                { key: 'MAX_OCR_PAGES', label: t('settings.field.maxOcrPages'), secret: false,
-                  placeholder: '50000', help: t('settings.field.maxOcrPagesHelp') },
-            ];
+        summaryText() {
+            const items = this.changeSummary;
+            if (items.length <= 2) return items.join(' · ');
+            return items.slice(0, 2).join(' · ') + ' · ' + t('settings.aiModels.bar.more', { count: items.length - 2 });
+        },
+        // The check's problems that still describe the saved binding — a role
+        // saved since then is no longer marked with an old report.
+        checkProblems() {
+            return this.llmTiers.filter((tier) => {
+                const r = this.checkedRole(tier);
+                return !!r && LLM_CHECK_PROBLEMS.includes(r.status);
+            });
+        },
+        checkedAt() {
+            return formatCheckedAt(this.check.report && this.check.report.checked_at);
+        },
+        // Search index: a run with the search index step, from wherever it
+        // was started, shows here as "being built".
+        indexRunning() {
+            return this.run.state === 'running' && this.run.steps.includes('search_index');
+        },
+        indexState() {
+            const state = searchIndexState(this.embStatus);
+            return state !== 'off' && this.indexRunning ? 'building' : state;
+        },
+        indexTone() {
+            return { ready: 'ok', building: 'accent', stale: 'warn', incomplete: 'warn' }[this.indexState] || 'mute';
+        },
+        indexHint() {
+            const state = searchIndexState(this.embStatus);
+            return state === 'stale' || state === 'incomplete' ? state : '';
+        },
+    },
+    watch: {
+        dirty: {
+            immediate: true,
+            handler(value) {
+                aiModelsDraft.dirty = value;
+            },
+        },
+        // Whoever ran the search index step: afterwards the status is read
+        // again, so a fixed index loses its hint.
+        indexRunning(now, before) {
+            if (before && !now) this.loadEmbeddingStatus();
         },
     },
     async created() {
+        if (!llmCheck.report) loadLlmCheck();
         await Promise.all([
-            this.loadSettings(),
-            this.loadIcon(),
-            this.loadCustomFields(),
-            this.loadExportMeta(),
-            this.loadLicenseStatus(),
             this.loadLlmConfig(),
             this.loadProviders(),
             this.loadEmbeddingStatus(),
         ]);
-        await this.loadExportPreview();
+    },
+    // Kept alive: coming back reads the index status again (the run that
+    // changed it may have been started elsewhere).
+    activated() {
+        if (this._shown) this.loadEmbeddingStatus();
+        this._shown = true;
+    },
+    beforeUnmount() {
+        // Leaving Settings drops the draft — and its dot.
+        aiModelsDraft.dirty = false;
     },
     methods: {
-        async loadSettings() {
-            try {
-                this.settings = await api('/api/settings');
-                // UNLOCK_PDFS: default true wenn nicht gesetzt
-                this.unlockPdfs = this.settings.UNLOCK_PDFS !== 'false';
-            } catch (e) {
-                console.error('Settings load error:', e);
-            }
-        },
         async loadProviders() {
             try {
                 const data = await api('/api/llm/providers');
@@ -6069,10 +11134,9 @@ const SettingsPage = {
                 console.error('Providers load error:', e);
             }
         },
-        // --- LLM-Tab: Verbindungen + Rollen (llm.json) ---------------------
-        // Der Server liefert das Dokument ohne Keys; jede Karte startet mit
-        // api_key = null ("unveraendert"). Erst eine Eingabe macht daraus einen
-        // String, der beim Speichern mitgeht.
+        // The server sends the document without keys; every connection starts
+        // with api_key = null ("unchanged"). Only typing makes it a string that
+        // goes out with the save.
         async loadLlmConfig() {
             try {
                 this.applyLlmConfig(await api('/api/llm/config'));
@@ -6090,7 +11154,73 @@ const SettingsPage = {
                 connections: (data.connections || []).map((c) => ({ ...c, api_key: null, _new: false })),
                 roles,
             };
+            this.savedDoc = cloneLlmDoc(this.llmDoc);
             this.llmStatus = data.status || {};
+            this.editing = {};
+        },
+        // Comparable form of a document: what a save would send. A keyless
+        // connection with an emptied key field is unchanged.
+        connSignature(c) {
+            const key = (c.api_key === '' && !c.has_key) ? null : c.api_key;
+            return JSON.stringify([c.id, c.label || '', c.provider, c.base_url || '', key]);
+        },
+        signature(doc) {
+            return JSON.stringify([
+                doc.connections.map((c) => this.connSignature(c)),
+                this.llmTiers.map((tier) => [doc.roles[tier].connection_id, doc.roles[tier].model]),
+            ]);
+        },
+        bindingText(doc, role, sameConn) {
+            const model = role.model || '—';
+            if (sameConn) return model;
+            const c = doc.connections.find((x) => x.id === role.connection_id);
+            if (!c) return '—';
+            return this.connectionLabel(c) + (role.model ? ' · ' + role.model : '');
+        },
+        // The saved binding a role runs on: fast without its own falls back
+        // to reasoning.
+        resolvedBinding(tier) {
+            const own = this.savedDoc.roles[tier];
+            if (tier === 'fast' && !(own.connection_id && own.model)) return this.savedDoc.roles.reasoning;
+            return own;
+        },
+        checkedRole(tier) {
+            const roles = (this.check.report && this.check.report.roles) || {};
+            const r = roles[tier];
+            if (!r || r.status === 'unbound') return null;
+            const bind = this.resolvedBinding(tier);
+            return r.connection_id === bind.connection_id && r.model === bind.model ? r : null;
+        },
+        checkSentence(tier) {
+            return llmCheckSentence(this.checkedRole(tier));
+        },
+        // ready | fallback | changed | model_missing | unreachable | auth_failed
+        // (the last three from the Startup check) | no_model | off
+        roleState(tier) {
+            const draft = this.llmDoc.roles[tier];
+            const saved = this.savedDoc.roles[tier];
+            if (draft.connection_id !== saved.connection_id || draft.model !== saved.model) return 'changed';
+            const checked = this.checkedRole(tier);
+            if (checked && LLM_CHECK_PROBLEMS.includes(checked.status)) return checked.status;
+            if (this.llmStatus[tier]) {
+                return tier === 'fast' && !(saved.connection_id && saved.model) ? 'fallback' : 'ready';
+            }
+            // Bound to a connection, no model chosen yet (the onboarding's state).
+            if (saved.connection_id && !saved.model) return 'no_model';
+            return 'off';
+        },
+        roleTone(tier) {
+            return llmStateTone(this.roleState(tier));
+        },
+        async checkAgain() {
+            this.checkError = '';
+            this.recheckedOk = false;
+            try {
+                const report = await recheckLlm();
+                this.recheckedOk = !llmCheckProblems(report).length;
+            } catch (e) {
+                this.checkError = t('error.generic', { message: e.message });
+            }
         },
         providerLabel(id) {
             const p = this.availableProviders.find((x) => x.id === id);
@@ -6103,12 +11233,43 @@ const SettingsPage = {
         connectionLabel(c) {
             return (c.label || '').trim() || this.providerLabel(c.provider) || c.id;
         },
+        initials(c) {
+            const label = this.connectionLabel(c);
+            const words = label.replace(/[()]/g, ' ').split(/\s+/).filter(Boolean);
+            const caps = label.match(/[A-Z]/g) || [];
+            if (words.length === 1 && caps.length >= 2) return caps[0] + caps[1];
+            if (words.length > 1) return (words[0][0] + words[1][0]).toUpperCase();
+            return (words[0] || '?').slice(0, 2).toUpperCase();
+        },
+        // "api.openai.com · key sk-…4f2a": the own URL, or the preset's host.
+        connectionMeta(c) {
+            let address = (c.base_url || '').trim();
+            if (!address) {
+                const preset = this.providerBaseUrl(c.provider);
+                try { address = preset ? new URL(preset).host : ''; } catch (e) { address = preset; }
+            }
+            let key;
+            if (c.api_key === null) {
+                key = c.has_key ? t('settings.aiModels.conn.key', { hint: c.key_hint }) : t('settings.aiModels.conn.noKey');
+            } else if (c.api_key) {
+                key = t('settings.aiModels.conn.newKey');
+            } else {
+                key = c.has_key ? t('settings.aiModels.conn.keyRemoved') : t('settings.aiModels.conn.noKey');
+            }
+            return [address, key].filter(Boolean).join(' · ');
+        },
+        isEditing(c) {
+            return !!this.editing[c.id];
+        },
+        toggleEdit(c) {
+            this.editing[c.id] = !this.editing[c.id];
+        },
         boundRolesOf(connectionId) {
             return this.llmTiers.filter((tier) => this.llmDoc.roles[tier].connection_id === connectionId);
         },
-        // Modell-Liste der Verbindung, an die die Rolle gebunden ist. Fuer die
-        // Embedding-Rolle stehen embedding-artige Modelle vorn — die Listen
-        // bestehen ueberwiegend aus Chat-Modellen, die hier selten gemeint sind.
+        // The model list of the connection the role is bound to. For the
+        // embedding role, embedding-like models come first — the lists are
+        // mostly chat models, rarely meant here.
         modelOptions(tier) {
             const cid = this.llmDoc.roles[tier].connection_id;
             const entry = cid ? this.llmModels[cid] : null;
@@ -6124,9 +11285,9 @@ const SettingsPage = {
             if (current && models.length && !models.includes(current)) models.unshift(current);
             return models;
         },
-        // Filter ueber die Modell-Liste: jedes Leerzeichen-getrennte Wort muss
-        // vorkommen (Gross/Klein egal). Das aktuell gebundene Modell faellt
-        // nie heraus, sonst zeigte das Dropdown einen Wert, den es nicht kennt.
+        // Every space-separated word must occur (case-insensitive). The bound
+        // model never drops out, or the dropdown would show a value it does
+        // not know.
         filteredModelOptions(tier) {
             const models = this.modelOptions(tier);
             const words = (this.llmModelFilter[tier] || '').toLowerCase().split(/\s+/).filter(Boolean);
@@ -6134,7 +11295,7 @@ const SettingsPage = {
             const current = this.llmDoc.roles[tier].model;
             return models.filter((m) => m === current || words.every((w) => m.toLowerCase().includes(w)));
         },
-        // "Kein Treffer" auch dann, wenn nur das gebundene Modell uebrig bleibt.
+        // "No match" also when only the bound model is left.
         modelFilterHasNoMatch(tier) {
             if (!(this.llmModelFilter[tier] || '').trim()) return false;
             const current = this.llmDoc.roles[tier].model;
@@ -6152,7 +11313,7 @@ const SettingsPage = {
             this.llmDoc.roles[tier].model = model;
             this.closeModelPicker(tier);
         },
-        // Enter nimmt den ersten Treffer, der nicht bloss das gebundene Modell ist.
+        // Enter takes the first match that is not merely the bound model.
         pickFirstModel(tier) {
             const current = this.llmDoc.roles[tier].model;
             const words = (this.llmModelFilter[tier] || '').trim();
@@ -6164,30 +11325,39 @@ const SettingsPage = {
             const entry = this.llmModels[connectionId];
             return entry && !entry.models.length ? (entry.error || '') : '';
         },
-        // Was der Server fuer eine Verbindung braucht, um ihre Modelle zu laden:
-        // die gespeicherte per id (der Key bleibt auf dem Server), eine neue
-        // oder mit geaendertem Key als Entwurf — nur dann reist der Key mit.
+        // What the server needs to load a connection's models: a saved one by
+        // id (the key stays on the server), a new one or one with a changed key
+        // as a draft — only then does the key travel.
         probeBody(c) {
             if (!c._new && c.api_key === null) {
                 return { connection_id: c.id, provider: c.provider, base_url: c.base_url || '' };
             }
             return { provider: c.provider, base_url: c.base_url || '', api_key: c.api_key || '' };
         },
+        // A ticket per connection (SPA-11): an edit invalidates the request
+        // in flight, so the old endpoint's list never lands after it.
         async loadModelsFor(c) {
+            const tickets = this._modelTickets || (this._modelTickets = {});
+            const ticket = (tickets[c.id] = (tickets[c.id] || 0) + 1);
             this.llmModelsLoading[c.id] = true;
             try {
                 const data = await api('/api/llm/models', { method: 'POST', body: JSON.stringify(this.probeBody(c)) });
+                if (tickets[c.id] !== ticket) return;
                 this.llmModels[c.id] = {
                     models: data.models || [],
                     error: data.error ? translateDetail(data.error) : '',
                 };
             } catch (e) {
+                if (tickets[c.id] !== ticket) return;
                 this.llmModels[c.id] = { models: [], error: e.message };
             } finally {
-                this.llmModelsLoading[c.id] = false;
+                if (tickets[c.id] === ticket) this.llmModelsLoading[c.id] = false;
             }
         },
         invalidateModels(c) {
+            const tickets = this._modelTickets || (this._modelTickets = {});
+            tickets[c.id] = (tickets[c.id] || 0) + 1;
+            this.llmModelsLoading[c.id] = false;
             delete this.llmModels[c.id];
         },
         onRoleConnectionChange(tier) {
@@ -6199,8 +11369,9 @@ const SettingsPage = {
         },
         addConnection() {
             const first = this.availableProviders[0];
+            const id = Math.random().toString(16).slice(2, 10);
             this.llmDoc.connections.push({
-                id: Math.random().toString(16).slice(2, 10),
+                id,
                 label: '',
                 provider: first ? first.id : 'custom',
                 base_url: '',
@@ -6209,11 +11380,28 @@ const SettingsPage = {
                 key_hint: '',
                 _new: true,
             });
+            this.editing[id] = true;
         },
         removeConnection(c) {
             if (this.boundRolesOf(c.id).length) return;
             this.llmDoc.connections = this.llmDoc.connections.filter((x) => x.id !== c.id);
-            delete this.llmModels[c.id];
+            // Drops a late answer too, which would otherwise recreate the entry.
+            this.invalidateModels(c);
+        },
+        discardDraft() {
+            // A list for the draft's endpoint or key (landed or in flight) must
+            // not survive on the restored connection; an unchanged one keeps its.
+            const saved = Object.fromEntries(this.savedDoc.connections.map((c) => [c.id, c]));
+            for (const c of this.llmDoc.connections) {
+                const old = saved[c.id];
+                if (!old || JSON.stringify(this.probeBody(c)) !== JSON.stringify(this.probeBody(old))) {
+                    this.invalidateModels(c);
+                }
+            }
+            this.llmDoc = cloneLlmDoc(this.savedDoc);
+            this.llmError = '';
+            this.editing = {};
+            for (const tier of this.llmTiers) this.closeModelPicker(tier);
         },
         async saveLlmConfig() {
             this.llmSaving = true;
@@ -6230,6 +11418,9 @@ const SettingsPage = {
                 this.applyLlmConfig(data);
                 this.llmSaved = true;
                 setTimeout(() => this.llmSaved = false, 2500);
+                // A report with problems is about the document just replaced:
+                // check the saved one, so the hint and the labels tell the truth.
+                if (llmCheckProblems(llmCheck.report).length) this.checkAgain();
                 await this.loadEmbeddingStatus();
             } catch (e) {
                 this.llmError = e.message;
@@ -6237,9 +11428,8 @@ const SettingsPage = {
                 this.llmSaving = false;
             }
         },
-        // Vorschlag laeuft auf der Verbindung der Reasoning-Rolle und fuellt
-        // Reasoning + Simple aus DEREN Liste; Simple wird nur mitgezogen, wenn
-        // es nicht an eine andere Verbindung gebunden ist.
+        // Runs on the reasoning role's connection and fills Reasoning + Simple
+        // from ITS list; Simple only follows when it is not bound elsewhere.
         async suggestModels() {
             const cid = this.llmDoc.roles.reasoning.connection_id;
             const c = this.llmDoc.connections.find((x) => x.id === cid);
@@ -6250,7 +11440,7 @@ const SettingsPage = {
                 const data = await api('/api/llm/suggest-models', { method: 'POST', body: JSON.stringify(this.probeBody(c)) });
                 if (data.suggestion) {
                     this.modelSuggestion = data.suggestion;
-                    // Dropdowns nur vorbefuellen – Nutzer speichert selbst.
+                    // Only prefill the dropdowns — the user saves.
                     this.llmDoc.roles.reasoning.model = data.suggestion.reasoning;
                     const fast = this.llmDoc.roles.fast;
                     if (!fast.connection_id || fast.connection_id === cid) {
@@ -6267,196 +11457,111 @@ const SettingsPage = {
                 this.suggestingModels = false;
             }
         },
-        async saveSettings() {
-            try {
-                await api('/api/settings', {
-                    method: 'PUT',
-                    body: JSON.stringify(this.settings),
-                });
-                this.settingsSaved = true;
-                setTimeout(() => this.settingsSaved = false, 2500);
-            } catch (e) {
-                alert(t('error.saveFailed', { message: e.message }));
-            }
-        },
-        async updatePageCounts() {
-            this.pageCountUpdating = true;
-            this.pageCountResult = null;
-            try {
-                const res = await api('/api/maintenance/update-page-counts', { method: 'POST' });
-                this.pageCountResult = { ok: true, msg: `✓ ${res.updated} Paper aktualisiert, ${res.failed} fehlgeschlagen` };
-            } catch (e) {
-                this.pageCountResult = { ok: false, msg: t('error.generic', { message: e.message }) };
-            } finally {
-                this.pageCountUpdating = false;
-            }
-        },
-        async rebuildLinks() {
-            this.rebuildLinksRunning = true;
-            this.rebuildLinksResult = null;
-            try {
-                const res = await api('/api/maintenance/rebuild-links', { method: 'POST' });
-                this.rebuildLinksResult = { ok: true, msg: '✓ ' + t('settings.rebuildLinksDone', { rebuilt: res.rebuilt, removed: res.removed }) };
-            } catch (e) {
-                this.rebuildLinksResult = { ok: false, msg: t('error.generic', { message: e.message }) };
-            } finally {
-                this.rebuildLinksRunning = false;
-            }
-        },
         async loadEmbeddingStatus() {
-            // Degradiert still: ohne Embedding-Modell liefert der Endpunkt
-            // Nullwerte, der Abschnitt zeigt dann den Konfigurations-Hinweis.
+            // Degrades silently: without an embedding model the endpoint sends
+            // zeros, the block then shows the configuration hint.
             try {
                 this.embStatus = await api('/api/maintenance/embeddings/status');
             } catch (e) {
                 this.embStatus = null;
             }
         },
-        async reindexEmbeddings(scope) {
-            // scope: 'papers' (ein Vektor je Paper) | 'chunks' (Passagen-Suche).
-            // Beide Laeufe sind idempotent — Bereits-Indexiertes wird uebersprungen.
-            this.embRunning = scope;
-            this.embResult = null;
-            try {
-                const url = scope === 'chunks'
-                    ? '/api/maintenance/embeddings/reindex-chunks'
-                    : '/api/maintenance/embeddings/reindex';
-                const res = await api(url, { method: 'POST' });
-                if (!res.model) {
-                    this.embResult = { ok: false, msg: t('settings.noEmbeddingModel') };
-                } else {
-                    const what = scope === 'chunks' ? t('settings.reindexPassages') : t('settings.reindexItems');
-                    let msg = '✓ ' + t('settings.reindexDone', { indexed: res.indexed, what: what, skipped: res.skipped });
-                    if (res.errors > 0) msg += t('settings.reindexErrors', { count: res.errors });
-                    this.embResult = { ok: res.errors === 0, msg };
-                }
-                await this.loadEmbeddingStatus();
-            } catch (e) {
-                this.embResult = { ok: false, msg: t('error.generic', { message: e.message }) };
-            } finally {
-                this.embRunning = '';
+        // "Rebuild now": the recompute with its search index step. Idempotent —
+        // what already has a vector of the bound model is skipped.
+        async rebuildIndex() {
+            this.indexError = '';
+            const finished = await startRecompute(['search_index'], 'search-index');
+            if (!finished && this.run.error) this.indexError = this.run.error;
+            else if (finished && this.run.errors) {
+                this.indexError = this.$tn('settings.index.errors', this.run.errors);
             }
+            await this.loadEmbeddingStatus();
         },
-        async fullRefresh() {
-            this.fullRefreshRunning = true;
-            this.fullRefreshDone = false;
-            this.fullRefreshMessage = 'Starte Refresh...';
-            this.fullRefreshPercent = 0;
-            this.fullRefreshStats = null;
+        cancelIndex() {
+            cancelRecompute();
+        },
+        share(part, whole) {
+            return whole ? Math.min(100, Math.round((part || 0) * 100 / whole)) : 0;
+        },
+        formatCount,
+    },
+};
 
-            try {
-                const resp = await fetch('/api/maintenance/full-refresh', { method: 'POST' });
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
-                const reader = resp.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
+// --- Settings → Custom fields -------------------------------------------------
+const SettingsCustomFieldsSection = {
+    name: 'SettingsCustomFieldsSection',
+    template: `
+        <div class="lb-set-body" data-settings-section="custom-fields">
+            <section class="lb-set-block">
+                <div class="lb-set-h-row">
+                    <h2 class="lb-set-h">{{ $t('settings.customFields.listHeading') }}</h2>
+                    <span class="lb-set-count">{{ customFields.length }}</span>
+                </div>
+                <div v-if="customFields.length" class="lb-set-card">
+                    <div v-for="cf in customFields" :key="cf.id" class="lb-set-row" :data-custom-field="cf.id">
+                        <span v-html="icons.columns" class="text-gray-400 flex-shrink-0"></span>
+                        <div class="lb-set-row-text">
+                            <p class="lb-set-label">{{ cf.name }}</p>
+                            <p class="lb-set-hint">
+                                {{ $t('settings.fieldType') }}: {{ fieldTypeLabel(cf.field_type) }}
+                                <span v-if="cf.options"> &middot; {{ $t('settings.optionsLabel') }}: {{ cf.options }}</span>
+                            </p>
+                        </div>
+                        <button type="button" @click="deleteField(cf)" :aria-label="$t('common.delete')"
+                                class="lb-icon-btn">
+                            <span v-html="icons.trash"></span>
+                        </button>
+                    </div>
+                </div>
+                <p v-else class="lb-set-card lb-set-pad lb-set-hint">
+                    {{ $t('settings.noCustomColumns') }}
+                </p>
+            </section>
 
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || '';
-                    for (const line of lines) {
-                        const trimmed = line.trim();
-                        if (!trimmed.startsWith('data: ')) continue;
-                        try {
-                            const evt = JSON.parse(trimmed.slice(6));
-                            if (evt.type === 'progress') {
-                                this.fullRefreshMessage = evt.message;
-                                this.fullRefreshPercent = evt.percent || 0;
-                                if (evt.stats) this.fullRefreshStats = evt.stats;
-                            } else if (evt.type === 'done') {
-                                this.fullRefreshPercent = 100;
-                                this.fullRefreshMessage = 'Fertig!';
-                                if (evt.stats) this.fullRefreshStats = evt.stats;
-                                this.fullRefreshDone = true;
-                            }
-                        } catch (e) { /* ignore */ }
-                    }
-                }
-            } catch (e) {
-                this.fullRefreshMessage = t('error.generic', { message: e.message });
-            } finally {
-                this.fullRefreshRunning = false;
-            }
-        },
-        // Sprache umschalten: erst sichtbar, dann persistiert. Die Reihenfolge
-        // ist Absicht - ein langsamer PUT darf die Oberflaeche nicht haengen
-        // lassen, und schlaegt er fehl, sagen wir es statt es zu verschlucken.
-        async changeLanguage(lang) {
-            setUiLang(lang);
-            try {
-                await api('/api/settings', {
-                    method: 'PUT',
-                    body: JSON.stringify({ UI_LANGUAGE: lang }),
-                });
-            } catch (e) {
-                alert(t('settings.languageSaveFailed', { message: e.message }));
-            }
-        },
-        toggleDarkMode() {
-            this.darkMode = !this.darkMode;
-            localStorage.setItem('darkMode', this.darkMode);
-            applyDarkMode(this.darkMode);
-        },
-        toggleThesisMode() {
-            this.thesisMode = !this.thesisMode;
-            localStorage.setItem('thesisMode', this.thesisMode);
-            window.dispatchEvent(new CustomEvent('refresh-sidebar'));
-        },
-        async toggleUnlockPdfs() {
-            this.unlockPdfs = !this.unlockPdfs;
-            try {
-                await api('/api/settings', {
-                    method: 'PUT',
-                    body: JSON.stringify({ UNLOCK_PDFS: this.unlockPdfs ? 'true' : 'false' }),
-                });
-            } catch (e) {
-                this.unlockPdfs = !this.unlockPdfs;
-                alert(t('error.saveFailed', { message: e.message }));
-            }
-        },
-        async loadIcon() {
-            try {
-                const data = await api('/api/appearance/icon');
-                this.customIconPath = data.path;
-            } catch (e) {}
-        },
-        async uploadIcon(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            const formData = new FormData();
-            formData.append('file', file);
-            try {
-                const resp = await fetch('/api/appearance/icon', {
-                    method: 'POST',
-                    body: formData,
-                });
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.detail);
-                }
-                const data = await resp.json();
-                this.customIconPath = data.path;
-                setFavicon(data.path);
-                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
-            } catch (e) {
-                alert(t('error.uploadFailed', { message: e.message }));
-            }
-        },
-        async deleteIcon() {
-            try {
-                await api('/api/appearance/icon', { method: 'DELETE' });
-                this.customIconPath = null;
-                setFavicon(null);
-                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
-            } catch (e) {
-                alert(t('error.generic', { message: e.message }));
-            }
-        },
-        // Custom Fields
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('settings.addField') }}</h2>
+                <div class="lb-set-card lb-set-pad">
+                    <div class="grid grid-cols-2 gap-3 mb-3">
+                        <div class="lb-field">
+                            <label class="lb-field-label" for="custom-field-name">{{ $t('common.name') }}</label>
+                            <input id="custom-field-name" v-model="newField.name" :placeholder="$t('settings.fieldNamePlaceholder')"
+                                   class="lb-input" />
+                        </div>
+                        <div class="lb-field">
+                            <label class="lb-field-label" for="custom-field-type">{{ $t('settings.fieldType') }}</label>
+                            <select id="custom-field-type" v-model="newField.field_type" class="lb-select">
+                                <option value="text">{{ $t('settings.fieldTypeText') }}</option>
+                                <option value="number">{{ $t('settings.fieldTypeNumber') }}</option>
+                                <option value="progress">{{ $t('settings.fieldTypeProgressRange') }}</option>
+                                <option value="select">{{ $t('settings.fieldTypeSelect') }}</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div v-if="newField.field_type === 'select'" class="lb-field mb-3">
+                        <label class="lb-field-label" for="custom-field-options">{{ $t('settings.optionsCommaSeparated') }}</label>
+                        <input id="custom-field-options" v-model="newField.options" :placeholder="$t('settings.optionsPlaceholder')"
+                               class="lb-input" />
+                    </div>
+                    <button type="button" @click="createField" :disabled="!newField.name" class="lb-btn lb-btn-primary">
+                        <span v-html="icons.plus"></span>
+                        {{ $t('settings.createField') }}
+                    </button>
+                </div>
+            </section>
+        </div>
+    `,
+    data() {
+        return {
+            icons,
+            customFields: [],
+            newField: { name: '', field_type: 'text', options: '' },
+        };
+    },
+    created() {
+        this.loadCustomFields();
+    },
+    methods: {
         async loadCustomFields() {
             try {
                 this.customFields = await api('/api/custom-fields');
@@ -6476,7 +11581,7 @@ const SettingsPage = {
             }
         },
         async deleteField(cf) {
-            if (!confirm(`Feld "${cf.name}" wirklich loeschen? Alle gespeicherten Werte gehen verloren.`)) return;
+            if (!confirm(t('settings.customFields.deleteConfirm', { name: cf.name }))) return;
             try {
                 await api(`/api/custom-fields/${cf.id}`, { method: 'DELETE' });
                 await this.loadCustomFields();
@@ -6491,64 +11596,992 @@ const SettingsPage = {
             };
             return labels[type] || type;
         },
-        // Export/Import
-        async loadExportMeta() {
-            try {
-                const [stats, categories] = await Promise.all([
-                    api('/api/stats'),
-                    api('/api/categories'),
-                ]);
-                this.stats = stats;
-                this.allCategories = categories;
-            } catch (e) {}
+    },
+};
+
+
+// --- Settings → Add-ons → <id> ------------------------------------------------
+// The Add-on's page: its existing settings component (Manifest fields or its
+// own "settings" slot, the props unchanged — ADR-0021), the Berechtigungen it
+// was granted (read only, the Marketplace's rows) and the way to the
+// Marketplace for everything else. The head (icon, name, Herkunft, version)
+// is the frame's.
+const SettingsAddonSection = {
+    name: 'SettingsAddonSection',
+    components: { AddonSettingsSection },
+    inject: ['settingsAddon'],
+    props: { id: { type: String, required: true } },
+    template: `
+        <div class="lb-set-body" :data-settings-section="'addons/' + id">
+            <template v-if="addon">
+                <section class="lb-set-block" data-testid="settings-addon-settings">
+                    <h2 class="lb-set-h">{{ $t('settings.addon.settingsHeading') }}</h2>
+                    <addon-settings-section :key="addon.id + ':' + addon.installed_version" :addon-id="addon.id"
+                                            @loaded="hasSettings = $event" />
+                    <p v-if="hasSettings === false" class="lb-set-card lb-set-pad lb-set-hint" data-testid="settings-addon-no-settings">
+                        {{ $t('settings.addon.noSettings') }}
+                    </p>
+                    <p v-else-if="hasSettings" class="lb-set-note">{{ $t('settings.addon.settingsNote') }}</p>
+                </section>
+
+                <section class="lb-set-block" data-testid="settings-addon-permissions">
+                    <h2 class="lb-set-h">{{ $t('settings.addon.permissionsHeading') }}</h2>
+                    <ul v-if="permissions.length" class="lb-set-card lb-set-perms">
+                        <li v-for="p in permissions" :key="p.key" class="lb-set-perm" :data-permission="p.key">
+                            <span>{{ $t(permissionLabel(p.key)) }}</span>
+                            <span class="lb-set-badge">{{ $t($permissionBadge(p)) }}</span>
+                        </li>
+                    </ul>
+                    <p v-else class="lb-set-hint" data-testid="settings-addon-no-permissions">{{ $t('settings.addon.noPermissions') }}</p>
+                </section>
+
+                <div class="lb-set-foot" data-testid="settings-addon-manage">
+                    <div class="lb-set-foot-text">
+                        <span class="lb-set-label">{{ $t('settings.addon.manageTitle') }}</span>
+                        <span class="lb-set-hint">{{ $t('settings.addon.manageHint') }}</span>
+                    </div>
+                    <router-link :to="{ path: '/marketplace', query: { addon: addon.id } }" class="lb-btn"
+                                 data-testid="settings-addon-open-marketplace">
+                        {{ $t('settings.addon.openInMarketplace') }}
+                        <span class="lb-set-link-ext" v-html="externalIcon"></span>
+                    </router-link>
+                </div>
+            </template>
+        </div>
+    `,
+    data() {
+        return { hasSettings: null, externalIcon: SETTINGS_ICONS.external };
+    },
+    computed: {
+        addon() {
+            return this.settingsAddon(this.id);
         },
-        async loadExportPreview() {
+        permissions() {
+            return (this.addon && this.addon.installed_permissions) || [];
+        },
+    },
+    methods: {
+        permissionLabel(key) {
+            return MARKETPLACE_PERMISSION_KEYS[key] || key;
+        },
+    },
+};
+
+
+// --- Settings → Diagnosis -----------------------------------------------------
+// The diagnosis runs whenever the section is opened, as it did on the former
+// General tab; its LLM fix leads to the AI models.
+const SettingsDiagnosisSection = {
+    name: 'SettingsDiagnosisSection',
+    components: { LibraryDiagnosis },
+    template: `
+        <div class="lb-set-body" data-settings-section="diagnosis">
+            <library-diagnosis :key="run" @open-llm-settings="$router.push('/settings/ai-models')" />
+        </div>
+    `,
+    data() {
+        return { run: 0, shown: false };
+    },
+    activated() {
+        if (this.shown) this.run++;
+        this.shown = true;
+    },
+};
+
+
+// --- Settings → Refresh -------------------------------------------------------
+// Block 1 reviews what the user curates (RefreshReview). Block 2 recomputes
+// what LocalBib derives (#213): a list of steps, then three states — ready
+// (the ticks), running (current step, bar, the steps done and to come,
+// cancel) and done (one tile per step, the error count, run again).
+const RECOMPUTE_DEFAULT = ['page_counts', 'citations', 'search_index'];
+
+const SettingsRefreshSection = {
+    name: 'SettingsRefreshSection',
+    components: { RefreshReview },
+    template: `
+        <div class="lb-set-body" data-settings-section="refresh">
+            <p class="lb-set-sub" style="margin-top:0">{{ $t('settings.refresh.intro') }}</p>
+
+            <section class="lb-set-block" data-testid="refresh-block-1">
+                <div class="lb-set-step">
+                    <span class="lb-set-num">1</span>
+                    <h2 class="lb-set-h">{{ $t('settings.refresh.block1.title') }}</h2>
+                    <span class="lb-set-tag is-review" data-testid="refresh-block-1-tag">{{ $t('settings.refresh.withReview') }}</span>
+                </div>
+                <p class="lb-set-sub">{{ $t('settings.refresh.block1.explain') }}</p>
+                <div class="lb-set-card lb-set-pad">
+                    <refresh-review bare />
+                </div>
+            </section>
+
+            <section class="lb-set-block" data-testid="refresh-block-2">
+                <div class="lb-set-step">
+                    <span class="lb-set-num">2</span>
+                    <h2 class="lb-set-h">{{ $t('settings.refresh.block2.title') }}</h2>
+                    <span class="lb-set-tag" data-testid="refresh-block-2-tag">{{ $t('settings.refresh.withoutReview') }}</span>
+                </div>
+                <p class="lb-set-sub">{{ $t('settings.refresh.block2.explain') }}</p>
+                <div class="lb-set-card lb-rc" data-testid="recompute" :data-state="view">
+                    <div v-if="view !== 'done'" class="lb-rc-list">
+                        <label v-for="s in steps" :key="s" class="lb-rc-step" :class="{ 'is-off': !selectable(s) }"
+                               :data-testid="'recompute-step-' + s">
+                            <input type="checkbox" :data-step="s" :checked="isChosen(s)"
+                                   :disabled="view === 'running' || !selectable(s)" @change="toggle(s)" />
+                            <span class="lb-rc-step-text">
+                                <span class="lb-rc-step-label">{{ $t('maintenance.recompute.step.' + s) }}</span>
+                                <span class="lb-set-note">{{ helpFor(s) }}</span>
+                            </span>
+                            <span v-if="s === 'search_index' && indexState === 'stale'" class="lb-set-pill is-warning"
+                                  data-testid="recompute-stale">{{ $t('maintenance.recompute.stale') }}</span>
+                        </label>
+                    </div>
+
+                    <div v-if="view === 'running'" role="status" class="lb-rc-progress" data-testid="recompute-progress">
+                        <div class="lb-rc-progress-head">
+                            <span class="lb-rc-current" data-testid="recompute-current">{{ $t('maintenance.recompute.step.' + run.step) }}</span>
+                            <span class="lb-mono lb-rc-count">{{ formatCount(run.current) }} / {{ formatCount(run.total) }} · {{ run.percent }} %</span>
+                        </div>
+                        <div class="lb-rc-bar"><div :style="{ width: run.percent + '%' }"></div></div>
+                        <div class="lb-rc-trail">
+                            <span v-for="s in run.steps" :key="s" class="lb-rc-trail-step" :class="'is-' + trailState(s)"
+                                  :data-trail="s" :data-trail-state="trailState(s)">
+                                <span v-if="trailState(s) === 'done'" class="lb-rc-trail-icon" v-html="icons.check"></span>
+                                <span v-else-if="trailState(s) === 'current'" class="lb-rc-trail-dot" aria-hidden="true"></span>
+                                {{ $t('maintenance.recompute.step.' + s) }}
+                            </span>
+                        </div>
+                    </div>
+
+                    <div v-if="view === 'done'" role="status" class="lb-rc-tiles" data-testid="recompute-result">
+                        <div v-for="s in run.steps" :key="s" class="lb-rc-tile" :data-tile="s">
+                            <span class="lb-rc-tile-num">{{ formatCount(stat(s).updated) }}</span>
+                            <span class="lb-rc-tile-label">{{ $t('maintenance.recompute.step.' + s) }}</span>
+                            <span v-if="stat(s).errors" class="lb-rc-tile-errors">{{ $tn('maintenance.recompute.errorCount', stat(s).errors) }}</span>
+                        </div>
+                    </div>
+
+                    <p v-if="error" class="lb-set-error lb-rc-error" role="alert" data-testid="recompute-error">{{ error }}</p>
+
+                    <div class="lb-rc-foot">
+                        <span class="lb-mono lb-rc-foot-text" :class="{ 'is-ok': view === 'done' && !run.errors, 'is-warn': view === 'done' && run.errors }"
+                              data-testid="recompute-foot">{{ footText }}</span>
+                        <button v-if="view === 'running'" type="button" class="lb-btn" data-testid="recompute-cancel" @click="cancel">
+                            {{ $t('common.cancel') }}
+                        </button>
+                        <button v-else type="button" class="lb-btn" data-testid="recompute-start"
+                                :disabled="!chosenSteps.length" @click="start">
+                            <span class="lb-ai-btn-icon" v-html="icons.refresh"></span>
+                            {{ view === 'done' ? $t('maintenance.recompute.again') : $t('maintenance.recompute.start') }}
+                        </button>
+                    </div>
+                </div>
+            </section>
+        </div>
+    `,
+    data() {
+        const chosen = {};
+        for (const s of RECOMPUTE_STEPS) chosen[s] = RECOMPUTE_DEFAULT.includes(s);
+        return {
+            steps: RECOMPUTE_STEPS,
+            chosen,
+            run: recomputeRun,
+            indexStatus: null,
+            error: '',
+            icons: RECOMPUTE_ICONS,
+        };
+    },
+    computed: {
+        // Running shows any run (one at a time, cancellable here too); the
+        // result only of a run started in this block.
+        view() {
+            if (this.run.state === 'running') return 'running';
+            if (this.run.state === 'done' && this.run.source === 'refresh') return 'done';
+            return 'ready';
+        },
+        indexState() {
+            return searchIndexState(this.indexStatus);
+        },
+        chosenSteps() {
+            return this.steps.filter((s) => this.isChosen(s));
+        },
+        footText() {
+            if (this.view === 'running') {
+                return t('maintenance.recompute.stepOf', { n: this.run.steps.indexOf(this.run.step) + 1, total: this.run.steps.length });
+            }
+            if (this.view === 'done') return tn('maintenance.recompute.finished', this.run.errors);
+            return t('maintenance.recompute.chosen', { n: this.chosenSteps.length, total: this.steps.length });
+        },
+    },
+    watch: {
+        // After any run the index may have changed (stale marker).
+        'run.state'(now, before) {
+            if (before === 'running') this.loadIndexStatus();
+        },
+    },
+    created() {
+        this.loadIndexStatus();
+    },
+    activated() {
+        if (this._shown) this.loadIndexStatus();
+        this._shown = true;
+    },
+    methods: {
+        async loadIndexStatus() {
             try {
-                let url = '/api/export/preview?';
-                if (this.exportCategoryId) url += `category_id=${this.exportCategoryId}&`;
-                this.exportPreview = await api(url);
-                this.exportPreviewExpanded = false;
+                this.indexStatus = await api('/api/maintenance/embeddings/status');
             } catch (e) {
-                this.exportPreview = { count: null, papers: [] };
+                this.indexStatus = null;
             }
         },
-        handleDrop(event) {
-            this.dragOver = false;
-            const file = event.dataTransfer.files[0];
-            if (file && file.name.endsWith('.ris')) {
-                this.uploadRisFile(file);
-            }
+        // The search index needs a bound embedding role; the server would
+        // refuse it anyway.
+        selectable(step) {
+            return step !== 'search_index' || this.indexState !== 'off';
         },
-        handleFileSelect(event) {
-            const file = event.target.files[0];
-            if (file) {
-                this.uploadRisFile(file);
-            }
+        isChosen(step) {
+            return !!this.chosen[step] && this.selectable(step);
         },
-        async uploadRisFile(file) {
-            this.importing = true;
-            this.importResult = null;
+        toggle(step) {
+            this.chosen[step] = !this.isChosen(step);
+        },
+        helpFor(step) {
+            if (step === 'search_index' && this.indexState === 'off') return t('maintenance.recompute.indexOff');
+            return t('maintenance.recompute.help.' + step);
+        },
+        trailState(step) {
+            const at = this.run.steps.indexOf(this.run.step);
+            const i = this.run.steps.indexOf(step);
+            if (i < at) return 'done';
+            return i === at ? 'current' : 'next';
+        },
+        stat(step) {
+            return recomputeStat(step);
+        },
+        formatCount,
+        async start() {
+            this.error = '';
+            const finished = await startRecompute(this.chosenSteps, 'refresh');
+            if (!finished && this.run.error) this.error = this.run.error;
+        },
+        cancel() {
+            cancelRecompute();
+        },
+    },
+};
+
+
+// --- Settings → Backup ---------------------------------------------------------
+// The backup folder, a backup now, the automatic schedule and what the folder
+// holds (routers/backup.py, backup.py). Whether the PDFs go along is asked
+// every time: the dialog before each manual run, and once — explicitly, with
+// no preselection — for the automatic ones. LocalBib never deletes a backup;
+// the section says so where it matters. While a run is under way (an
+// automatic one, too) the section reads GET /api/backup once a second.
+const BACKUP_INTERVALS = ['off', 'daily', 'weekly', 'monthly'];
+const BACKUP_RESTORE_STEPS = ['step1', 'step2', 'step3', 'step4', 'step5', 'step6'];
+const BACKUP_POLL_MS = 1000;
+// Roughly how many automatic backups one month brings, for the growth hint.
+const BACKUP_PER_MONTH = { daily: 30, weekly: 4, monthly: 1 };
+
+function formatBytes(bytes) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let n = Number(bytes || 0);
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return new Intl.NumberFormat(uiLocale(), { maximumFractionDigits: i === 0 ? 0 : 1 }).format(n) + ' ' + units[i];
+}
+
+// A failed run's reason; the disk-space numbers are formatted here, not by the server.
+function backupErrorText(outcome) {
+    const params = { ...(outcome.params || {}) };
+    for (const key of ['needed', 'free']) {
+        if (typeof params[key] === 'number') params[key] = formatBytes(params[key]);
+    }
+    return translateDetail({ code: outcome.error, params });
+}
+
+const SettingsBackupSection = {
+    name: 'SettingsBackupSection',
+    components: { SettingsFieldStatus },
+    mixins: [SettingsAutosave],
+    template: `
+        <div class="lb-set-body lb-bk" data-settings-section="backup">
+            <p class="lb-set-sub" style="margin-top:0">{{ $t('settings.backup.intro') }}</p>
+            <p v-if="loadError" class="lb-set-error" role="alert" data-testid="backup-load-error">{{ loadError }}</p>
+
+            <template v-if="state">
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('settings.backup.folderHeading') }}</h2>
+                <div class="lb-set-card">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.backup.folder') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.backup.folderHint') }}</div>
+                            <code v-if="state.folder" class="lb-set-path" data-testid="backup-folder">{{ state.folder }}</code>
+                            <span v-else class="lb-set-note" data-testid="backup-folder-none">{{ $t('settings.backup.folderNone') }}</span>
+                        </div>
+                        <div v-if="!folderEdit" class="lb-set-control">
+                            <button v-if="state.folder" type="button" class="lb-btn" data-testid="backup-folder-open" @click="openFolder">
+                                {{ $t('settings.folders.open') }}
+                            </button>
+                            <button type="button" class="lb-btn" :class="{ 'lb-btn-primary': !state.folder }"
+                                    data-testid="backup-folder-change" @click="editFolder">
+                                {{ state.folder ? $t('settings.backup.folderChange') : $t('settings.backup.folderChoose') }}
+                            </button>
+                        </div>
+                    </div>
+                    <div v-if="folderEdit" class="lb-set-pad lb-set-divide lb-set-fields" data-testid="backup-folder-edit">
+                        <div class="lb-field">
+                            <label class="lb-set-label" for="backup-folder-input">{{ $t('settings.backup.folderNew') }}</label>
+                            <input id="backup-folder-input" class="lb-input lb-mono" type="text" autocomplete="off"
+                                   v-model="folderEdit.path" data-testid="backup-folder-input"
+                                   :placeholder="$t('settings.backup.folderPlaceholder')"
+                                   @keydown.enter.prevent="saveFolder" @keydown.esc="folderEdit = null" />
+                            <p class="lb-set-hint">{{ $t('settings.backup.folderInputHint') }}</p>
+                        </div>
+                        <p v-if="folderEdit.error" class="lb-set-error" role="alert" data-testid="backup-folder-error">{{ folderEdit.error }}</p>
+                        <div class="lb-set-dialog-actions">
+                            <button type="button" class="lb-btn" data-testid="backup-folder-cancel" @click="folderEdit = null">{{ $t('common.cancel') }}</button>
+                            <button type="button" class="lb-btn lb-btn-primary" data-testid="backup-folder-save"
+                                    :disabled="folderEdit.busy || !folderEdit.path.trim()" @click="saveFolder">{{ $t('common.save') }}</button>
+                        </div>
+                    </div>
+                    <div v-if="folderWarning" class="lb-ctx-wrap" data-testid="backup-folder-warning" :data-warning="folderWarning">
+                        <div role="status" class="lb-ctx-hint is-warn">
+                            <span class="lb-ctx-icon" v-html="icons.warn"></span>
+                            <div class="lb-ctx-text">
+                                <div class="lb-ctx-title">{{ $t('settings.backup.warning.' + folderWarning + '.title') }}</div>
+                                <div class="lb-ctx-body">{{ $t('settings.backup.warning.' + folderWarning + '.text') }}</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-if="openError" class="lb-set-pad lb-set-divide">
+                        <p class="lb-set-error" role="alert">{{ openError }}</p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('settings.backup.nowHeading') }}</h2>
+                <div class="lb-set-card lb-rc" data-testid="backup-now" :data-state="state.run ? 'running' : 'ready'">
+                    <div v-if="!state.run" class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label" data-testid="backup-newest">{{ newestLine }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.backup.nowHint') }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <button type="button" class="lb-btn lb-btn-primary" data-testid="backup-start"
+                                    :disabled="!state.folder" @click="ask = true">
+                                <span class="lb-ai-btn-icon" v-html="icons.backup"></span>
+                                {{ $t('settings.backup.start') }}
+                            </button>
+                        </div>
+                    </div>
+                    <div v-else role="status" class="lb-rc-progress" data-testid="backup-progress">
+                        <div class="lb-rc-progress-head">
+                            <span class="lb-rc-current" data-testid="backup-phase">{{ runLine }}</span>
+                            <span class="lb-mono lb-rc-count">{{ runCount }}</span>
+                        </div>
+                        <div class="lb-rc-bar"><div :style="{ width: runPercent + '%' }"></div></div>
+                    </div>
+                    <div v-if="lastDone" class="lb-ctx-wrap">
+                        <div role="status" class="lb-ctx-done" data-testid="backup-done">
+                            <span class="lb-ctx-done-icon" v-html="icons.check"></span>
+                            {{ $t('settings.backup.done', { size: formatBytes(state.last.bytes) }) }}
+                        </div>
+                        <p v-if="state.last.skipped" class="lb-set-hint" data-testid="backup-skipped">{{ $tn('settings.backup.skipped', state.last.skipped) }}</p>
+                    </div>
+                    <p v-if="lastFailed" class="lb-set-error lb-rc-error" role="alert" data-testid="backup-error">
+                        {{ $t('settings.backup.failed', { reason: backupErrorText(state.last) }) }}
+                    </p>
+                    <p v-if="runError" class="lb-set-error lb-rc-error" role="alert" data-testid="backup-run-error">{{ runError }}</p>
+                </div>
+            </section>
+
+            <section class="lb-set-block">
+                <div>
+                    <h2 class="lb-set-h">{{ $t('settings.backup.autoHeading') }}</h2>
+                    <p class="lb-set-sub">{{ $t('settings.backup.autoHint') }}</p>
+                </div>
+                <div class="lb-set-card" data-testid="backup-auto">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.backup.scope') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.backup.scopeHint', { full: formatBytes(fullBytes), data: formatBytes(dataBytes) }) }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <settings-field-status :state="fieldState('AUTO_BACKUP_PDFS')" data-field-status="AUTO_BACKUP_PDFS" />
+                            <div class="lb-segmented" role="radiogroup" :aria-label="$t('settings.backup.scope')">
+                                <button v-for="opt in [true, false]" :key="String(opt)" type="button" role="radio"
+                                        class="lb-seg" :class="{ 'is-on': state.auto_pdfs === opt }"
+                                        :aria-checked="state.auto_pdfs === opt ? 'true' : 'false'"
+                                        :data-testid="'backup-scope-' + (opt ? 'with-pdfs' : 'data-only')" @click="setScope(opt)">
+                                    {{ opt ? $t('settings.backup.withPdfs') : $t('settings.backup.dataOnly') }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.backup.interval') }}</div>
+                            <div class="lb-set-hint" data-testid="backup-auto-state">{{ autoLine }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <settings-field-status :state="fieldState('AUTO_BACKUP')" data-field-status="AUTO_BACKUP" />
+                            <div class="lb-segmented" role="radiogroup" :aria-label="$t('settings.backup.interval')">
+                                <button v-for="iv in intervals" :key="iv" type="button" role="radio"
+                                        class="lb-seg" :class="{ 'is-on': state.auto === iv }"
+                                        :aria-checked="state.auto === iv ? 'true' : 'false'"
+                                        :disabled="iv !== 'off' && !autoPossible"
+                                        :data-testid="'backup-interval-' + iv" @click="setAutoInterval(iv)">
+                                    {{ $t('settings.backup.every.' + iv) }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-if="state.auto_problem" class="lb-ctx-wrap" data-testid="backup-auto-problem">
+                        <div role="alert" class="lb-ctx-hint is-warn">
+                            <span class="lb-ctx-icon" v-html="icons.warn"></span>
+                            <div class="lb-ctx-text">
+                                <div class="lb-ctx-title">{{ $t('settings.backup.autoFailed', { when: formatCheckedAt(state.auto_problem.finished_at) }) }}</div>
+                                <div class="lb-ctx-body">{{ backupErrorText(state.auto_problem) }}</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div v-if="growthLine" class="lb-set-pad lb-set-divide">
+                        <p class="lb-set-hint" data-testid="backup-growth">{{ growthLine }}</p>
+                    </div>
+                </div>
+            </section>
+
+            <section v-if="state.folder" class="lb-set-block">
+                <div class="lb-set-h-row">
+                    <h2 class="lb-set-h">{{ $t('settings.backup.listHeading') }}</h2>
+                    <span class="lb-set-count" data-testid="backup-count">{{ $tn('settings.backup.count', state.count) }} · {{ formatBytes(state.total_bytes) }}</span>
+                </div>
+                <div class="lb-set-card">
+                    <p v-if="!state.count" class="lb-set-pad lb-set-hint" data-testid="backup-list-empty">{{ $t('settings.backup.listEmpty') }}</p>
+                    <ul v-else class="lb-set-perms" data-testid="backup-list">
+                        <li v-for="b in state.backups" :key="b.name" class="lb-set-perm lb-bk-item" :data-backup="b.name">
+                            <span class="lb-bk-when">{{ formatCheckedAt(b.created_at) }}</span>
+                            <span class="lb-set-tag">{{ b.include_pdfs ? $t('settings.backup.withPdfs') : $t('settings.backup.dataOnly') }}</span>
+                            <span class="lb-mono lb-set-note lb-bk-size">{{ formatBytes(b.bytes) }}</span>
+                        </li>
+                    </ul>
+                    <p v-if="state.count > state.backups.length" class="lb-set-pad lb-set-divide lb-set-note">
+                        {{ $tn('settings.backup.listMore', state.count - state.backups.length) }}
+                    </p>
+                    <p v-if="state.partial.length" class="lb-set-pad lb-set-divide lb-set-note" data-testid="backup-partial">
+                        {{ $tn('settings.backup.partial', state.partial.length) }}
+                    </p>
+                    <div class="lb-set-pad lb-set-divide">
+                        <p class="lb-set-hint" data-testid="backup-never-deleted">{{ $t('settings.backup.neverDeleted') }}</p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="lb-set-block">
+                <button type="button" class="lb-set-advanced" data-testid="backup-restore-toggle"
+                        :aria-expanded="restoreOpen ? 'true' : 'false'" @click="restoreOpen = !restoreOpen">
+                    <span class="lb-set-chevron" :class="{ 'is-open': restoreOpen }" aria-hidden="true">&#9656;</span>
+                    <span class="lb-set-h">{{ $t('settings.backup.restore.title') }}</span>
+                </button>
+                <div v-if="restoreOpen" class="lb-set-card lb-set-pad lb-set-fields" data-testid="backup-restore">
+                    <ol class="lb-bk-steps">
+                        <li v-for="s in restoreSteps" :key="s">{{ $t('settings.backup.restore.' + s) }}</li>
+                    </ol>
+                    <p class="lb-set-hint">{{ $t('settings.backup.restore.keys') }}</p>
+                </div>
+            </section>
+            </template>
+
+            <div v-if="ask" class="lb-set-scrim" data-testid="backup-ask" @keydown.esc="ask = false" @click.self="ask = false">
+                <div class="lb-set-dialog" role="dialog" aria-modal="true" aria-labelledby="backup-ask-title">
+                    <h2 id="backup-ask-title" class="lb-set-h">{{ $t('settings.backup.ask.title') }}</h2>
+                    <p class="lb-set-hint">{{ $t('settings.backup.ask.body') }}</p>
+                    <div class="lb-bk-choices">
+                        <button type="button" class="lb-bk-choice" data-testid="backup-ask-with-pdfs" @click="run(true)">
+                            <span class="lb-bk-choice-title">{{ $t('settings.backup.withPdfs') }}</span>
+                            <span class="lb-bk-choice-size">{{ $t('settings.backup.ask.about', { size: formatBytes(fullBytes) }) }}</span>
+                            <span class="lb-set-note">{{ $tn('settings.backup.ask.pdfCount', pdfCount) }}</span>
+                        </button>
+                        <button type="button" class="lb-bk-choice" data-testid="backup-ask-data-only" @click="run(false)">
+                            <span class="lb-bk-choice-title">{{ $t('settings.backup.dataOnly') }}</span>
+                            <span class="lb-bk-choice-size">{{ $t('settings.backup.ask.about', { size: formatBytes(dataBytes) }) }}</span>
+                            <span class="lb-set-note">{{ $t('settings.backup.ask.withoutPdfs') }}</span>
+                        </button>
+                    </div>
+                    <div class="lb-set-dialog-actions">
+                        <button type="button" class="lb-btn" data-testid="backup-ask-cancel" @click="ask = false">{{ $t('common.cancel') }}</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `,
+    data() {
+        return {
+            state: null, loadError: '', folderEdit: null, openError: '', ask: false, runError: '',
+            restoreOpen: false, intervals: BACKUP_INTERVALS, restoreSteps: BACKUP_RESTORE_STEPS,
+            icons: { ...RECOMPUTE_ICONS, backup: SETTINGS_ICONS.backup },
+            // The run this section saw start, so its result shows only here.
+            watched: false,
+        };
+    },
+    computed: {
+        estimate() {
+            return (this.state && this.state.estimate) || { data_bytes: 0, pdf_bytes: 0, pdf_count: 0 };
+        },
+        dataBytes() {
+            return this.estimate.data_bytes;
+        },
+        fullBytes() {
+            return this.estimate.data_bytes + this.estimate.pdf_bytes;
+        },
+        pdfCount() {
+            return this.estimate.pdf_count;
+        },
+        folderWarning() {
+            const s = this.state;
+            if (!s || !s.folder) return '';
+            if (!s.folder_state.exists) return 'missing';
+            if (s.folder_state.same_drive) return 'sameDrive';
+            return '';
+        },
+        newestLine() {
+            const b = this.state.backups[0];
+            if (!b) return t('settings.backup.noneYet');
+            return t('settings.backup.newest', {
+                when: formatCheckedAt(b.created_at),
+                scope: b.include_pdfs ? t('settings.backup.withPdfs') : t('settings.backup.dataOnly'),
+                size: formatBytes(b.bytes),
+            });
+        },
+        runPercent() {
+            const run = this.state.run;
+            return run ? run.percent || 0 : 0;
+        },
+        runLine() {
+            const run = this.state.run;
+            const kind = run.kind === 'auto' ? t('settings.backup.runAuto') : t('settings.backup.runManual');
+            return kind + ' · ' + t('settings.backup.phase.' + (run.phase || 'database'));
+        },
+        runCount() {
+            const run = this.state.run;
+            if (run.phase === 'pdfs' && run.total) {
+                return formatCount(run.done) + ' / ' + formatCount(run.total) + ' · ' + run.percent + ' %';
+            }
+            return '';
+        },
+        lastDone() {
+            const last = this.state.last;
+            return this.watched && !this.state.run && last && last.ok && last.kind === 'manual';
+        },
+        lastFailed() {
+            const last = this.state.last;
+            return this.watched && !this.state.run && last && !last.ok && last.kind === 'manual';
+        },
+        // An automatic backup needs a folder and the answer to the PDF question.
+        autoPossible() {
+            return !!(this.state.folder && this.state.auto_pdfs !== null && this.state.auto_pdfs !== undefined);
+        },
+        autoLine() {
+            const s = this.state;
+            if (!this.autoPossible) {
+                return s.folder ? t('settings.backup.autoNeedsScope') : t('settings.backup.autoNeedsFolder');
+            }
+            if (s.auto_effective === 'off') return t('settings.backup.autoOff');
+            if (s.run && s.run.kind === 'auto') return t('settings.backup.autoRunning');
+            const next = s.next_auto_at ? new Date(s.next_auto_at) : null;
+            if (!next || next <= new Date()) return t('settings.backup.autoDue');
+            return t('settings.backup.autoNext', { when: formatCheckedAt(s.next_auto_at) });
+        },
+        growthLine() {
+            const s = this.state;
+            if (!s || s.auto_effective === 'off') return '';
+            const each = s.auto_pdfs ? this.fullBytes : this.dataBytes;
+            return t('settings.backup.growth', {
+                size: formatBytes(each), month: formatBytes(each * (BACKUP_PER_MONTH[s.auto_effective] || 1)),
+            });
+        },
+    },
+    created() {
+        this.load();
+    },
+    activated() {
+        if (this._shown) this.load();
+        this._shown = true;
+    },
+    deactivated() {
+        clearTimeout(this._poll);
+    },
+    beforeUnmount() {
+        clearTimeout(this._poll);
+    },
+    methods: {
+        formatBytes,
+        formatCheckedAt,
+        backupErrorText,
+        show(state) {
+            this.state = state;
+            clearTimeout(this._poll);
+            if (state.run) this._poll = setTimeout(() => this.load(), BACKUP_POLL_MS);
+        },
+        async load() {
             try {
-                const formData = new FormData();
-                formData.append('file', file);
-                const resp = await fetch('/api/import/ris', {
-                    method: 'POST',
-                    body: formData,
-                });
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({}));
-                    throw new Error(err.detail || 'Import fehlgeschlagen');
-                }
-                this.importResult = await resp.json();
-                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+                this.show(await api('/api/backup'));
+                this.loadError = '';
             } catch (e) {
-                alert('Import fehlgeschlagen: ' + e.message);
+                this.loadError = e.message;
             }
-            this.importing = false;
         },
+        editFolder() {
+            this.openError = '';
+            this.folderEdit = { path: this.state.folder || '', busy: false, error: '' };
+        },
+        async saveFolder() {
+            const edit = this.folderEdit;
+            if (!edit || edit.busy || !edit.path.trim()) return;
+            edit.busy = true;
+            edit.error = '';
+            try {
+                this.show(await api('/api/backup/settings', { method: 'PUT', body: JSON.stringify({ folder: edit.path.trim() }) }));
+                this.folderEdit = null;
+            } catch (e) {
+                edit.error = e.message;
+                edit.busy = false;
+            }
+        },
+        async openFolder() {
+            this.openError = '';
+            try {
+                await api('/api/system/open-folder', { method: 'POST', body: JSON.stringify({ folder: 'backups' }) });
+            } catch (e) {
+                this.openError = e.message;
+            }
+        },
+        saveBackupSetting(key, body) {
+            return this.track(key, async () => {
+                this.show(await api('/api/backup/settings', { method: 'PUT', body: JSON.stringify(body) }));
+            });
+        },
+        setScope(withPdfs) {
+            if (this.state.auto_pdfs === withPdfs) return;
+            return this.saveBackupSetting('AUTO_BACKUP_PDFS', { auto_pdfs: withPdfs });
+        },
+        setAutoInterval(interval) {
+            if (this.state.auto === interval) return;
+            return this.saveBackupSetting('AUTO_BACKUP', { auto: interval });
+        },
+        async run(includePdfs) {
+            this.ask = false;
+            this.runError = '';
+            try {
+                this.watched = true;
+                this.show(await api('/api/backup/run', { method: 'POST', body: JSON.stringify({ include_pdfs: includePdfs }) }));
+            } catch (e) {
+                this.runError = e.message;
+            }
+        },
+    },
+};
+
+
+// --- Settings → License & About (ADR-0015) ------------------------------------
+const SOURCE_REPO_URL = 'https://github.com/tobiasbartlog/localbib';
+const SETTINGS_FOLDER_ROWS = [
+    { name: 'library', key: 'settings.about.folder.library' },
+    { name: 'settings', key: 'settings.about.folder.settings' },
+    { name: 'logs', key: 'settings.about.folder.logs' },
+];
+
+const SettingsAboutSection = {
+    name: 'SettingsAboutSection',
+    mixins: [SettingsFolders],
+    template: `
+        <div class="lb-set-body" data-settings-section="about" data-testid="license-panel">
+            <section class="lb-set-block">
+                <h2 class="lb-set-h">{{ $t('license.keyHeading') }}</h2>
+                <div class="lb-set-card lb-set-pad">
+                    <!-- Aktiviert: einmal geprüft, danach nie wieder online. -->
+                    <div v-if="licenseActivated" data-testid="license-activated"
+                         class="flex items-center gap-2 text-sm text-accent-ink bg-accent-soft border border-accent-soft rounded-lg px-4 py-3">
+                        <span>✓</span>
+                        <span class="font-medium">{{ $t('license.activated') }}<span v-if="licenseKeyMasked"> — {{ $t('license.keyMasked', { key: licenseKeyMasked }) }}</span>.</span>
+                    </div>
+                    <p v-if="licenseActivated" class="lb-set-hint mt-3">
+                        {{ $t('license.checkedOnce') }}
+                    </p>
+
+                    <!-- Noch nicht aktiviert: Eingabe + Kauflink. -->
+                    <template v-else>
+                        <!-- Laufende Testphase (#144). Fehlt sie — Quellinstallation —
+                             steht hier nichts: dort gibt es nichts abzuzaehlen. -->
+                        <p v-if="licenseTrial && !licenseTrial.expired"
+                           data-testid="license-trial"
+                           class="text-sm text-accent-ink bg-accent-soft border border-accent-soft rounded-lg px-4 py-3 mb-4">
+                            {{ $tn('license.trialRunning', licenseTrial.days_remaining) }}
+                        </p>
+                        <!-- Altbestand aus dem früheren Shop: der Weg zum kostenlosen
+                             Code steht hier, nicht erst hinter einer Sperre. -->
+                        <p v-if="licenseLegacyNote"
+                           data-testid="license-legacy-note"
+                           class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-4 py-3 mb-4">
+                            {{ licenseLegacyNote }}
+                        </p>
+                        <p class="lb-set-hint mb-5">
+                            {{ $t('license.enterKeyHint') }}
+                        </p>
+                        <div class="flex gap-3 items-start mb-3">
+                            <input v-model="licenseKey"
+                                   data-testid="license-key-input"
+                                   type="text"
+                                   spellcheck="false"
+                                   placeholder="LB--XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+                                   @keyup.enter="activateLicense"
+                                   class="lb-input flex-1" />
+                            <button type="button" @click="activateLicense"
+                                    data-testid="license-activate"
+                                    :disabled="licenseLoading || !licenseKey"
+                                    class="lb-btn lb-btn-primary">
+                                <span v-if="licenseLoading">{{ $t('license.activating') }}</span>
+                                <span v-else>{{ $t('license.activate') }}</span>
+                            </button>
+                        </div>
+                        <p v-if="licenseCheckoutUrl" class="lb-set-hint">
+                            {{ $t('gate.noLicenseYet') }}
+                            <a :href="licenseCheckoutUrl" target="_blank" rel="noopener"
+                               data-testid="license-buy-link"
+                               class="text-accent underline">{{ $t('license.buy') }}</a>
+                        </p>
+                    </template>
+
+                    <p v-if="licenseMessage"
+                       data-testid="license-message"
+                       class="text-sm mt-3"
+                       :class="licenseError ? 'text-red-600' : 'text-accent'">
+                        {{ licenseMessage }}
+                    </p>
+                </div>
+            </section>
+
+            <section class="lb-set-block" data-testid="about-version">
+                <h2 class="lb-set-h">{{ $t('settings.about.versionHeading') }}</h2>
+                <div class="lb-set-card">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label" data-testid="about-version-label">{{ $t('settings.about.version', { version: version }) }}</div>
+                            <div class="lb-set-hint" data-testid="about-update-status">{{ updateStatus }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <button type="button" class="lb-btn" data-testid="about-check-update"
+                                    :disabled="checking" @click="checkUpdate">
+                                {{ $t('settings.about.checkUpdates') }}
+                            </button>
+                        </div>
+                    </div>
+                    <div v-if="update" class="lb-set-pad lb-set-divide" data-testid="about-update-found">
+                        <div class="lb-set-label">{{ $t('settings.about.updateFound', { version: update.latest }) }}</div>
+                        <p class="lb-set-hint">{{ $t('settings.about.updateHint') }}</p>
+                        <p v-if="updateMessage" class="text-sm" :class="updateFailed ? 'text-red-600' : ''"
+                           data-testid="about-update-message">{{ updateMessage }}</p>
+                        <div class="lb-set-dialog-actions">
+                            <a v-if="update.release_url" :href="update.release_url" target="_blank" rel="noopener"
+                               class="lb-btn" data-testid="about-update-notes">{{ $t('settings.about.whatsNew') }}</a>
+                            <button v-if="update.can_auto_update" type="button" class="lb-btn lb-btn-primary"
+                                    data-testid="about-update-now" :disabled="updateRunning" @click="installUpdate">
+                                {{ updateRunning ? $t('update.running') : $t('update.now') }}
+                            </button>
+                            <a v-else-if="update.download_url" :href="update.download_url" target="_blank" rel="noopener"
+                               class="lb-btn lb-btn-primary" data-testid="about-update-download">{{ $t('update.openReleasePage') }}</a>
+                        </div>
+                    </div>
+                    <div v-else-if="updateMessage" class="lb-set-pad lb-set-divide">
+                        <p class="lb-set-error" role="alert" data-testid="about-update-check-error">{{ updateMessage }}</p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="lb-set-block" data-testid="about-folders">
+                <div>
+                    <h2 class="lb-set-h">{{ $t('settings.about.foldersHeading') }}</h2>
+                    <p class="lb-set-sub">{{ $t('settings.about.foldersHint') }}</p>
+                </div>
+                <div class="lb-set-card">
+                    <div v-for="row in folderRows" :key="row.name" class="lb-set-row" :data-folder="row.name">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t(row.key) }}</div>
+                            <code class="lb-set-path" :data-testid="'about-folder-' + row.name">{{ folderPath(row.name) }}</code>
+                        </div>
+                        <div class="lb-set-control">
+                            <span v-if="copied === row.name" class="lb-set-status" role="status"
+                                  :data-testid="'about-copied-' + row.name">{{ $t('settings.about.copied') }}</span>
+                            <button type="button" class="lb-btn lb-btn-icon" :data-testid="'about-copy-' + row.name"
+                                    :aria-label="$t('settings.about.copyPath', { folder: $t(row.key) })"
+                                    :title="$t('settings.about.copyPath', { folder: $t(row.key) })"
+                                    @click="copyPath(row.name)">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                            </button>
+                            <button type="button" class="lb-btn" :data-testid="'about-open-' + row.name"
+                                    @click="openFolder(row.name)">{{ $t('settings.folders.open') }}</button>
+                        </div>
+                    </div>
+                    <div v-if="folderError" class="lb-set-pad lb-set-divide">
+                        <p class="lb-set-error" role="alert" data-testid="about-folder-error">{{ folderError }}</p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="lb-set-block" data-testid="about-source">
+                <h2 class="lb-set-h">{{ $t('settings.about.sourceHeading') }}</h2>
+                <div class="lb-set-card lb-set-pad">
+                    <p class="lb-set-hint">{{ $t('settings.about.sourceText') }}</p>
+                    <a :href="sourceUrl" target="_blank" rel="noopener" class="text-accent underline"
+                       data-testid="about-source-link">{{ $t('settings.about.sourceLink') }}</a>
+                </div>
+            </section>
+
+            <section class="lb-set-block" data-testid="about-setup">
+                <div class="lb-set-card">
+                    <div class="lb-set-row">
+                        <div class="lb-set-row-text">
+                            <div class="lb-set-label">{{ $t('settings.about.setupHeading') }}</div>
+                            <div class="lb-set-hint">{{ $t('settings.about.setupHint') }}</div>
+                        </div>
+                        <div class="lb-set-control">
+                            <button type="button" class="lb-btn" data-testid="about-restart-setup" @click="restartSetup">
+                                {{ $t('settings.about.setupButton') }}
+                            </button>
+                        </div>
+                    </div>
+                    <div v-if="setupError" class="lb-set-pad lb-set-divide">
+                        <p class="lb-set-error" role="alert" data-testid="about-setup-error">{{ setupError }}</p>
+                    </div>
+                </div>
+            </section>
+        </div>
+    `,
+    data() {
+        return {
+            folderRows: SETTINGS_FOLDER_ROWS,
+            sourceUrl: SOURCE_REPO_URL,
+            copied: '',
+            checking: false,
+            checked: false,
+            update: null,
+            updateRunning: false,
+            updateFailed: false,
+            updateMessage: '',
+            setupError: '',
+            licenseKey: '',
+            licenseKeyMasked: '',
+            licenseLoading: false,
+            licenseMessage: '',
+            licenseError: false,
+            licenseActivated: false,
+            licenseCheckoutUrl: '',
+            licenseTrial: null,
+            licenseLegacyNote: '',
+        };
+    },
+    computed: {
+        version() {
+            return this.systemInfo ? this.systemInfo.version : '';
+        },
+        updateStatus() {
+            if (this.checking) return t('settings.about.checking');
+            if (this.update) return t('settings.about.updateFoundShort');
+            return this.checked ? t('settings.about.upToDate') : t('settings.about.notChecked');
+        },
+    },
+    created() {
+        this.loadLicenseStatus();
+        this.loadSystemInfo();
+        // An activation elsewhere (the trial gate) is news here too (SPA-7):
+        // the section stays alive under <keep-alive> and loaded only once.
+        // An activation this section made itself is already on screen.
+        this._onLicenseActivated = () => { if (!this.licenseActivated) this.loadLicenseStatus(); };
+        window.addEventListener('license-activated', this._onLicenseActivated);
+    },
+    // Kept alive: created() already read the status on the first mount;
+    // coming back reads it again (an activation may have happened meanwhile).
+    activated() {
+        if (this._shown) this.loadLicenseStatus();
+        this._shown = true;
+    },
+    unmounted() {
+        window.removeEventListener('license-activated', this._onLicenseActivated);
+    },
+    methods: {
+        folderPath(name) {
+            const folders = this.systemInfo && this.systemInfo.folders;
+            return (folders && folders[name]) || '';
+        },
+        async copyPath(name) {
+            const path = this.folderPath(name);
+            if (!path) return;
+            try {
+                await navigator.clipboard.writeText(path);
+                this.copied = name;
+                clearTimeout(this._copiedTimer);
+                this._copiedTimer = setTimeout(() => { this.copied = ''; }, 2000);
+            } catch (e) {
+                this.folderError = t('settings.about.copyFailed');
+            }
+        },
+        // The existing version check (cached on the server); a hit offers the
+        // existing one-click update, nothing new.
+        async checkUpdate() {
+            if (this.checking) return;
+            this.checking = true;
+            this.updateMessage = '';
+            try {
+                const result = await api('/api/version-check');
+                this.update = result && result.update_available ? result : null;
+                this.checked = true;
+            } catch (e) {
+                this.update = null;
+                this.checked = false;
+                this.updateMessage = e.message;
+                this.updateFailed = true;
+            }
+            this.checking = false;
+        },
+        async installUpdate() {
+            if (this.updateRunning) return;
+            this.updateRunning = true;
+            this.updateFailed = false;
+            this.updateMessage = t('update.downloading');
+            try {
+                const result = await api('/api/update/install', { method: 'POST' });
+                this.updateMessage = (result && result.message)
+                    ? translateDetail(result.message) : t('update.installing');
+            } catch (e) {
+                this.updateRunning = false;
+                this.updateFailed = true;
+                this.updateMessage = e.message;
+            }
+        },
+        // Forget that the first-run dialog was answered, then show it now (the
+        // App root owns the dialog). Nothing else is touched.
+        async restartSetup() {
+            this.setupError = '';
+            try {
+                await api('/api/settings', { method: 'PUT', body: JSON.stringify({ ONBOARDING_COMPLETED: 'false' }) });
+            } catch (e) {
+                this.setupError = e.message;
+                return;
+            }
+            window.dispatchEvent(new CustomEvent('restart-onboarding'));
+        },
+        // Latest wins: a reload (event, return to the section) can overlap
+        // with an older one or with the user's own activation; an answer
+        // that is no longer the newest request is dropped.
         async loadLicenseStatus() {
+            const ticket = (this._licenseTicket = (this._licenseTicket || 0) + 1);
             try {
                 const data = await api('/api/license/status');
+                if (ticket !== this._licenseTicket) return;
                 this.applyLicenseStatus(data);
             } catch(e) { /* silent */ }
         },
@@ -6570,6 +12603,9 @@ const SettingsPage = {
                     body: JSON.stringify({ key: this.licenseKey }),
                 });
                 if (result.activated) {
+                    // The activation answer is the newest truth: an older
+                    // status read still in flight must not overwrite it.
+                    this._licenseTicket = (this._licenseTicket || 0) + 1;
                     this.applyLicenseStatus(result);
                     this.licenseKey = '';
                     this.licenseError = false;
@@ -6590,14 +12626,202 @@ const SettingsPage = {
 };
 
 
+
+// --- The sections, the groups, the frame --------------------------------------
+// `key` names the section's texts (settings.section.<key>.title/.description).
+const SETTINGS_GROUPS = ['settings', 'addons', 'maintenance', 'system'];
+const SETTINGS_SECTIONS = [
+    { slug: 'general', key: 'general', group: 'settings', component: SettingsGeneralSection },
+    { slug: 'appearance', key: 'appearance', group: 'settings', component: SettingsAppearanceSection },
+    { slug: 'library', key: 'library', group: 'settings', component: SettingsLibrarySection },
+    { slug: 'sources', key: 'sources', group: 'settings', component: SettingsSourcesSection },
+    { slug: 'ai-models', key: 'aiModels', group: 'settings', component: SettingsAiModelsSection },
+    { slug: 'custom-fields', key: 'customFields', group: 'settings', component: SettingsCustomFieldsSection },
+    { slug: 'diagnosis', key: 'diagnosis', group: 'maintenance', component: SettingsDiagnosisSection },
+    { slug: 'refresh', key: 'refresh', group: 'maintenance', component: SettingsRefreshSection },
+    { slug: 'backup', key: 'backup', group: 'maintenance', component: SettingsBackupSection },
+    { slug: 'about', key: 'about', group: 'system', component: SettingsAboutSection },
+];
+
+const SettingsPage = {
+    name: 'SettingsPage',
+    components: { AddonIcon },
+    provide() {
+        // The Add-on page reads its card from the frame's list, so the head
+        // and the page never disagree about which Add-on is shown.
+        return { settingsAddon: (id) => this.addons.find((a) => a.id === id) || null };
+    },
+    template: `
+        <div class="lb-set" data-testid="settings-frame" :data-section="sectionSlug">
+            <nav class="lb-set-nav" :aria-label="$t('settings.nav.label')" data-testid="settings-nav">
+                <!-- Narrow window (< 1080 px): the app sidebar is hidden here,
+                     so the list itself leads back. -->
+                <router-link to="/" class="lb-set-link lb-set-back" data-testid="settings-back">
+                    <span class="lb-set-link-icon" v-html="navIcons.back"></span>
+                    <span class="lb-set-link-label">{{ $t('settings.nav.back') }}</span>
+                </router-link>
+                <template v-for="g in groups" :key="g.id">
+                    <div class="lb-set-group" :data-group="g.id">{{ $t('settings.group.' + g.id) }}</div>
+                    <router-link v-for="s in g.sections" :key="s.slug" :to="'/settings/' + s.slug"
+                                 class="lb-set-link" active-class="is-active" :data-testid="'settings-nav-' + s.slug">
+                        <span class="lb-set-link-icon" v-html="navIcons[s.slug]"></span>
+                        <span class="lb-set-link-label">{{ $t('settings.section.' + s.key + '.title') }}</span>
+                        <span v-if="s.slug === 'ai-models' && aiModelsDirty" class="lb-set-dot" role="img"
+                              :aria-label="$t('settings.aiModels.unsaved')" data-testid="ai-models-dirty-dot"></span>
+                        <span v-if="s.slug === 'diagnosis' && diagnosis.kinds" class="lb-set-pill"
+                              :class="'is-' + diagnosis.severity" data-testid="diagnosis-count"
+                              :aria-label="$tn('settings.nav.diagnosisCount', diagnosis.kinds)">{{ diagnosis.kinds }}</span>
+                    </router-link>
+                    <template v-if="g.id === 'addons'">
+                        <router-link v-for="a in addons" :key="a.id" :to="addonPath(a)"
+                                     class="lb-set-link" active-class="is-active" :data-testid="'settings-nav-addon-' + a.id">
+                            <addon-icon :addon="a" :size="16" />
+                            <span class="lb-set-link-label">{{ a.name }}</span>
+                        </router-link>
+                        <router-link to="/marketplace" class="lb-set-link is-more" data-testid="settings-nav-marketplace">
+                            <span class="lb-set-link-icon" v-html="navIcons.plus"></span>
+                            <span class="lb-set-link-label">{{ $t('settings.nav.moreInMarketplace') }}</span>
+                            <span class="lb-set-link-ext" v-html="navIcons.external"></span>
+                        </router-link>
+                    </template>
+                </template>
+            </nav>
+
+            <div class="lb-set-main">
+                <header class="lb-set-head" data-testid="settings-head">
+                    <div class="lb-set-eyebrow" data-testid="settings-head-group">{{ head.group }}</div>
+                    <div v-if="head.addon" class="lb-set-title-row">
+                        <addon-icon :addon="head.addon" :size="44" />
+                        <h1 class="lb-set-title" data-testid="settings-head-title">{{ head.title }}</h1>
+                        <span class="lb-set-badge" :class="{ 'is-ok': head.official }" data-testid="settings-addon-trust">
+                            {{ $t(head.official ? 'marketplace.trust.official' : 'marketplace.trust.thirdParty') }}
+                        </span>
+                        <span v-if="head.addon.installed_version" class="lb-set-version" data-testid="settings-addon-version">{{ head.addon.installed_version }}</span>
+                    </div>
+                    <h1 v-else class="lb-set-title" data-testid="settings-head-title">{{ head.title }}</h1>
+                    <p v-if="head.description" class="lb-set-desc" data-testid="settings-head-description">{{ head.description }}</p>
+                </header>
+
+                <router-view v-slot="{ Component, route }">
+                    <keep-alive :max="12">
+                        <component :is="Component" :key="route.path" />
+                    </keep-alive>
+                </router-view>
+            </div>
+        </div>
+    `,
+    data() {
+        return { addons: [], addonsLoaded: false, navIcons: SETTINGS_ICONS };
+    },
+    computed: {
+        groups() {
+            return SETTINGS_GROUPS.map((id) => ({ id, sections: SETTINGS_SECTIONS.filter((s) => s.group === id) }));
+        },
+        // The AI models section keeps an unsaved draft (#209).
+        aiModelsDirty() {
+            return aiModelsDraft.dirty;
+        },
+        diagnosis() {
+            return diagnosisCounter;
+        },
+        sectionSlug() {
+            const r = this.$route;
+            if (r.name === 'settings-addon') return 'addons/' + r.params.id;
+            return (r.meta && r.meta.settingsSlug) || '';
+        },
+        head() {
+            const r = this.$route;
+            if (r.name === 'settings-addon') {
+                const a = this.addons.find((x) => x.id === r.params.id) || null;
+                return {
+                    group: t('settings.group.addon'),
+                    title: a ? a.name : '',
+                    description: a ? a.tagline : '',
+                    addon: a,
+                    official: a ? addonIsOfficial(a) : false,
+                };
+            }
+            const s = SETTINGS_SECTIONS.find((x) => x.slug === this.sectionSlug);
+            if (!s) return { group: '', title: '', description: '', addon: null, official: false };
+            return {
+                group: t('settings.group.' + s.group),
+                title: t('settings.section.' + s.key + '.title'),
+                description: t('settings.section.' + s.key + '.description'),
+                addon: null,
+                official: false,
+            };
+        },
+    },
+    watch: {
+        '$route.params.id'() {
+            this.checkAddonRoute();
+        },
+    },
+    created() {
+        this._onAddonsChanged = () => this.loadAddons();
+        window.addEventListener(ADDON_EVENT, this._onAddonsChanged);
+        this.loadAddons();
+        this.loadDiagnosisCounter();
+    },
+    beforeUnmount() {
+        window.removeEventListener(ADDON_EVENT, this._onAddonsChanged);
+    },
+    methods: {
+        // The cheap pass only (`llm=false`): opening Settings must never fire an
+        // LLM test. The Diagnosis section runs the full check when it is opened.
+        async loadDiagnosisCounter() {
+            try {
+                const res = await api('/api/diagnosis?llm=false');
+                diagnosisCounter.set(res.findings || []);
+            } catch (e) {
+                // The counter is a courtesy; the section reports its own errors.
+            }
+        },
+        // The Marketplace's own source, without forcing the network round-trip
+        // the Marketplace view makes: opening Settings asks GitHub nothing new.
+        async loadAddons() {
+            try {
+                const data = await api('/api/marketplace?refresh=false');
+                const name = (a) => String(a.name || a.id);
+                this.addons = (data.addons || []).filter(addonHasSettingsPage)
+                    .sort((a, b) => name(a).localeCompare(name(b), uiLocale()));
+            } catch (e) {
+                this.addons = [];
+            }
+            this.addonsLoaded = true;
+            this.checkAddonRoute();
+        },
+        // An Add-on that is not (or no longer) running has no page: General.
+        checkAddonRoute() {
+            const r = this.$route;
+            if (r.name !== 'settings-addon' || !this.addonsLoaded) return;
+            if (!this.addons.some((a) => a.id === r.params.id)) this.$router.replace('/settings/general');
+        },
+        addonPath(a) {
+            return '/settings/addons/' + encodeURIComponent(a.id);
+        },
+    },
+};
+
+// /settings and every unknown slug land on General; `meta.settingsSlug` tells
+// the frame which section is open.
+const SETTINGS_ROUTES = [
+    { path: '', redirect: '/settings/general' },
+    ...SETTINGS_SECTIONS.map((s) => ({
+        path: s.slug, name: 'settings-' + s.slug, component: s.component, meta: { settingsSlug: s.slug },
+    })),
+    { path: 'addons/:id', name: 'settings-addon', component: SettingsAddonSection, props: true },
+    { path: ':rest(.*)*', redirect: '/settings/general' },
+];
+
 // =============================================================================
 // App Component
 // =============================================================================
 
 const App = {
-    components: { Sidebar },
+    components: { Sidebar, StartupCheckDialog },
     template: `
-        <div class="lb-root"
+        <div class="lb-root" :class="{ 'is-settings': inSettings }"
              @dragover.prevent="onGlobalDragOver"
              @dragleave.prevent="onGlobalDragLeave"
              @drop.prevent="onGlobalDrop">
@@ -6666,10 +12890,23 @@ const App = {
                      class="px-4 py-2 text-sm flex items-center justify-between flex-shrink-0 bg-amber-50 border-b border-amber-200 text-amber-900">
                     <span>
                         {{ $t('banner.llmOff') }}
-                        <a href="#/settings" class="underline font-medium">{{ $t('banner.setUpNow') }}</a>
+                        <a href="#/settings/ai-models" class="underline font-medium">{{ $t('banner.setUpNow') }}</a>
                     </span>
                     <button @click="llmOffHintVisible = false"
                             class="ml-4 text-lg leading-none text-amber-700 hover:text-amber-900"
+                            :aria-label="$t('common.close')">×</button>
+                </div>
+                <!-- A re-opened setup could not read or write llm.json (SPA-1):
+                     the saved AI setup is unchanged, so this is no "AI off". -->
+                <div v-if="llmSaveErrorVisible" role="alert"
+                     data-testid="llm-save-error-hint"
+                     class="px-4 py-2 text-sm flex items-center justify-between flex-shrink-0 bg-red-50 border-b border-red-300 text-red-800">
+                    <span>
+                        {{ $t('banner.llmSaveFailed') }}
+                        <a href="#/settings/ai-models" class="underline font-medium">{{ $t('banner.checkAiModels') }}</a>
+                    </span>
+                    <button @click="llmSaveErrorVisible = false"
+                            class="ml-4 text-lg leading-none text-red-700"
                             :aria-label="$t('common.close')">×</button>
                 </div>
                 <main class="flex-1 overflow-y-auto">
@@ -6860,6 +13097,12 @@ const App = {
                     </template>
                 </div>
             </div>
+            <!-- Startup check of the AI models (#209): after the boot, behind the
+                 license gate and never over the onboarding. "Later" keeps this
+                 result away for the session; a new server start checks anew. -->
+            <startup-check-dialog v-if="startupCheckVisible" :report="startupCheck"
+                                  @later="dismissStartupCheck" @open="openAiModels"
+                                  @open-library="openLibrarySettings" />
             <!-- Global drag-drop overlay (shown outside ImportPage) -->
             <div v-if="globalDragging" class="fixed inset-0 bg-accent/20 z-40 flex items-center justify-center pointer-events-none">
                 <div class="bg-white rounded-2xl shadow-xl p-8 text-center pointer-events-none">
@@ -6903,16 +13146,31 @@ const App = {
             onboardingVisible: false,
             onboardingPage: 1,
             llmOffHintVisible: false,
+            llmSaveErrorVisible: false,
             onboardingSaving: false,
             onboardingProvider: '',
             onboardingBaseUrl: '',
             onboardingApiKey: '',
             onboardingMailto: '',
+            // True once "Restart setup" opened the dialog over a saved setup:
+            // from then on the LLM document is never written blind.
+            onboardingReopened: false,
             onboardingProviders: ONBOARDING_FALLBACK_PROVIDERS,
             onboardingMigrationSources: ONBOARDING_MIGRATION_SOURCES,
+            // The boot's Startup check report while it has something to say.
+            startupCheck: null,
         };
     },
     computed: {
+        startupCheckVisible() {
+            return !!this.startupCheck && !this.licenseBlocked && !this.gateConfirming && !this.onboardingVisible;
+        },
+        // Settings hide the app sidebar in a narrow window (#207, style.css);
+        // their own section list leads back.
+        inSettings() {
+            const path = this.$route.path;
+            return path === '/settings' || path.startsWith('/settings/');
+        },
         // Der Preis kommt als Zahl plus Waehrung vom Server; das
         // Dezimaltrennzeichen entscheidet die gewaehlte Sprache, nicht das
         // Backend (ADR-0018).
@@ -6962,11 +13220,11 @@ const App = {
             try {
                 const result = await api('/api/update/install', { method: 'POST' });
                 this.updateMessage = (result && result.message)
-                    || t('update.installing');
+                    ? translateDetail(result.message) : t('update.installing');
             } catch (e) {
                 this.updateRunning = false;
                 this.updateFailed = true;
-                this.updateMessage = e.message || 'Update fehlgeschlagen.';
+                this.updateMessage = e.message || t('update.failed');
             }
         },
         onGlobalDragOver(e) {
@@ -7101,36 +13359,75 @@ const App = {
         // wird als "default" angelegt und an alle drei Rollen gebunden — die
         // Modelle waehlt der Nutzer unter Einstellungen -> LLM, bis dahin
         // bleiben die LLM-Funktionen aus und der Hinweis sagt das.
+        // The PUT replaces the whole document, so it is built on the saved
+        // one (onboardingLlmDocument): after "Restart setup" every other
+        // connection, key and model binding survives.
         async persistOnboarding(payload, connection = null) {
             this.onboardingSaving = true;
             let ready = false;
+            let failed = false;
             try {
                 await api('/api/settings', {
                     method: 'PUT',
                     body: JSON.stringify({ ...payload, ONBOARDING_COMPLETED: 'true' }),
                 });
                 if (connection) {
-                    const conn = { id: 'default', ...connection };
-                    const bind = { connection_id: 'default', model: '' };
+                    let current = null;
+                    try {
+                        current = await api('/api/llm/config');
+                    } catch (e) {
+                        // A first run has nothing to lose; a re-opened setup
+                        // must not overwrite a document it could not read.
+                        if (this.onboardingReopened) throw e;
+                    }
                     const data = await api('/api/llm/config', {
                         method: 'PUT',
-                        body: JSON.stringify({
-                            connections: [conn],
-                            roles: { reasoning: bind, fast: bind, embedding: bind },
-                        }),
+                        body: JSON.stringify(onboardingLlmDocument(current, connection)),
                     });
                     ready = !!(data && data.status && data.status.reasoning);
                 }
-            } catch(e) { /* silent: der Dialog darf nie zur Sackgasse werden */ }
+            } catch(e) {
+                // Never a dead end: the dialog moves on either way.
+                failed = true;
+            }
             this.onboardingSaving = false;
             // Answered — on to the migration offer (#178). The dialog stays up
             // for one more page; ONBOARDING_COMPLETED is already written, so
             // closing it from there costs nothing.
             this.onboardingPage = 2;
-            this.llmOffHintVisible = !ready;
+            if (this.onboardingReopened && failed) {
+                // A re-opened setup left llm.json untouched: "AI is off" would
+                // be false. Say that saving failed and the old setup stands.
+                this.llmSaveErrorVisible = true;
+                this.llmOffHintVisible = false;
+            } else if (this.onboardingReopened && !connection) {
+                // Skipped on a re-open: nothing changed, the hint stays as it was.
+                this.llmSaveErrorVisible = false;
+            } else {
+                this.llmSaveErrorVisible = false;
+                this.llmOffHintVisible = !ready;
+            }
         },
         closeOnboarding() {
             this.onboardingVisible = false;
+        },
+        // "Restart setup" in License & About (#211): the dialog from the first
+        // start again, starting on page 1 with what is saved prefilled.
+        async reopenOnboarding() {
+            try {
+                const settings = await api('/api/settings') || {};
+                this.onboardingMailto = settings.CROSSREF_MAILTO || '';
+            } catch (e) { /* the dialog opens with empty fields */ }
+            this.onboardingReopened = true;
+            this.onboardingPage = 1;
+            this.onboardingProvider = '';
+            this.onboardingBaseUrl = '';
+            this.onboardingApiKey = '';
+            this.onboardingVisible = true;
+            try {
+                const data = await api('/api/llm/providers');
+                if (data && data.providers && data.providers.length) this.onboardingProviders = data.providers;
+            } catch (e) { /* the fallback list stays */ }
         },
         // A source button is a shortcut into the wizard, not a decision: the
         // card is preselected there and every step stays undoable.
@@ -7146,6 +13443,32 @@ const App = {
         },
         changeLanguage(lang) {
             setUiLang(lang);
+        },
+        // --- Startup check of the AI models (#209) -------------------------
+        // Asked once the license and the onboarding have been decided. Only
+        // a role that does not work opens the popup — an unbound one is off
+        // on purpose (#140) — and a result dismissed in this session stays away.
+        async loadStartupCheck() {
+            const report = await loadLlmCheck();
+            if (!report) return;
+            // A notice of the start itself (an ignored base folder) shows even
+            // when the AI check found nothing or did not run.
+            const problems = report.checked_at && llmCheckProblems(report).length;
+            if (!problems && !startupNotices(report).length) return;
+            if (ssGet(STARTUP_CHECK_SEEN_KEY) === startupCheckSeenValue(report)) return;
+            this.startupCheck = report;
+        },
+        dismissStartupCheck() {
+            if (this.startupCheck) ssSet(STARTUP_CHECK_SEEN_KEY, startupCheckSeenValue(this.startupCheck));
+            this.startupCheck = null;
+        },
+        openLibrarySettings() {
+            this.dismissStartupCheck();
+            this.$router.push('/settings/library');
+        },
+        openAiModels() {
+            this.dismissStartupCheck();
+            this.$router.push('/settings/ai-models');
         },
         saveOnboarding() {
             const payload = { UI_LANGUAGE: uiLang.value };
@@ -7165,29 +13488,21 @@ const App = {
     },
     mounted() {
         this.checkVersion();
-        this.checkOnboarding();
+        const onboardingChecked = this.checkOnboarding();
         window.addEventListener('refresh-sidebar', () => {
             if (this.$refs.sidebar) {
                 this.$refs.sidebar.load();
             }
         });
-        // Dark Mode (schon beim Script-Load angewandt, hier nochmal sicherheitshalber)
-        applyDarkMode(localStorage.getItem('darkMode') === 'true');
-        // Custom Icon als Favicon laden
-        api('/api/appearance/icon').then(data => {
-            if (data && data.path) {
-                let link = document.querySelector("link[rel~='icon']");
-                if (!link) {
-                    link = document.createElement('link');
-                    link.rel = 'icon';
-                    document.head.appendChild(link);
-                }
-                link.href = data.path;
-            }
-        }).catch(() => {});
+        // Dark mode and thesis area live on the server (#208): take them over,
+        // or hand the server what this browser already had.
+        syncUiPrefs();
         // Lizenzstatus zuerst (rein lokal), dann den Kaufhinweis pruefen —
         // wer aktiviert hat, wird gar nicht erst gefragt.
-        this.checkLicenseStatus().then(() => this.checkBannerState());
+        const licenseChecked = this.checkLicenseStatus().then(() => this.checkBannerState());
+        // The Startup check's popup comes after both (#209).
+        Promise.all([onboardingChecked, licenseChecked]).then(() => this.loadStartupCheck());
+        window.addEventListener('restart-onboarding', () => this.reopenOnboarding());
         // Aktivierung in den Einstellungen blendet den Kaufhinweis sofort aus.
         window.addEventListener('license-activated', () => {
             this.licenseActivated = true;
@@ -7202,6 +13517,11 @@ const App = {
 // =============================================================================
 // Global Analysis State (persists across route changes)
 // =============================================================================
+// The network chat over a whole Collection sends at most this many Items: the
+// endpoint packs PDF text per Item into one prompt, so a large Collection
+// would overflow the model's context. The chat says when it was capped.
+const NETWORK_CHAT_MAX_ITEMS = 20;
+
 const analysisStore = {
     networkData: null,
     stats: null,
@@ -7218,9 +13538,18 @@ const analysisStore = {
     minRefs: 1,
     minCitations: 0,
     topNRefs: 0,
-    bulkExtractResult: null,
+    graphDistance: 25,
+    category: '',
+    // The net's view (#242): colour mode, the "View" popover, the lens, and
+    // the card - its tab and whether it holds the Collection's chat.
+    colorBy: 'type',
+    viewOpen: false,
+    lensOn: false,
+    cardTab: 'details',
+    collChat: false,
     chatMessages: [],
     chatContextPaper: null,
+    scope: null,  // null = Library, {id, name} = a Collection (#202)
 };
 
 // =============================================================================
@@ -7233,6 +13562,7 @@ const chatStore = {
     paperIds: [],
     selectedPapers: [],
     totalChunks: 0,
+    scopeName: '',  // the Collection the chat was started from (#202), '' = a hand-picked selection
 };
 
 const ResearchChatPage = {
@@ -7253,8 +13583,9 @@ const ResearchChatPage = {
                     <p class="text-sm text-gray-500 mt-0.5">{{ $t('chat.subheading') }}</p>
                 </div>
                 <div class="flex items-center gap-2">
+                    <span v-if="scopeName" class="lb-scope-label" data-testid="chat-scope">{{ $t('scope.collection', { name: scopeName }) }}</span>
                     <span v-if="paperIds.length" class="text-xs bg-accent-soft text-accent-ink px-2 py-1 rounded-full font-medium">
-                        {{ paperIds.length }} Paper &middot; {{ totalChunks }} Chunks
+                        {{ $tn('common.itemCount', paperIds.length) }} &middot; {{ $tn('chat.chunkCount', totalChunks) }}
                     </span>
                     <button v-if="messages.length" @click="startNewChat"
                             class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border border-gray-300 bg-white text-gray-700 hover:bg-gray-50 transition-colors"
@@ -7272,10 +13603,10 @@ const ResearchChatPage = {
 
             <!-- Paper Chips -->
             <div v-if="selectedPapers.length > 0" class="flex flex-wrap gap-1.5 mb-3 flex-shrink-0">
-                <span v-for="p in selectedPapers" :key="p.id"
+                <span v-for="p in selectedPapers" :key="p.id" data-testid="chat-item-chip"
                       class="inline-flex items-center gap-1 bg-accent-soft text-accent-ink text-xs px-2 py-0.5 rounded-full">
-                    {{ p.title ? p.title.substring(0, 40) : 'Paper ' + p.id }}{{ p.title && p.title.length > 40 ? '...' : '' }}
-                    <button @click="removePaper(p.id)" class="ml-0.5 text-accent hover:text-accent-ink">&times;</button>
+                    {{ p.title ? p.title.substring(0, 40) : $t('chat.itemFallback', { id: p.id }) }}{{ p.title && p.title.length > 40 ? '...' : '' }}
+                    <button @click="removePaper(p.id)" :data-testid="'chat-item-remove-' + p.id" class="ml-0.5 text-accent hover:text-accent-ink">&times;</button>
                 </span>
             </div>
 
@@ -7316,7 +13647,7 @@ const ResearchChatPage = {
                                  @click="openPdfModal(s)">
                                 <span class="hover:underline font-medium"
                                     :class="msg.role === 'user' ? 'text-accent-soft' : 'text-accent'">
-                                    [{{ si + 1 }}] {{ s.title || 'Paper ' + s.paper_id }}
+                                    [{{ si + 1 }}] {{ s.title || $t('chat.itemFallback', { id: s.paper_id }) }}
                                 </span>
                                 <span v-if="s.authors" class="opacity-70"> &mdash; {{ s.authors }}</span>
                                 <span v-if="s.pages_referenced && s.pages_referenced.length">, {{ $t('papers.pagesAbbr') }} {{ s.pages_referenced.join(', ') }}</span>
@@ -7455,6 +13786,7 @@ const ResearchChatPage = {
             selectedPapers: chatStore.selectedPapers,
             allPapers: [],
             totalChunks: chatStore.totalChunks,
+            scopeName: chatStore.scopeName,
             showPaperSelector: false,
             paperSearch: '',
             chunking: false,
@@ -7558,6 +13890,7 @@ const ResearchChatPage = {
         // Paper-IDs aus Query-Parametern lesen
         const q = this.$route.query;
         if (q.paper_ids) {
+            this.setScope(q.collection_name || '');
             const ids = q.paper_ids.split(',').map(Number).filter(Boolean);
             // Only reset if different papers requested
             const currentIds = this.paperIds.slice().sort().join(',');
@@ -7588,19 +13921,30 @@ const ResearchChatPage = {
             }
             return blocks;
         },
+        // A hand edit of the selection leaves the Collection's scope.
+        setScope(name) {
+            this.scopeName = name;
+            chatStore.scopeName = name;
+        },
+        // paperIds/selectedPapers ARE chatStore's arrays (see data()): they are
+        // changed in place, never reassigned, or the store keeps the old
+        // selection and brings it back on the next visit.
         togglePaper(p) {
+            this.setScope('');
             const idx = this.paperIds.indexOf(p.id);
             if (idx >= 0) {
-                this.paperIds.splice(idx, 1);
-                this.selectedPapers = this.selectedPapers.filter(sp => sp.id !== p.id);
+                this.removePaper(p.id);
             } else {
                 this.paperIds.push(p.id);
                 this.selectedPapers.push(p);
             }
         },
         removePaper(id) {
-            this.paperIds = this.paperIds.filter(pid => pid !== id);
-            this.selectedPapers = this.selectedPapers.filter(p => p.id !== id);
+            this.setScope('');
+            const idx = this.paperIds.indexOf(id);
+            if (idx >= 0) this.paperIds.splice(idx, 1);
+            const sel = this.selectedPapers.findIndex(p => p.id === id);
+            if (sel >= 0) this.selectedPapers.splice(sel, 1);
         },
         async confirmPaperSelection() {
             this.showPaperSelector = false;
@@ -7704,7 +14048,7 @@ const ResearchChatPage = {
             this.pdfModal = {
                 show: true,
                 paperId: source.paper_id,
-                paperTitle: source.title || 'Unbekannt',
+                paperTitle: source.title || t('common.unknown'),
                 authors: source.authors || '',
                 page: page,
                 url: '/api/papers/' + source.paper_id + '/pdf#page=' + page,
@@ -7727,22 +14071,32 @@ const ResearchChatPage = {
             this.closePdfModal();
             this.$router.push('/paper/' + id + '?page=' + page);
         },
+        // Goes into v-html, and both the question and the answer (which quotes
+        // PDF text) are foreign text: everything is escaped FIRST, then only
+        // the markup this function makes itself comes back - bold, line
+        // breaks and the citation badges. `[Quelle X]` is protocol (the
+        // answer's source marker), and escaping leaves it untouched.
         formatMessage(content, sources) {
             if (!content) return '';
+            const esc = (s) => String(s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+            let html = esc(content);
             // Convert **bold** first
-            let html = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+            html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
             // Convert line breaks BEFORE inserting HTML badges (to avoid <br> inside title attrs)
             html = html.replace(/\n/g, '<br>');
             // Convert [Quelle X] to clickable badges with hover tooltip
             html = html.replace(/\[Quelle (\d+)\]/g, (match, num) => {
-                const idx = parseInt(num) - 1;
+                const idx = parseInt(num, 10) - 1;
                 const src = sources && sources[idx];
-                const paperId = src ? src.paper_id : '';
-                const title = src ? (src.title || '').replace(/&/g,'&amp;').replace(/"/g, '&quot;').replace(/</g,'&lt;').substring(0, 80) : '';
-                const authors = src && src.authors ? ' — ' + src.authors.replace(/&/g,'&amp;').replace(/"/g, '&quot;').replace(/</g,'&lt;').substring(0, 60) : '';
-                const pages = src && src.pages_referenced && src.pages_referenced.length ? ', S. ' + src.pages_referenced.join(', ') : '';
-                const tooltip = title + authors + pages;
-                const pageParam = src && src.pages_referenced && src.pages_referenced.length ? '?page=' + src.pages_referenced[0] : '';
+                const paperId = src && /^\d+$/.test(String(src.paper_id)) ? String(src.paper_id) : '';
+                const pagesRef = src && Array.isArray(src.pages_referenced) ? src.pages_referenced : [];
+                const title = src ? String(src.title || '').substring(0, 80) : '';
+                const authors = src && src.authors ? ' — ' + String(src.authors).substring(0, 60) : '';
+                const pages = pagesRef.length ? ', ' + t('papers.pagesAbbr') + ' ' + pagesRef.join(', ') : '';
+                const tooltip = esc(title + authors + pages);
+                const pageParam = pagesRef.length ? '?page=' + encodeURIComponent(pagesRef[0]) : '';
                 const href = paperId ? `#/paper/${paperId}${pageParam}` : '#';
                 return `<a href="${href}" class="source-badge inline-flex items-center justify-center bg-accent-soft text-accent-ink text-xs font-medium px-1.5 py-0 rounded-full cursor-pointer hover:bg-accent-soft transition-colors no-underline" title="${tooltip}" data-source-idx="${idx}">[Q${num}]</a>`;
             });
@@ -7838,7 +14192,7 @@ const ThesisPage = {
                         <button @click="tab='all'"
                             :class="tab==='all' ? 'border-accent text-accent' : 'border-transparent text-gray-500 hover:text-gray-700'"
                             class="px-5 py-3 text-sm font-medium border-b-2 transition-colors">
-                            Alle Quellen ({{ result.summary.total }})
+                            {{ $t('thesis.allSources', { count: result.summary.total }) }}
                         </button>
                         <button @click="tab='not_online'"
                             :class="tab==='not_online' ? 'border-accent text-accent' : 'border-transparent text-gray-500 hover:text-gray-700'"
@@ -7870,7 +14224,7 @@ const ThesisPage = {
                                     <tr v-for="ref in result.references" :key="ref.index" class="border-b border-gray-100 hover:bg-gray-50">
                                         <td class="py-2 pr-3 text-xs text-gray-400">{{ ref.index }}</td>
                                         <td class="py-2 pr-3 text-gray-900 max-w-xs">
-                                            <span class="line-clamp-2">{{ ref.title || 'Unbekannt' }}</span>
+                                            <span class="line-clamp-2">{{ ref.title || $t('common.unknown') }}</span>
                                             <a v-if="ref.doi" :href="'https://doi.org/' + ref.doi" target="_blank" class="text-xs text-accent hover:underline block mt-0.5">DOI: {{ ref.doi }}</a>
                                         </td>
                                         <td class="py-2 pr-3 text-gray-500 max-w-[140px] truncate text-xs">{{ ref.authors }}</td>
@@ -8002,7 +14356,7 @@ const ThesisPage = {
                 }
                 this.result = await resp.json();
                 this.progress = 100;
-                this.loadingMessage = 'Fertig!';
+                this.loadingMessage = t('common.done');
                 setTimeout(() => { this.phase = 'result'; this.tab = 'all'; }, 400);
             } catch (err) {
                 clearInterval(iv);
@@ -8017,345 +14371,780 @@ const ThesisPage = {
 // AnalysePage Component
 // =============================================================================
 
-// ── Wissensnetz: Farben der D3-Ebene ─────────────────────────────────────────
-// SVG-Attribute nehmen keine CSS-Klasse, also liest der Graph die Tokens zur
-// Zeichenzeit aus dem Dokument. Feste Hexwerte waren hier ein Dark-Mode-Loch:
-// der Trennring der Fremdknoten ist die *Seitenfarbe* (hell #fafaf7 — im Dark
-// Mode ein weisser Leuchtring um jeden Knoten), und die Auswahl zeichnete
-// Schwarz auf Schwarz. Der Cache haelt den Wert pro Theme/Palette fest, damit
-// nicht jeder Knoten ein getComputedStyle ausloest.
-let _lbTokenCache = { key: null, vals: {} };
-function lbToken(name, fallback) {
-    const root = document.documentElement;
-    const key = (root.getAttribute('data-theme') || '') + '|' + (root.getAttribute('data-palette') || '');
-    if (_lbTokenCache.key !== key) _lbTokenCache = { key, vals: {} };
-    if (!(name in _lbTokenCache.vals)) {
-        const v = getComputedStyle(root).getPropertyValue(name).trim();
-        _lbTokenCache.vals[name] = v || fallback;
+// ── Knowledge network: drawing rules (#242) ─────────────────────────────────
+// Every colour of the net is a token reference (`var(--lb-…)`) set as an
+// inline style - never a hex value - so a theme or palette switch recolours
+// it on the spot; the page's MutationObserver re-applies the look besides.
+// Orange means exactly three things: a shared reference, a bridge to one,
+// and the selection.
+
+// What a node is drawn as (`data-node-kind`, #241): an own Item, a shared
+// reference (the orange nodes; it follows "path between two items"), a cited
+// work, or a deeper level. Tests read emphasis from this and `data-dimmed`
+// instead of comparing colours.
+function netNodeKind(d, sharedIds) {
+    if (d.type === 'own') return 'own';
+    if (sharedIds.has(d.id)) return 'shared';
+    if (/^depth\d+$/.test(d.type || '')) return 'deeper';
+    return 'external';
+}
+// Search hits and the camera list own Items first, then shared references.
+const NET_KIND_RANK = { own: 0, shared: 1, external: 2, deeper: 3 };
+// Drawing order of the edges: bridges and PDF edges lie above the plain ones.
+const NET_EDGE_RANK = { cite: 0, bridge: 1, pdf: 2 };
+const netEnd = (v) => (v && typeof v === 'object' ? v.id : v);
+
+// Shared references within `steps` steps: a breadth-first walk from every own
+// Item (never through another own Item). A cited work that two own Items
+// reach is shared; the edges and nodes on the way are its bridge.
+function netSharedReferences(ownIds, adj, edgeIndex, steps) {
+    const reach = new Map();    // node -> own Items that reach it
+    const parent = new Map();   // node -> (own Item -> previous node)
+    for (const ownId of ownIds) {
+        let frontier = [ownId];
+        const seen = new Set([ownId]);
+        for (let step = 0; step < steps && frontier.length; step++) {
+            const next = [];
+            for (const cur of frontier) {
+                for (const nb of adj.get(cur) || []) {
+                    if (seen.has(nb)) continue;
+                    seen.add(nb);
+                    if (!reach.has(nb)) reach.set(nb, new Set());
+                    reach.get(nb).add(ownId);
+                    if (!parent.has(nb)) parent.set(nb, new Map());
+                    parent.get(nb).set(ownId, cur);
+                    if (!ownIds.has(nb)) next.push(nb);
+                }
+            }
+            frontier = next;
+        }
     }
-    return _lbTokenCache.vals[name];
-}
-// Knotenring: Auswahl > eigenes Paper > Brueckenknoten > Trennring gegen den Grund.
-function netNodeStroke(d, bridgeNodes, highlighted) {
-    if (highlighted) return lbToken('--lb-ink', '#1a1a1a');
-    if (d.type === 'own') return lbToken('--lb-accent-ink', '#7a2808');
-    if (bridgeNodes.has(d.id)) return lbToken('--lb-accent', '#c2410c');
-    return lbToken('--lb-bg', '#fafaf7');
-}
-// Kantenfarbe: Auswahl > Bruecke > aus dem PDF gelesene Referenz > normale Kante.
-function netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, highlighted) {
-    if (highlighted) return lbToken('--lb-ink', '#1a1a1a');
-    if (bridgeEdgeSet.has(i)) return lbToken('--lb-accent', '#c2410c');
-    if (pdfRefEdgeSet.has(i)) return lbToken('--lb-mute-2', '#a8a49c');
-    return lbToken('--lb-hairline', '#e7e2d6');
+    const shared = new Set();
+    const sharedEdges = new Set();
+    const paths = new Map();    // shared id -> { nodes, edges, owners }
+    for (const [id, owners] of reach) {
+        if (ownIds.has(id) || owners.size < 2) continue;
+        shared.add(id);
+        const path = { nodes: new Set([id]), edges: new Set(), owners: new Set(owners) };
+        for (const ownId of owners) {
+            let cur = id;
+            while (cur !== ownId) {
+                const prev = parent.get(cur) && parent.get(cur).get(ownId);
+                if (prev == null) break;
+                const ei = edgeIndex.get(cur + '|' + prev);
+                if (ei != null) { path.edges.add(ei); sharedEdges.add(ei); }
+                path.nodes.add(prev);
+                cur = prev;
+            }
+        }
+        paths.set(id, path);
+    }
+    return { shared, sharedEdges, paths };
 }
 
-const AnalysePage = {
+// The one look of a node: fill, outline and emphasis. Selection, category,
+// lens and the sliders all restyle through here, so no path can fall back
+// to the kind colour while the net is coloured by year.
+//   ctx = { colorBy: 'type'|'year', years: [min, max]|null, emph: {nodes}|null }
+function netNodeStyle(d, kind, ctx) {
+    let fill;
+    let stroke;
+    let width;
+    if (kind === 'own') {
+        fill = 'var(--lb-ink)'; stroke = 'var(--lb-accent-ink)'; width = 2;
+    } else if (ctx.colorBy === 'year') {
+        // Warm grey from old (light) to new (dark); orange fills nothing.
+        const year = Number(d.year);
+        if (d.year != null && d.year !== '' && Number.isFinite(year) && ctx.years) {
+            const [lo, hi] = ctx.years;
+            const t = hi > lo ? Math.min(1, Math.max(0, (year - lo) / (hi - lo))) : 1;
+            fill = 'color-mix(in oklab, var(--lb-ink-2) ' + Math.round(t * 100) + '%, var(--lb-year-old))';
+        } else {
+            fill = 'var(--lb-bg-elev)';   // no year: hollow
+        }
+        if (kind === 'shared') { stroke = 'var(--lb-accent)'; width = 2; }
+        else { stroke = 'var(--lb-mute-2)'; width = 1; }
+    } else if (kind === 'shared') {
+        fill = 'var(--lb-accent)'; stroke = 'var(--lb-bg-elev)'; width = 1;
+    } else if (kind === 'deeper') {
+        fill = 'var(--lb-bg-elev)'; stroke = 'var(--lb-node-ext)'; width = 1.5;
+    } else {
+        fill = 'var(--lb-node-ext)'; stroke = 'var(--lb-bg-elev)'; width = 1;
+    }
+    const dimmed = !!ctx.emph && !ctx.emph.nodes.has(d.id);
+    const opacity = !dimmed ? 1 : (kind === 'own' || kind === 'shared' ? 0.14 : 0.1);
+    return { fill, stroke, strokeWidth: width, opacity, dimmed };
+}
+
+// The look of an edge by its kind (cite | bridge | pdf). Under an emphasis the
+// edges taking part come forward - a plain one darkens to 3:1 against the
+// sheet - and the rest steps back. `marker` names the arrowhead.
+function netEdgeStyle(kind, ctx, involved) {
+    const base = {
+        cite: { stroke: 'var(--lb-hairline-2)', width: 1, opacity: 0.7, marker: 'cite' },
+        bridge: { stroke: 'var(--lb-accent)', width: 1.5, opacity: 0.9, marker: 'bridge' },
+        pdf: { stroke: 'var(--lb-ink-3)', width: 1.5, opacity: 0.9, marker: 'pdf' },
+    }[kind] || { stroke: 'var(--lb-hairline-2)', width: 1, opacity: 0.7, marker: 'cite' };
+    if (!ctx.emph) return base;
+    if (!involved) return Object.assign({}, base, { opacity: ctx.emph.mode === 'lens' ? 0.08 : 0.05 });
+    if (kind === 'cite') return { stroke: 'var(--lb-mute)', width: 1, opacity: 1, marker: 'hot' };
+    return Object.assign({}, base, { opacity: 1 });
+}
+
+// A title cut to `max` characters with an ellipsis.
+function netTrim(text, max) {
+    const s = String(text || '').trim();
+    return s.length > max ? s.slice(0, max - 1).trimEnd() + '…' : s;
+}
+
+// Where the labels of own Items go, in screen space: right of the node, left
+// of it at the right edge, and where two would overlap the Item with fewer
+// edges gives way. `items` carry graph coordinates; widths are estimated
+// from the characters (no layout to measure in, and none needed).
+//   items: [{ id, x, y, r, text, degree, prio }], t: { k, x, y }
+//   reserved: screen boxes that are taken already (the selected label)
+function netPlaceLabels(items, t, width, reserved) {
+    const FONT = 12.5;
+    const HALF_H = FONT * 0.65;
+    const placed = (reserved || []).slice();
+    const out = new Map();
+    const order = items.slice().sort((a, b) => (b.prio - a.prio) || (b.degree - a.degree) || String(a.id).localeCompare(String(b.id)));
+    for (const it of order) {
+        const sx = it.x * t.k + t.x;
+        const sy = it.y * t.k + t.y;
+        const sr = it.r * t.k;
+        const w = it.text.length * FONT * 0.5;
+        let side = 'right';
+        let x0 = sx + sr + 6;
+        if (x0 + w > width - 8) {
+            side = 'left';
+            x0 = sx - sr - 6 - w;
+        }
+        const box = { x0, x1: x0 + w, y0: sy - HALF_H, y1: sy + HALF_H };
+        const hit = placed.some((b) => box.x0 < b.x1 && box.x1 > b.x0 && box.y0 < b.y1 && box.y1 > b.y0);
+        out.set(it.id, { show: !hit, side });
+        if (!hit) placed.push(box);
+    }
+    return out;
+}
+
+// A key typed into a field is text, not a shortcut.
+function netIsField(el) {
+    return !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName || ''));
+}
+// Reduced motion: the network lays out at once and the camera jumps. Without
+// matchMedia (jsdom, an old engine) there is no preference.
+function analysisReducedMotion() {
+    return typeof window.matchMedia === 'function'
+        && !!window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+// How many ticks a simulation needs to come to rest.
+function simulationTicksToRest(sim) {
+    return Math.ceil(Math.log(sim.alphaMin() / Math.max(sim.alpha(), sim.alphaMin()))
+        / Math.log(1 - sim.alphaDecay()));
+}
+// Runs a force simulation to rest in one go, without its timer.
+function settleSimulation(sim) {
+    sim.stop();
+    const n = simulationTicksToRest(sim);
+    if (n > 0) sim.tick(n);
+}
+// Motion (#243). The durations mirror --lb-dur-1..4 of style.css (the token
+// is read when the engine knows it; jsdom has no style sheet) and are 0
+// under reduced motion, where everything lands at once.
+const ANALYSIS_DUR = { 1: 120, 2: 160, 3: 280, 4: 320 };
+const ANALYSIS_STAGGER = 35;
+function analysisMotionMs(step) {
+    if (analysisReducedMotion()) return 0;
+    let ms = NaN;
+    try {
+        ms = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--lb-dur-' + step));
+    } catch (e) { /* no style sheet: the mirror holds */ }
+    return Number.isFinite(ms) ? ms : ANALYSIS_DUR[step];
+}
+// --lb-ease-out, cubic-bezier(.16, 1, .3, 1), as a d3 easing (the camera
+// flies through d3, which knows no CSS curves).
+const analysisEaseOut = (() => {
+    const x1 = 0.16;
+    const y1 = 1;
+    const x2 = 0.3;
+    const y2 = 1;
+    const bez = (a, b, s) => 3 * a * s * (1 - s) * (1 - s) + 3 * b * s * s * (1 - s) + s * s * s;
+    return (x) => {
+        if (x <= 0 || x >= 1) return x <= 0 ? 0 : 1;
+        let lo = 0;
+        let hi = 1;
+        for (let i = 0; i < 24; i++) {
+            const mid = (lo + hi) / 2;
+            if (bez(x1, x2, mid) < x) lo = mid; else hi = mid;
+        }
+        return bez(y1, y2, (lo + hi) / 2);
+    };
+})();
+// The build-up's stage of a work: own Items first, then the shared
+// references, then the other references ring by ring - at most six stages,
+// 35 ms apart (the CSS multiplies --lb-i with --lb-stagger).
+function netStage(node, kind) {
+    if (node.type === 'own') return 0;
+    if (kind === 'shared') return 1;
+    return Math.min(5, 1 + Math.max(1, Number(node.depth) || 1));
+}
+// Whether two camera transforms are the same place.
+function sameCamera(a, b) {
+    return Math.abs(a.x - b.x) < 0.5 && Math.abs(a.y - b.y) < 0.5 && Math.abs(a.k - b.k) < 0.001;
+}
+// The next animation frame (a timer where the engine has none).
+function analysisFrame(cb) {
+    if (typeof window.requestAnimationFrame === 'function') return window.requestAnimationFrame(cb);
+    return setTimeout(cb, 16);
+}
+function analysisCancelFrame(id) {
+    if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(id);
+    else clearTimeout(id);
+}
+// "m:ss" for the running clocks (first run, PDF dialog).
+function fmtElapsed(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+// A catalog sentence whose placeholders are numbers in mono: the template
+// renders the parts, so the sentence stays one catalog entry and its numbers
+// keep the machine's voice. `vars` hold formatted strings.
+function textParts(key, vars) {
+    const parts = [];
+    for (const seg of t(key).split(/(\{\w+\})/)) {
+        const m = seg.match(/^\{(\w+)\}$/);
+        if (m && m[1] in vars) parts.push({ num: true, text: String(vars[m[1]]) });
+        else if (seg) parts.push({ num: false, text: seg });
+    }
+    return parts;
+}
+function fmtCount(n) {
+    return Number(n || 0).toLocaleString(uiLocale());
+}
+// The network build caps its lists (network_orchestrator: referenced_papers,
+// missing_sources); a tab at the cap says so ("500+").
+const ANALYSIS_LIST_CAP = 500;
+// The first run's placeholder: a still constellation in the shape of the
+// network (viewBox 560 × 250). Nodes are [x, y, r, kind], edges join nodes.
+const ANALYSIS_PLACEHOLDER = {
+    nodes: [
+        [112, 75, 7, 'own'], [196, 140, 7, 'own'], [280, 62, 6, 'shared'], [252, 112, 7, 'own'],
+        [347, 150, 7, 'own'], [390, 92, 5, 'ext'], [470, 98, 6, 'shared'], [157, 195, 7, 'own'],
+        [373, 210, 5, 'ext'], [482, 162, 5, 'ext'],
+    ],
+    edges: [[0, 1], [1, 2], [2, 5], [3, 4], [4, 6], [7, 3], [4, 8], [6, 9]],
+};
+// An empty PDF-references dialog (#241); `state` walks checking → nomodel |
+// confirm → running → done | aborted | stopped.
+function bulkDialogIdle() {
+    return { open: false, state: 'idle', current: 0, total: 0, percent: 0, rows: [], result: null, message: '', startedAt: 0 };
+}
+
+let _lbDepthPickerSeq = 0;
+// Search depth 1–5 as a radiogroup on a track with a sliding thumb: roving
+// tabindex, arrow keys, and the chosen depth's name beside it at a fixed
+// minimum width so nothing jumps. The page head and the empty state use it.
+const AnalysisDepthPicker = {
+    props: {
+        modelValue: { type: Number, default: 1 },
+        disabled: { type: Boolean, default: false },
+    },
+    emits: ['update:modelValue'],
+    data() {
+        return { uid: 'lb-an-depth-' + (++_lbDepthPickerSeq) };
+    },
     template: `
-        <div class="lb-view lb-analyse">
-            <!-- Bulk Extract Progress Modal -->
-            <div v-if="bulkExtracting" class="lb-modal-overlay" style="align-items:center;justify-content:center">
-                <div style="background:var(--lb-bg-elev);border:1px solid var(--lb-hairline);border-radius:12px;box-shadow:var(--lb-shadow-lg);padding:24px;max-width:640px;width:92vw;max-height:80vh;display:flex;flex-direction:column">
-                    <div class="lb-section-label" style="padding:0;margin-bottom:6px">{{ $t('analysis.pipeline') }}</div>
-                    <h3 style="font-family:var(--lb-font-serif);font-size:22px;font-weight:500;margin:0 0 16px;color:var(--lb-ink)">{{ $t('analysis.bulkRefExtraction') }}</h3>
-                    <div style="margin-bottom:14px">
-                        <div style="width:100%;background:var(--lb-bg-soft);border-radius:99px;height:6px;margin-bottom:8px;overflow:hidden">
-                            <div style="background:var(--lb-accent);height:6px;border-radius:99px;transition:width .3s ease" :style="{ width: bulkProgress.percent + '%' }"></div>
+        <div class="lb-an-depth" :class="{ 'is-disabled': disabled }">
+            <span :id="uid + '-l'" class="lb-an-label">{{ $t('analysis.depthLabel') }}</span>
+            <div class="lb-an-seg lb-an-seg-depth" role="radiogroup" :aria-labelledby="uid + '-l'"
+                 :aria-describedby="uid + '-n'" :aria-disabled="disabled ? 'true' : null" @keydown="onKey">
+                <span class="lb-an-seg-thumb" aria-hidden="true"
+                      :style="{ transform: 'translateX(' + (modelValue - 1) * 100 + '%)' }"></span>
+                <button v-for="d in 5" :key="d" type="button" role="radio" class="lb-an-seg-btn"
+                        :aria-checked="modelValue === d ? 'true' : 'false'" :tabindex="modelValue === d ? 0 : -1"
+                        :disabled="disabled" :data-depth="d" @click="pick(d)">{{ d }}</button>
+            </div>
+            <span :id="uid + '-n'" class="lb-an-depth-name">{{ $t('analysis.depth.' + modelValue) }}</span>
+        </div>
+    `,
+    methods: {
+        pick(d) {
+            if (!this.disabled && d !== this.modelValue) this.$emit('update:modelValue', d);
+        },
+        onKey(e) {
+            if (this.disabled) return;
+            const step = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[e.key];
+            let next = null;
+            if (step) next = Math.min(5, Math.max(1, this.modelValue + step));
+            else if (e.key === 'Home') next = 1;
+            else if (e.key === 'End') next = 5;
+            if (next == null) return;
+            e.preventDefault();
+            this.pick(next);
+            this.$nextTick(() => {
+                const el = this.$el.querySelector('[data-depth="' + next + '"]');
+                if (el) el.focus();
+            });
+        },
+    },
+};
+
+const AnalysePage = {
+    components: { AnalysisDepthPicker },
+    template: `
+        <div class="lb-view-full lb-analyse">
+            <!-- PDF references (#241): asks first, shows the run, keeps its
+                 outcome; nothing goes through alert() any more. -->
+            <div v-if="bulk.open" class="lb-an-scrim" data-testid="bulk-scrim" @click.self="onBulkBackdrop">
+                <div ref="bulkDialog" class="lb-an-dialog" role="dialog" aria-modal="true" aria-labelledby="lb-an-bulk-title"
+                     tabindex="-1" data-testid="bulk-dialog" :data-state="bulk.state">
+                    <h2 id="lb-an-bulk-title" class="lb-an-dialog-title">{{ bulk.state === 'done' ? $t('analysis.bulk.doneTitle') : $t('analysis.bulk.title') }}</h2>
+
+                    <p v-if="bulk.state === 'checking'" class="lb-an-dialog-note">{{ $t('common.loading') }}</p>
+
+                    <template v-else-if="bulk.state === 'nomodel'">
+                        <p class="lb-an-dialog-body" data-testid="bulk-no-model">{{ $t('analysis.bulk.noModel') }}</p>
+                        <p class="lb-an-dialog-note">{{ $t('analysis.bulk.noModelNote') }}</p>
+                        <div class="lb-an-dialog-foot">
+                            <button type="button" class="lb-key" data-testid="bulk-close" @click="closeBulk">{{ $t('common.close') }}</button>
+                            <button type="button" class="lb-key lb-key-primary" data-testid="bulk-setup-models" @click="bulkGoToModels">{{ $t('analysis.bulk.setUpModels') }}</button>
                         </div>
-                        <p style="font-size:13px;color:var(--lb-ink-2);margin:0">{{ bulkProgress.message || $t('common.starting') }}</p>
-                        <p v-if="bulkProgress.current_paper && bulkProgress.total_papers" class="lb-mono" style="font-size:11px;color:var(--lb-mute);margin:4px 0 0">
-                            {{ $t('analysis.itemProgress', { current: bulkProgress.current_paper, total: bulkProgress.total_papers }) }}
+                    </template>
+
+                    <template v-else-if="bulk.state === 'confirm'">
+                        <p class="lb-an-dialog-body" data-testid="bulk-scope">{{ scope ? $t('analysis.bulk.scopeCollection', { name: scope.name }) : $t('analysis.bulk.scopeLibrary') }}</p>
+                        <p class="lb-an-dialog-note">{{ $t('analysis.bulk.how') }}</p>
+                        <div class="lb-an-dialog-foot">
+                            <button type="button" class="lb-key" data-testid="bulk-cancel" @click="closeBulk">{{ $t('common.cancel') }}</button>
+                            <button type="button" class="lb-key lb-key-primary" data-testid="bulk-start" @click="startBulk">{{ $t('analysis.bulk.start') }}</button>
+                        </div>
+                    </template>
+
+                    <template v-else-if="bulk.state === 'running'">
+                        <div class="lb-an-bar" role="progressbar" :aria-label="$t('analysis.bulk.progressLabel')" aria-valuemin="0"
+                             :aria-valuemax="bulk.total || 100" :aria-valuenow="bulk.total ? bulk.current : bulk.percent" data-testid="bulk-progress">
+                            <span :style="{ transform: 'scaleX(' + Math.min(100, bulk.percent) / 100 + ')' }"></span>
+                        </div>
+                        <p class="lb-an-bar-meta">
+                            <span data-testid="bulk-count"><template v-if="bulk.total"><span v-for="(p, i) in bulkCountParts" :key="i" :class="{ 'lb-an-n': p.num }">{{ p.text }}</span></template><template v-else>{{ $t('common.starting') }}</template></span>
+                            <span data-testid="bulk-elapsed"><span v-for="(p, i) in bulkSinceParts" :key="i" :class="{ 'lb-an-n': p.num }">{{ p.text }}</span></span>
                         </p>
-                    </div>
-                    <div v-if="bulkPaperResults.length" style="flex:1;overflow-y:auto;border-top:1px solid var(--lb-hairline);padding-top:10px;display:flex;flex-direction:column;gap:2px">
-                        <div v-for="r in bulkPaperResults" :key="r.paper_id" style="display:flex;align-items:center;gap:8px;font-size:12px;padding:3px 0">
-                            <span v-if="r.status === 'ok'" style="color:var(--lb-accent);width:14px">&#10003;</span>
-                            <span v-else style="color:var(--lb-mute);width:14px">&#x2013;</span>
-                            <span class="lb-truncate" style="flex:1;color:var(--lb-ink-2)">{{ r.title }}</span>
-                            <span v-if="r.status === 'ok'" class="lb-mono" style="color:var(--lb-mute);font-size:11px">{{ $t('analysis.refsRatio', { extracted: r.total_extracted, inLibrary: r.in_library }) }}</span>
-                            <span v-else class="lb-mono" style="color:var(--lb-mute);font-size:11px">{{ r.status }}</span>
+                        <ul class="lb-an-rows" aria-live="polite" data-testid="bulk-rows">
+                            <li v-for="(r, i) in bulk.rows" :key="i" class="lb-an-row" :data-status="r.status">
+                                <svg v-if="r.status === 'ok'" class="lb-an-row-ic is-ok" width="14" height="14" viewBox="0 0 24 24" role="img" :aria-label="$t('analysis.bulk.rowOk')"><polyline points="20 6 9 17 4 12"/></svg>
+                                <svg v-else class="lb-an-row-ic" width="14" height="14" viewBox="0 0 24 24" role="img" :aria-label="$t('analysis.bulk.rowSkipped')"><circle cx="12" cy="12" r="7"/></svg>
+                                <span class="lb-an-row-title">{{ r.title || $t('papers.untitled') }}</span>
+                                <span class="lb-an-row-why"><template v-if="r.status === 'ok'"><span v-for="(p, j) in bulkRowParts(r)" :key="j" :class="{ 'lb-an-n': p.num }">{{ p.text }}</span></template><template v-else>{{ bulkReason(r.status) }}</template></span>
+                            </li>
+                        </ul>
+                        <div class="lb-an-dialog-foot is-split">
+                            <p class="lb-an-dialog-note">{{ $t('analysis.bulk.stopNote') }}</p>
+                            <button type="button" class="lb-key" data-testid="bulk-stop" @click="stopBulk">{{ $t('analysis.bulk.stop') }}</button>
                         </div>
-                    </div>
+                    </template>
+
+                    <template v-else-if="bulk.state === 'done'">
+                        <dl class="lb-an-facts" data-testid="bulk-facts">
+                            <template v-for="f in bulkFacts" :key="f.id">
+                                <dt class="lb-an-n" :data-fact="f.id">{{ f.value }}</dt>
+                                <dd>{{ f.label }}</dd>
+                            </template>
+                        </dl>
+                        <ul v-if="bulkSkipped.length" class="lb-an-rows" data-testid="bulk-skipped">
+                            <li v-for="(r, i) in bulkSkipped" :key="i" class="lb-an-row" :data-status="r.status">
+                                <svg class="lb-an-row-ic" width="14" height="14" viewBox="0 0 24 24" role="img" :aria-label="$t('analysis.bulk.rowSkipped')"><circle cx="12" cy="12" r="7"/></svg>
+                                <span class="lb-an-row-title">{{ r.title || $t('papers.untitled') }}</span>
+                                <span class="lb-an-row-why">{{ bulkReason(r.status) }}</span>
+                            </li>
+                        </ul>
+                        <p class="lb-an-dialog-note lb-an-gap">{{ $t('analysis.bulk.doneNote') }}</p>
+                        <div class="lb-an-dialog-foot">
+                            <button type="button" class="lb-key" data-testid="bulk-close" @click="closeBulk">{{ $t('common.close') }}</button>
+                            <button type="button" class="lb-key lb-key-primary" data-testid="bulk-rebuild" @click="bulkRebuild">{{ $t('analysis.bulk.rebuild') }}</button>
+                        </div>
+                    </template>
+
+                    <template v-else-if="bulk.state === 'aborted' || bulk.state === 'stopped'">
+                        <div class="lb-an-callout" :class="{ 'is-danger': bulk.state === 'aborted' }"
+                             :role="bulk.state === 'aborted' ? 'alert' : 'status'" data-testid="bulk-outcome">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12.5"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                            <div>
+                                <p class="lb-an-callout-title">{{ bulk.state === 'aborted' ? $t('analysis.bulk.abortedTitle') : $t('analysis.bulk.stoppedTitle') }}</p>
+                                <p class="lb-an-dialog-body">{{ bulkOutcomeText }}</p>
+                            </div>
+                        </div>
+                        <p class="lb-an-dialog-note lb-an-gap">{{ $t('analysis.bulk.resumeNote') }}</p>
+                        <div class="lb-an-dialog-foot">
+                            <button type="button" class="lb-key" data-testid="bulk-close" @click="closeBulk">{{ $t('common.close') }}</button>
+                            <button type="button" class="lb-key lb-key-primary" data-testid="bulk-resume" @click="startBulk">{{ $t('analysis.bulk.resume') }}</button>
+                        </div>
+                    </template>
                 </div>
             </div>
 
-            <!-- Page Head -->
-            <header class="lb-page-head">
+            <!-- Page head (#241): title left; depth, "PDF references" and the
+                 primary key right - depth and run only once a network exists
+                 or is loading, so before the first run the empty state is the
+                 one place to start. The meta line runs below at full width. -->
+            <header class="lb-page-head lb-an-head">
                 <div class="lb-page-head-l">
                     <div class="lb-eyebrow">{{ $t('nav.analysis') }}</div>
                     <h1 class="lb-page-title">{{ $t('analysis.heading') }}</h1>
-                    <div class="lb-page-meta">
-                        <span v-if="stats">{{ $t('analysis.ownItemsCount', { count: stats.own_papers }) }}</span>
-                        <span v-if="stats" class="lb-page-meta-sep">&middot;</span>
-                        <span v-if="stats">{{ $t('analysis.referencesCount', { count: stats.total_references }) }}</span>
-                        <span v-if="!stats">{{ $t('analysis.subheading') }}</span>
-                    </div>
                 </div>
-                <div class="lb-page-head-r">
-                    <div class="lb-segmented">
-                        <button class="lb-seg" :class="{'is-on': mode==='categories'}" @click="setMode('categories')">{{ $t('sidebar.categories') }}</button>
-                        <button class="lb-seg" :class="{'is-on': mode==='years'}" @click="setMode('years')">{{ $t('analysis.modeYears') }}</button>
-                        <button class="lb-seg" :class="{'is-on': mode==='authors'}" @click="setMode('authors')">{{ $t('common.authors') }}</button>
-                    </div>
+                <div class="lb-an-head-r">
+                    <analysis-depth-picker v-if="networkData || loading" v-model="depth" :disabled="loading" data-testid="analysis-head-depth" />
+                    <button type="button" class="lb-key" data-testid="analysis-pdf-refs" @click="openBulkDialog">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+                        {{ $t('analysis.pdfReferences') }}
+                    </button>
+                    <button v-if="networkData || loading" type="button" class="lb-key lb-key-primary" data-testid="analysis-run"
+                            :disabled="loading" @click="runAnalysis">
+                        <span v-if="loading" class="lb-an-spin" aria-hidden="true"></span>
+                        <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                        {{ runLabel }}
+                    </button>
                 </div>
+                <p class="lb-an-meta" data-testid="analysis-meta">
+                    <span class="lb-scope-label" data-testid="analysis-scope">{{ scope ? $t('scope.collection', { name: scope.name }) : $t('scope.library') }}</span>
+                    <button v-if="scope" type="button" class="lb-an-text-action" data-testid="analysis-scope-clear" @click="$router.push({ name: 'analyse' })">{{ $t('scope.switchToLibrary') }}</button>
+                    <template v-for="line in metaLines" :key="line.id">
+                        <span class="lb-an-meta-sep" aria-hidden="true">&middot;</span>
+                        <span :data-testid="'analysis-meta-' + line.id"><span v-for="(p, i) in line.parts" :key="i" :class="{ 'lb-an-n': p.num }">{{ p.text }}</span></span>
+                    </template>
+                </p>
             </header>
 
-            <!-- Toolbar -->
-            <div class="lb-toolbar">
-                <div class="lb-toolbar-l">
-                    <div class="lb-sortgroup">
-                        <span class="lb-sortgroup-l">{{ $t('analysis.stat.depth') }}</span>
-                        <div style="display:flex;gap:2px;padding:3px 4px">
-                            <button v-for="d in [1,2,3,4,5]" :key="d" @click="depth = d"
-                                class="lb-seg" :class="{'is-on': depth === d}"
-                                style="min-width:24px;justify-content:center;padding:4px 8px">{{ d }}</button>
-                        </div>
-                        <span class="lb-mono" style="font-size:10.5px;color:var(--lb-mute);padding-right:8px">{{ depthLabel }}</span>
-                    </div>
-                </div>
-                <div class="lb-toolbar-r">
-                    <button @click="bulkExtractRefs" :disabled="bulkExtracting" class="lb-btn lb-btn-ghost"
-                        :title="$t('analysis.bulkRefTitle')">
-                        <span v-if="bulkExtracting" class="spinner-sm"></span>
-                        <svg v-else xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
-                        {{ bulkExtracting ? $t('refs.extracting') : $t('analysis.pdfReferences') }}
-                    </button>
-                    <button @click="runAnalysis" :disabled="loading" class="lb-btn lb-btn-primary">
-                        <span v-if="loading" class="spinner-sm"></span>
-                        <span v-else v-html="icons.refresh"></span>
-                        {{ loading ? $t('analysis.running') : $t('analysis.start') }}
-                    </button>
-                </div>
+            <!-- Views: a segmented switch with a sliding thumb and counts. -->
+            <div v-if="networkData" class="lb-an-seg lb-an-tabs" role="tablist" :aria-label="$t('analysis.tabsLabel')"
+                 data-testid="analysis-tabs" @keydown="onTabKey">
+                <span class="lb-an-seg-thumb" aria-hidden="true" :style="{ transform: 'translateX(' + activeTabIndex * 100 + '%)' }"></span>
+                <button v-for="tab in tabDefs" :key="tab.id" type="button" role="tab" class="lb-an-seg-btn"
+                        :id="'lb-an-tab-' + tab.id" :aria-controls="'lb-an-panel-' + tab.id"
+                        :aria-selected="activeTab === tab.id ? 'true' : 'false'" :tabindex="activeTab === tab.id ? 0 : -1"
+                        :data-tab="tab.id" :data-testid="'analysis-tab-' + tab.id" @click="activeTab = tab.id">
+                    {{ tab.label }}<span v-if="tab.count" class="lb-an-n lb-an-tab-n">{{ tab.count }}</span>
+                </button>
             </div>
 
-            <!-- Error -->
-            <div v-if="error" style="margin-bottom:18px;background:var(--lb-accent-soft);border:1px solid var(--lb-accent);color:var(--lb-accent-ink);border-radius:8px;padding:12px 14px;font-size:13px">
-                {{ error }}
-            </div>
-
-            <!-- Stats -->
-            <div v-if="stats" style="display:grid;grid-template-columns:repeat(7,1fr);gap:0;margin-bottom:24px;border-top:1px solid var(--lb-hairline);border-bottom:1px solid var(--lb-hairline)">
-                <div v-for="(s, i) in statBlocks" :key="i" style="padding:18px 16px;border-right:1px solid var(--lb-hairline);text-align:left" :style="{borderRight: i===6 ? '0' : null}">
-                    <div style="font-family:var(--lb-font-serif);font-style:italic;font-size:28px;line-height:1;color:var(--lb-ink);margin-bottom:6px">{{ s.value }}</div>
-                    <div class="lb-section-label" style="padding:0">{{ s.label }}</div>
-                </div>
+            <!-- A failed build or refresh says why above the surface; a network
+                 that is already there stays. -->
+            <div v-if="error" class="lb-an-alert" role="alert" data-testid="analysis-error">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12.5"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                <p>{{ error }}</p>
             </div>
 
             <!-- Tabs + Content -->
-            <div v-if="networkData">
-                <div style="display:flex;gap:24px;border-bottom:1px solid var(--lb-hairline);margin-bottom:20px;overflow-x:auto">
-                    <button v-for="t in tabDefs" :key="t.id" @click="activeTab=t.id"
-                        :style="{color: activeTab===t.id ? 'var(--lb-ink)' : 'var(--lb-mute)', borderBottomColor: activeTab===t.id ? 'var(--lb-accent)' : 'transparent'}"
-                        style="appearance:none;background:transparent;border:0;border-bottom:2px solid transparent;padding:10px 2px;font-family:var(--lb-font-mono);font-size:11px;letter-spacing:0.14em;text-transform:uppercase;cursor:pointer;display:inline-flex;align-items:center;gap:8px;white-space:nowrap;transition:color .12s ease,border-color .12s ease">
-                        {{ t.label }}
-                        <span v-if="t.count != null" class="lb-mono" style="font-size:10px;color:var(--lb-mute-2);letter-spacing:0">{{ t.count }}</span>
-                    </button>
-                </div>
+            <div v-if="networkData" class="lb-an-views">
+                <!-- The network (#242): the net is the stage - a sheet with a
+                     dot grid down to the window's edge; tools float top left,
+                     the legend bar sits below the net, the card lies left. -->
+                <div v-show="activeTab==='network'" id="lb-an-panel-network" role="tabpanel" aria-labelledby="lb-an-tab-network" class="lb-an-panel-net">
+                    <div ref="stage" class="lb-an-stage" :class="{ 'is-narrow': stageNarrow }">
+                        <div class="lb-an-board">
+                            <div ref="netArea" class="lb-an-net" tabindex="-1" data-testid="analysis-net">
+                                <div ref="graphContainer" class="lb-an-canvas"></div>
 
-                <!-- Network Graph -->
-                <div v-show="activeTab==='network'">
-                    <!-- Graph Toolbar -->
-                    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
-                        <!-- Search -->
-                        <div style="position:relative;width:260px">
-                            <input v-model="graphSearchQuery" @focus="graphSearchOpen = true" @input="graphSearchOpen = true" @blur="setTimeout(() => graphSearchOpen = false, 200)"
-                                :placeholder="$t('analysis.searchNavigate')" class="lb-input" style="padding-left:32px">
-                            <svg style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--lb-mute)" width="14" height="14" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-                            <div v-if="graphSearchOpen && graphSearchResults.length" style="position:absolute;top:100%;left:0;right:0;margin-top:4px;background:var(--lb-bg-elev);border:1px solid var(--lb-hairline);border-radius:8px;box-shadow:var(--lb-shadow-lg);max-height:240px;overflow-y:auto;z-index:30">
-                                <button v-for="n in graphSearchResults" :key="n.id" @mousedown.prevent="navigateToNode(n)"
-                                    style="width:100%;text-align:left;padding:7px 12px;font-size:12px;border:0;background:transparent;border-bottom:1px solid var(--lb-hairline);display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--lb-ink-2)">
-                                    <span style="width:8px;height:8px;border-radius:50%;flex-shrink:0" :style="{background: graphNodeColor(n.type)}"></span>
-                                    <span class="lb-truncate" style="flex:1">{{ n.title || n.id }}</span>
-                                    <span v-if="n.year" class="lb-mono" style="font-size:11px;color:var(--lb-mute);flex-shrink:0">{{ n.year }}</span>
-                                </button>
-                            </div>
-                        </div>
-                        <span class="lb-field-label" style="margin:0 4px 0 8px">{{ $t('filters.category') }}</span>
-                        <select v-model="graphPanelCategory" @change="applyCategoryFilter" class="lb-select" style="border:1px solid var(--lb-hairline);border-radius:7px;background:var(--lb-bg-elev);min-width:160px">
-                            <option value="">{{ $t('filters.all') }}</option>
-                            <option v-for="c in graphPanelCategoryList" :key="c.id" :value="c.id">{{ c.name }}</option>
-                        </select>
-                        <div style="position:relative;margin-left:auto">
-                            <button @click="graphPanelOpen = !graphPanelOpen" class="lb-btn">
-                                <span style="width:7px;height:7px;border-radius:2px;background:var(--lb-accent)"></span>
-                                Eigene Paper ({{ graphPanelFilteredPapers.length }})
-                                <svg :style="{transform: graphPanelOpen ? 'rotate(180deg)' : 'none', transition:'transform .12s ease'}" width="11" height="11" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-                            </button>
-                            <div v-if="graphPanelOpen" style="position:absolute;top:100%;right:0;margin-top:4px;background:var(--lb-bg-elev);border:1px solid var(--lb-hairline);border-radius:8px;box-shadow:var(--lb-shadow-lg);overflow:hidden;z-index:30;width:320px">
-                                <div style="padding:8px;border-bottom:1px solid var(--lb-hairline)">
-                                    <input v-model="graphPanelSearch" :placeholder="$t('analysis.filterPlaceholder')" class="lb-input" style="padding:6px 10px;font-size:12px">
+                                <!-- A re-run leaves the network standing and only says so. -->
+                                <div v-if="loading" class="lb-an-pill" :style="{ top: (bandBottom + 8) + 'px' }" role="status" data-testid="analysis-rerun-pill">
+                                    <span class="lb-an-spin is-ink" aria-hidden="true"></span>
+                                    {{ $t('analysis.running') }}
+                                    <span class="lb-an-n">{{ runElapsed }}</span>
                                 </div>
-                                <div style="max-height:280px;overflow-y:auto">
-                                    <button v-for="p in graphPanelFilteredPapers" :key="p.id" @click="navigateToNode(p)"
-                                        :style="{background: highlightedNodeId === p.id ? 'var(--lb-accent-soft)' : 'transparent'}"
-                                        style="width:100%;text-align:left;padding:7px 12px;font-size:12px;border:0;border-bottom:1px solid var(--lb-hairline);display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--lb-ink-2)">
-                                        <span style="width:7px;height:7px;border-radius:50%;flex-shrink:0;background:var(--lb-ink)"></span>
-                                        <span class="lb-truncate" style="flex:1">{{ p.title || p.id }}</span>
-                                        <span v-if="p.year" class="lb-mono" style="font-size:11px;color:var(--lb-mute);flex-shrink:0">{{ p.year }}</span>
+
+                                <!-- Hover card -->
+                                <div v-if="hoverNode && !viewOpen" class="lb-hover-card" aria-hidden="true">
+                                    <div class="lb-hover-year">{{ hoverNode.year || '—' }}</div>
+                                    <div class="lb-hover-title">{{ hoverNode.title || hoverNode.id }}</div>
+                                    <div class="lb-hover-meta" v-if="hoverNode.authors">{{ hoverNode.authors }}</div>
+                                    <div class="lb-hover-foot">
+                                        <span v-if="hoverNode.cited_by_count != null">{{ hoverNode.cited_by_count.toLocaleString($locale()) }} {{ $t('papers.citAbbr') }}</span>
+                                        <span v-if="hoverNode.cited_by_count != null" class="lb-meta-dot">·</span>
+                                        <span>{{ nodeKindLabel(hoverNode) }}</span>
+                                    </div>
+                                </div>
+
+                                <!-- Tools, top left: search, category, own items, the lens
+                                     and - in a Collection - its chat. They wrap, never clip. -->
+                                <div ref="toolbar" class="lb-an-tools" data-testid="analysis-tools">
+                                    <div ref="search" class="lb-an-search">
+                                        <svg class="lb-an-ic lb-an-search-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                                        <input ref="searchInput" v-model="searchQuery" type="text" class="lb-an-field" role="combobox"
+                                               :aria-label="$t('analysis.search.label')" aria-autocomplete="list"
+                                               :aria-expanded="searchExpanded ? 'true' : 'false'" aria-controls="lb-an-search-list"
+                                               :aria-activedescendant="searchExpanded ? 'lb-an-opt-' + searchActiveIndex : null"
+                                               aria-keyshortcuts="/" :placeholder="$t('analysis.searchNavigate')" autocomplete="off"
+                                               data-testid="analysis-search" @input="onSearchInput" @focus="onSearchFocus" @keydown="onSearchKey">
+                                        <div v-if="searchOpen && searchQuery.trim()" class="lb-an-float lb-an-results">
+                                            <ul v-if="searchResults.length" id="lb-an-search-list" role="listbox" :aria-label="$t('analysis.search.results')" data-testid="analysis-search-list">
+                                                <li v-for="(r, i) in searchResults" :key="r.id" :id="'lb-an-opt-' + i" role="option" class="lb-an-opt"
+                                                    :class="{ 'is-active': i === searchActiveIndex }" :aria-selected="i === searchActiveIndex ? 'true' : 'false'"
+                                                    :data-node-id="r.id" @click="pickResult(r)">
+                                                    <span class="lb-an-sw" :class="'is-' + r.kind" aria-hidden="true"></span>
+                                                    <span class="lb-an-opt-title">{{ r.title }}</span>
+                                                    <span v-if="r.year" class="lb-an-n lb-an-opt-year">{{ r.year }}</span>
+                                                </li>
+                                            </ul>
+                                            <p class="lb-an-results-note" aria-hidden="true">{{ searchStatus }}</p>
+                                        </div>
+                                        <p class="lb-an-sr" role="status" data-testid="analysis-search-status">{{ searchStatus }}</p>
+                                    </div>
+
+                                    <label for="lb-an-cat" class="lb-an-sr">{{ $t('filters.category') }}</label>
+                                    <select id="lb-an-cat" v-model="graphPanelCategory" class="lb-key lb-an-select" data-testid="analysis-category">
+                                        <option value="">{{ $t('analysis.category.all') }}</option>
+                                        <option v-for="c in graphPanelCategoryList" :key="c.id" :value="String(c.id)">{{ c.name }}</option>
+                                    </select>
+
+                                    <div ref="ownMenu" class="lb-an-menu-w">
+                                        <button type="button" class="lb-key" :aria-expanded="ownListOpen ? 'true' : 'false'" aria-controls="lb-an-own-list"
+                                                data-testid="analysis-own-items" @click="ownListOpen = !ownListOpen">
+                                            <span class="lb-an-sw is-own is-sm" aria-hidden="true"></span>
+                                            {{ $t('analysis.ownItemsKey') }}
+                                            <span class="lb-an-n lb-an-key-n">{{ fmtCount(ownPapersInCategory.length) }}</span>
+                                            <svg class="lb-an-ic lb-key-chev" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+                                        </button>
+                                        <div v-if="ownListOpen" id="lb-an-own-list" class="lb-an-float lb-an-ownlist" data-testid="analysis-own-list">
+                                            <div v-if="ownPapersInCategory.length >= 20" class="lb-an-ownlist-filter">
+                                                <input v-model="graphPanelSearch" type="text" class="lb-an-field is-plain" :aria-label="$t('analysis.filterPlaceholder')" :placeholder="$t('analysis.filterPlaceholder')">
+                                            </div>
+                                            <ul>
+                                                <li v-for="p in graphPanelFilteredPapers" :key="p.id">
+                                                    <router-link :to="'/paper/' + p.paper_id" class="lb-an-ownlist-a">
+                                                        <span class="lb-an-sw is-own is-sm" aria-hidden="true"></span>
+                                                        <span class="lb-an-opt-title">{{ p.title || p.id }}</span>
+                                                        <span v-if="p.year" class="lb-an-n lb-an-opt-year">{{ p.year }}</span>
+                                                    </router-link>
+                                                </li>
+                                                <li v-if="!graphPanelFilteredPapers.length" class="lb-an-ownlist-empty">{{ $t('analysis.noItemsFound') }}</li>
+                                            </ul>
+                                        </div>
+                                    </div>
+
+                                    <button ref="lensChip" type="button" class="lb-an-chip" :aria-pressed="lensOn ? 'true' : 'false'"
+                                            :title="$t('analysis.lens.title')" data-testid="analysis-lens" @click="toggleLens">
+                                        <span class="lb-an-sw is-shared is-sm" aria-hidden="true"></span>
+                                        {{ $t('analysis.lens.label') }}
+                                        <span class="lb-an-n" data-testid="analysis-lens-count">{{ fmtCount(sharedCount) }}</span>
                                     </button>
-                                    <div v-if="!graphPanelFilteredPapers.length" style="padding:18px;text-align:center;font-size:12px;color:var(--lb-mute)">{{ $t('analysis.noItemsFound') }}</div>
+
+                                    <button v-if="scope" type="button" class="lb-key" data-testid="analysis-chat-collection" @click="askAboutCollection">
+                                        <svg class="lb-an-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                                        {{ $t('analysis.askCollection', { name: scope.name }) }}
+                                    </button>
+                                </div>
+
+                                <!-- "View": colour by and the filters, above the bar. -->
+                                <div v-if="viewOpen" id="lb-an-view-pop" ref="viewPop" class="lb-an-float lb-an-pop" role="dialog"
+                                     :aria-label="$t('analysis.view.key')" data-testid="analysis-view-pop">
+                                    <div class="lb-an-pop-block">
+                                        <p id="lb-an-colorby-l" class="lb-an-label">{{ $t('analysis.view.colorBy') }}</p>
+                                        <div class="lb-an-seg lb-an-seg-2" role="radiogroup" aria-labelledby="lb-an-colorby-l" data-testid="analysis-color-by" @keydown="onColorKey">
+                                            <span class="lb-an-seg-thumb" aria-hidden="true" :style="{ transform: colorBy === 'year' ? 'translateX(100%)' : 'translateX(0)' }"></span>
+                                            <button type="button" role="radio" class="lb-an-seg-btn" data-color-by="type"
+                                                    :aria-checked="colorBy === 'type' ? 'true' : 'false'" :tabindex="colorBy === 'type' ? 0 : -1"
+                                                    @click="colorBy = 'type'">{{ $t('analysis.view.byType') }}</button>
+                                            <button type="button" role="radio" class="lb-an-seg-btn" data-color-by="year"
+                                                    :aria-checked="colorBy === 'year' ? 'true' : 'false'" :tabindex="colorBy === 'year' ? 0 : -1"
+                                                    @click="colorBy = 'year'">{{ $t('analysis.view.byYear') }}</button>
+                                        </div>
+                                    </div>
+                                    <div class="lb-an-pop-block is-filters">
+                                        <p class="lb-an-label">{{ $t('analysis.filter') }}</p>
+                                        <div class="lb-an-range">
+                                            <div class="lb-an-range-head"><label for="lb-an-f-minrefs">{{ $t('analysis.refDepth') }}</label><span class="lb-an-n" data-testid="analysis-filter-minrefs-value">{{ $tn('analysis.steps', minRefs) }}</span></div>
+                                            <input id="lb-an-f-minrefs" v-model.number="minRefs" type="range" min="1" max="3" step="1" aria-describedby="lb-an-f-minrefs-h" data-testid="analysis-filter-minrefs">
+                                            <p id="lb-an-f-minrefs-h" class="lb-an-range-note">{{ $t('analysis.refDepthTitle') }}</p>
+                                        </div>
+                                        <div class="lb-an-range">
+                                            <div class="lb-an-range-head"><label for="lb-an-f-mincit">{{ $t('analysis.minCitations') }}</label><span class="lb-an-n">{{ minCitations ? fmtCount(minCitations) : $t('analysis.off') }}</span></div>
+                                            <input id="lb-an-f-mincit" v-model.number="minCitations" type="range" min="0" max="500" step="10" data-testid="analysis-filter-mincit">
+                                        </div>
+                                        <div class="lb-an-range">
+                                            <div class="lb-an-range-head"><label for="lb-an-f-topn">{{ $t('analysis.topNRefs') }}</label><span class="lb-an-n">{{ topNRefs ? fmtCount(topNRefs) : $t('analysis.all') }}</span></div>
+                                            <input id="lb-an-f-topn" v-model.number="topNRefs" type="range" min="0" max="30" step="1" data-testid="analysis-filter-topn">
+                                        </div>
+                                        <div class="lb-an-range">
+                                            <div class="lb-an-range-head"><label for="lb-an-f-spacing">{{ $t('analysis.spacing') }}</label><span class="lb-an-n">{{ graphDistance }}</span></div>
+                                            <input id="lb-an-f-spacing" v-model.number="graphDistance" type="range" min="5" max="120" step="1" data-testid="analysis-filter-spacing">
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
-                        </div>
-                    </div>
-                    <!-- Net Shell: Canvas + Aside -->
-                    <div class="lb-net-shell">
-                        <div class="lb-net-canvas">
-                            <div ref="graphContainer" style="position:absolute;inset:0" @click.self="clearHighlight"></div>
 
-                            <!-- Hover Card -->
-                            <div v-if="hoverNode" class="lb-hover-card">
-                                <div class="lb-hover-year">{{ hoverNode.year || '—' }}</div>
-                                <div class="lb-hover-title">{{ hoverNode.title || hoverNode.id }}</div>
-                                <div class="lb-hover-meta" v-if="hoverNode.authors">{{ hoverNode.authors }}</div>
-                                <div class="lb-hover-foot">
-                                    <span v-if="hoverNode.cited_by_count != null">{{ hoverNode.cited_by_count.toLocaleString($locale()) }} {{ $t('papers.citAbbr') }}</span>
-                                    <span v-if="hoverNode.cited_by_count != null" class="lb-meta-dot">·</span>
-                                    <span>{{ nodeTypeLabel(hoverNode.type) }}</span>
-                                </div>
-                            </div>
-
-                            <!-- Selected Node Detail -->
-                            <div v-if="selectedNode" style="position:absolute;top:18px;right:18px;background:var(--lb-bg-elev);border:1px solid var(--lb-hairline);border-radius:10px;box-shadow:var(--lb-shadow-lg);padding:18px;width:320px;z-index:10;max-height:calc(100% - 36px);overflow-y:auto">
-                                <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:10px">
-                                    <div style="flex:1;min-width:0">
-                                        <div class="lb-mono" style="font-size:10.5px;color:var(--lb-accent);letter-spacing:0.04em;margin-bottom:4px">{{ selectedNode.year || '—' }} · {{ nodeTypeLabel(selectedNode.type) }}</div>
-                                        <h4 style="font-family:var(--lb-font-serif);font-size:15px;line-height:1.3;font-weight:500;color:var(--lb-ink);margin:0">{{ selectedNode.title }}</h4>
-                                    </div>
-                                    <button @click="selectedNode=null; clearHighlight(); nodeAbstract=null" class="lb-modal-close" style="width:24px;height:24px"><span v-html="icons.x"></span></button>
-                                </div>
-                                <p v-if="selectedNode.authors" style="font-size:12px;color:var(--lb-ink-3);font-style:italic;margin:0 0 8px">{{ selectedNode.authors }}</p>
-                                <div class="lb-mono" style="display:flex;gap:10px;font-size:11px;color:var(--lb-mute);margin-bottom:8px">
-                                    <span v-if="selectedNode.cited_by_count">{{ selectedNode.cited_by_count.toLocaleString($locale()) }} {{ $t('papers.citAbbr') }}</span>
-                                    <span v-if="selectedNode.referenced_by_count">{{ $t('analysis.refTimes', { count: selectedNode.referenced_by_count }) }}</span>
-                                </div>
-                                <div v-if="selectedNode.doi" style="margin-bottom:10px">
-                                    <a :href="'https://doi.org/' + selectedNode.doi" target="_blank" class="lb-mono" style="font-size:11px;color:var(--lb-accent);text-decoration:none">DOI: {{ selectedNode.doi }}</a>
-                                </div>
-                                <div v-if="selectedNode.paper_id" style="margin-bottom:10px">
-                                    <router-link :to="'/paper/' + selectedNode.paper_id" class="lb-btn lb-btn-primary" style="padding:5px 10px;font-size:11.5px">{{ $t('analysis.openDetails') }} →</router-link>
-                                </div>
-                                <div style="border-top:1px solid var(--lb-hairline);padding-top:10px;margin-top:6px">
-                                    <div v-if="nodeAbstractLoading" style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--lb-mute)">
-                                        <span class="spinner-sm"></span> {{ $t('analysis.abstractLoading') }}
-                                    </div>
-                                    <div v-else-if="nodeAbstract" style="font-size:12.5px;line-height:1.55;color:var(--lb-ink-2);max-height:160px;overflow-y:auto">
-                                        <span class="lb-section-label" style="padding:0;display:inline">Abstract</span><br>{{ nodeAbstract }}
-                                    </div>
-                                    <div v-else-if="nodeAbstractError" style="font-size:11.5px;color:var(--lb-mute);font-style:italic">{{ nodeAbstractError }}</div>
-                                </div>
-                                <button @click="askAboutSelectedNode()" class="lb-btn lb-btn-w" style="margin-top:10px;justify-content:center">
-                                    <svg width="13" height="13" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
-                                    {{ $t('analysis.askInChat') }}
-                                </button>
-                            </div>
-                        </div>
-
-                        <aside class="lb-net-aside">
-                            <div class="lb-aside-block">
-                                <h4 class="lb-aside-h">{{ $t('analysis.legend') }}</h4>
-                                <ul class="lb-legend">
-                                    <li><span class="lb-legend-mark lb-legend-paper"></span><span>{{ $t('analysis.legendOwnItem') }}</span></li>
-                                    <li><span class="lb-legend-mark" style="background:var(--lb-accent);width:12px;height:12px;border-radius:50%"></span><span>{{ $t('analysis.legendShared') }}</span></li>
-                                    <li><span class="lb-legend-mark lb-legend-cat"></span><span>{{ $t('analysis.legendSize') }}</span></li>
-                                    <li><span class="lb-legend-mark lb-legend-edge"></span><span>{{ $t('analysis.legendCites') }}</span></li>
-                                    <li><span class="lb-legend-mark lb-legend-edge-co"></span><span>{{ $t('analysis.legendPdfRef') }}</span></li>
+                            <!-- The bar below the net, in the flow: legend, hint, "View"
+                                 and the zoom keys. Its swatches use the net's tokens. -->
+                            <div ref="bar" class="lb-an-legendbar">
+                                <ul class="lb-an-legend" :aria-label="$t('analysis.legend')" data-testid="analysis-legend">
+                                    <li data-legend="own"><span class="lb-an-sw is-own" aria-hidden="true"></span>{{ $t('analysis.legendOwnItem') }}</li>
+                                    <template v-if="colorBy === 'year'">
+                                        <li data-legend="years"><span class="lb-an-n">{{ $t('analysis.legend.older') }}</span> <span class="lb-an-yearbar" aria-hidden="true"></span> <span class="lb-an-n">{{ $t('analysis.legend.newer') }}</span></li>
+                                        <li data-legend="shared"><span class="lb-an-sw is-shared-ring" aria-hidden="true"></span>{{ $t('analysis.sharedReference') }}</li>
+                                    </template>
+                                    <template v-else>
+                                        <li data-legend="shared"><span class="lb-an-sw is-shared" aria-hidden="true"></span>{{ $t('analysis.sharedReference') }}</li>
+                                        <li data-legend="reference"><span class="lb-an-sw is-external" aria-hidden="true"></span>{{ $t('analysis.legend.reference') }}</li>
+                                        <li data-legend="deeper"><span class="lb-an-sw is-deeper" aria-hidden="true"></span>{{ $t('analysis.legend.deeper') }}</li>
+                                    </template>
+                                    <li data-legend="size"><span class="lb-an-sizes" aria-hidden="true"><span class="lb-an-sw is-external is-xs"></span><span class="lb-an-sw is-external is-lg"></span></span>{{ $t('analysis.legendSize') }}</li>
+                                    <li data-legend="cite"><span class="lb-an-line is-cite" aria-hidden="true"></span>{{ $t('analysis.legendCites') }}</li>
+                                    <li data-legend="pdf"><span class="lb-an-line is-pdf" aria-hidden="true"></span>{{ $t('analysis.legendPdfRef') }}</li>
                                 </ul>
-                            </div>
-
-                            <div class="lb-aside-block">
-                                <h4 class="lb-aside-h">{{ $t('analysis.filter') }}</h4>
-                                <div style="display:flex;flex-direction:column;gap:14px;margin-top:6px">
-                                    <div>
-                                        <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--lb-ink-3);margin-bottom:4px"><span>{{ $t('analysis.spacing') }}</span><span class="lb-mono" style="color:var(--lb-ink-2)">{{ graphDistance }}</span></div>
-                                        <input type="range" v-model.number="graphDistance" min="5" max="120" step="1" style="width:100%;accent-color:var(--lb-accent)">
-                                    </div>
-                                    <div>
-                                        <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--lb-ink-3);margin-bottom:4px"><span :title="$t('analysis.refDepthTitle')">{{ $t('analysis.refDepth') }}</span><span class="lb-mono" style="color:var(--lb-accent)">{{ minRefs }}</span></div>
-                                        <input type="range" v-model.number="minRefs" min="1" max="3" step="1" style="width:100%;accent-color:var(--lb-accent)">
-                                    </div>
-                                    <div>
-                                        <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--lb-ink-3);margin-bottom:4px"><span :title="$t('analysis.minCitationsTitle')">{{ $t('analysis.minCitations') }}</span><span class="lb-mono" style="color:var(--lb-ink-2)">{{ minCitations || $t('analysis.off') }}</span></div>
-                                        <input type="range" v-model.number="minCitations" min="0" max="500" step="10" style="width:100%;accent-color:var(--lb-accent)">
-                                    </div>
-                                    <div>
-                                        <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--lb-ink-3);margin-bottom:4px"><span :title="$t('analysis.topNTitle')">{{ $t('analysis.topNRefs') }}</span><span class="lb-mono" style="color:var(--lb-ink-2)">{{ topNRefs || 'Alle' }}</span></div>
-                                        <input type="range" v-model.number="topNRefs" min="0" max="30" step="1" style="width:100%;accent-color:var(--lb-accent)">
-                                    </div>
+                                <div class="lb-an-legendbar-r">
+                                    <span class="lb-an-hint" data-testid="analysis-hint"><template v-for="(p, i) in hintParts" :key="i"><kbd v-if="p.key">/</kbd><template v-else>{{ p.text }}</template></template></span>
+                                    <button ref="viewKey" type="button" class="lb-key lb-an-viewkey" :aria-expanded="viewOpen ? 'true' : 'false'"
+                                            aria-controls="lb-an-view-pop" data-testid="analysis-view-key" @click="viewOpen = !viewOpen">
+                                        <svg class="lb-an-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="9" cy="6" r="2" class="lb-an-ic-knob"/><circle cx="15" cy="12" r="2" class="lb-an-ic-knob"/><circle cx="8" cy="18" r="2" class="lb-an-ic-knob"/></svg>
+                                        {{ $t('analysis.view.key') }}
+                                        <span v-if="colorBy === 'year'" class="lb-an-n lb-an-key-n">{{ $t('analysis.view.year') }}</span>
+                                    </button>
+                                    <button type="button" class="lb-key lb-key-icon" :aria-label="$t('analysis.zoom.in')" aria-keyshortcuts="+"
+                                            :title="$t('analysis.zoom.inTitle')" data-testid="analysis-zoom-in" @click="zoomBy(1.25)">
+                                        <svg class="lb-an-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                    </button>
+                                    <button type="button" class="lb-key lb-key-icon" :aria-label="$t('analysis.zoom.out')" aria-keyshortcuts="-"
+                                            :title="$t('analysis.zoom.outTitle')" data-testid="analysis-zoom-out" @click="zoomBy(1 / 1.25)">
+                                        <svg class="lb-an-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                    </button>
+                                    <button type="button" class="lb-key lb-key-icon" :aria-label="$t('analysis.zoom.fit')" aria-keyshortcuts="0"
+                                            :title="$t('analysis.zoom.fitTitle')" data-testid="analysis-zoom-fit" @click="zoomFit">
+                                        <svg class="lb-an-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+                                    </button>
                                 </div>
                             </div>
-
-                            <div class="lb-aside-block" style="margin-top:auto">
-                                <p class="lb-mono" style="font-size:10px;color:var(--lb-mute);letter-spacing:0.06em;margin:0">{{ $t('analysis.panZoomHint') }}</p>
-                            </div>
-                        </aside>
-                    </div>
-                </div>
-
-                <!-- Paper Chat (below network) -->
-                <div v-show="activeTab==='network' && networkData" style="border-top:1px solid var(--lb-hairline);margin-top:24px;padding-top:20px">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-                        <div>
-                            <div class="lb-section-label" style="padding:0;margin-bottom:4px">{{ $t('analysis.itemChat') }}</div>
-                            <div v-if="chatContextPaper" style="font-family:var(--lb-font-serif);font-style:italic;font-size:15px;color:var(--lb-ink-2)" class="lb-truncate">{{ chatContextPaper.title }}</div>
-                        </div>
-                        <div style="display:flex;align-items:center;gap:10px">
-                            <button v-if="chatContextPaper" @click="chatContextPaper=null; clearChat()" class="lb-btn-text" :title="$t('analysis.clearItemContext')">{{ $t('analysis.switchItem') }}</button>
-                            <button @click="chatOpen = !chatOpen" class="lb-btn-text">{{ chatOpen ? 'Einklappen' : 'Aufklappen' }}</button>
-                        </div>
-                    </div>
-
-                    <div v-show="chatOpen">
-                        <div v-if="!chatContextPaper" class="lb-empty" style="padding:32px 24px;border:1px solid var(--lb-hairline);border-radius:10px;background:var(--lb-bg-elev)">
-                            <div class="lb-empty-mark">"</div>
-                            <p style="font-size:13.5px;color:var(--lb-ink-3);margin:0 0 4px">{{ $t('analysis.chatHintBefore') }} <span style="color:var(--lb-accent);font-weight:500">{{ $t('analysis.chatHintButton') }}</span>.</p>
-                            <p style="font-size:12px;color:var(--lb-mute);margin:0">{{ $t('analysis.chatHintBoth') }}</p>
                         </div>
 
-                        <div v-else>
-                            <div ref="chatMessages" style="background:var(--lb-bg-elev);border:1px solid var(--lb-hairline);border-radius:10px;margin-bottom:10px;overflow-y:auto;max-height:400px;min-height:140px">
-                                <div v-if="chatMessages.length === 0 && !chatStreaming" style="display:flex;align-items:center;justify-content:center;height:140px;color:var(--lb-mute);font-size:12.5px;font-style:italic">
-                                    {{ $t('analysis.askAbout', { title: chatContextPaper.title }) }}
+                        <!-- The card: a work picked in the net or the search, or the
+                             Collection's chat. Details | Chat, closed by its key or Esc. -->
+                        <section v-if="cardOpen" ref="card" class="lb-an-float lb-an-card" :style="cardStyle"
+                                 aria-labelledby="lb-an-card-title" data-testid="analysis-card" :data-card-tab="cardTabShown">
+                            <div class="lb-an-card-top">
+                                <div class="lb-an-seg lb-an-seg-2 lb-an-card-tabs" role="tablist" :aria-label="$t('analysis.card.tabsLabel')" @keydown="onCardTabKey">
+                                    <span class="lb-an-seg-thumb" aria-hidden="true" :style="{ transform: cardTabShown === 'chat' ? 'translateX(100%)' : 'translateX(0)' }"></span>
+                                    <button id="lb-an-card-tab-details" type="button" role="tab" class="lb-an-seg-btn" aria-controls="lb-an-card-panel"
+                                            :aria-selected="cardTabShown === 'details' ? 'true' : 'false'" :tabindex="cardTabShown === 'details' ? 0 : -1"
+                                            :aria-disabled="collChat ? 'true' : null" :title="collChat ? $t('analysis.card.detailsOnlyWork') : null"
+                                            data-testid="analysis-card-tab-details" @click="showCardTab('details')">{{ $t('analysis.card.details') }}</button>
+                                    <button id="lb-an-card-tab-chat" type="button" role="tab" class="lb-an-seg-btn" aria-controls="lb-an-card-panel"
+                                            :aria-selected="cardTabShown === 'chat' ? 'true' : 'false'" :tabindex="cardTabShown === 'chat' ? 0 : -1"
+                                            data-testid="analysis-card-tab-chat" @click="showCardTab('chat')">{{ $t('analysis.card.chat') }}</button>
                                 </div>
-                                <div v-for="(msg, i) in chatMessages" :key="i" style="padding:14px 18px;border-bottom:1px solid var(--lb-hairline)">
-                                    <div class="lb-section-label" style="padding:0;margin-bottom:6px" :style="{color: msg.role === 'user' ? 'var(--lb-accent)' : 'var(--lb-mute)'}">{{ msg.role === 'user' ? 'Du' : 'Assistent' }}</div>
-                                    <div :style="{fontFamily: msg.role === 'user' ? 'var(--lb-font-sans)' : 'var(--lb-font-serif)', fontSize: msg.role === 'user' ? '13.5px' : '15px'}" class="lb-md" style="line-height:1.6;color:var(--lb-ink-2)" v-html="renderMarkdown(msg.content)"></div>
-                                </div>
-                                <div v-if="chatStreaming" style="padding:14px 18px">
-                                    <div class="lb-section-label" style="padding:0;margin-bottom:6px;color:var(--lb-mute)">{{ $t('analysis.assistant') }}</div>
-                                    <div style="font-family:var(--lb-font-serif);font-size:15px;line-height:1.6;color:var(--lb-ink-2)" class="lb-md" v-html="renderMarkdown(chatStreamContent || $t('analysis.thinking'))"></div>
-                                </div>
-                            </div>
-
-                            <div style="display:flex;gap:8px">
-                                <input v-model="chatInput" @keydown.enter="sendChatMessage" :disabled="chatStreaming"
-                                    :placeholder="$t('analysis.askAboutItem')" class="lb-input" style="flex:1">
-                                <button @click="sendChatMessage" :disabled="chatStreaming || !chatInput.trim()" class="lb-btn lb-btn-primary">
-                                    <span v-if="chatStreaming" class="spinner-sm"></span>
-                                    <svg v-else width="14" height="14" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6"/></svg>
-                                    {{ $t('chat.send') }}
-                                </button>
-                                <button v-if="chatMessages.length" @click="clearChat" class="lb-icon-btn" :title="$t('chat.clear')">
-                                    <svg width="14" height="14" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                                <button type="button" class="lb-key lb-key-icon lb-an-card-close" :aria-label="$t('common.close')" aria-keyshortcuts="Escape"
+                                        :title="$t('analysis.card.closeTitle')" data-testid="analysis-card-close" @click="closeCard()">
+                                    <svg class="lb-an-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                                 </button>
                             </div>
 
-                            <div v-if="chatMessages.length === 0 && !chatStreaming" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
-                                <button v-for="q in quickQuestions" :key="q" @click="chatInput = q; $nextTick(() => sendChatMessage())" class="lb-chip">{{ q }}</button>
+                            <div ref="cardBody" id="lb-an-card-panel" class="lb-an-card-body" role="tabpanel"
+                                 :aria-labelledby="cardTabShown === 'chat' ? 'lb-an-card-tab-chat' : 'lb-an-card-tab-details'">
+                                <template v-if="collChat">
+                                    <p class="lb-an-label lb-an-card-kicker">{{ $t('analysis.card.collection') }}</p>
+                                    <h2 id="lb-an-card-title" ref="cardTitle" tabindex="-1" class="lb-an-card-title" data-testid="analysis-card-title">{{ scope ? scope.name : '' }}</h2>
+                                    <p v-if="chatContextPaper && chatContextPaper.capped" class="lb-an-card-note" data-testid="analysis-chat-capped"><span v-for="(p, i) in cappedParts" :key="i" :class="{ 'lb-an-n': p.num }">{{ p.text }}</span></p>
+                                </template>
+                                <template v-else-if="selectedNode">
+                                    <p class="lb-an-card-kicker">
+                                        <span v-if="selectedNode.year" class="lb-an-card-year" data-testid="analysis-card-year">{{ selectedNode.year }}</span>
+                                        <span class="lb-an-label lb-an-card-kind" :class="{ 'is-shared': cardKind === 'shared' }" data-testid="analysis-card-kind">{{ cardKind === 'shared' ? $t('analysis.sharedReference') : $t('analysis.citedWork') }}</span>
+                                    </p>
+                                    <h2 id="lb-an-card-title" ref="cardTitle" tabindex="-1" class="lb-an-card-title" data-testid="analysis-card-title">{{ selectedNode.title || $t('papers.untitled') }}</h2>
+                                    <p v-if="selectedNode.authors" class="lb-an-card-authors">{{ selectedNode.authors }}</p>
+                                    <p v-if="selectedNode.cited_by_count != null" class="lb-an-card-note" data-testid="analysis-card-citations"><span v-for="(p, i) in cardCitationParts" :key="i" :class="{ 'lb-an-n': p.num }">{{ p.text }}</span></p>
+                                </template>
+
+                                <!-- Details: the own Items citing it, then the abstract. -->
+                                <template v-if="cardTabShown === 'details' && selectedNode">
+                                    <template v-if="cardCiters.length">
+                                        <h3 class="lb-an-label lb-an-card-h">{{ $tn('analysis.card.citedBy', cardCiters.length) }}</h3>
+                                        <ul class="lb-an-citers" data-testid="analysis-card-citers">
+                                            <li v-for="c in cardCiters" :key="c.id">
+                                                <router-link :to="'/paper/' + c.paper_id"><span class="lb-an-sw is-own is-xs8" aria-hidden="true"></span>{{ c.title || $t('papers.untitled') }}</router-link>
+                                            </li>
+                                        </ul>
+                                    </template>
+                                    <h3 class="lb-an-label lb-an-card-h is-abstract">{{ $t('common.abstract') }}</h3>
+                                    <p class="lb-an-sr" role="status">{{ nodeAbstractLoading ? $t('analysis.abstractLoading') : '' }}</p>
+                                    <div v-if="nodeAbstractLoading" class="lb-an-skeleton" aria-hidden="true" data-testid="analysis-card-skeleton"><span></span><span></span><span></span></div>
+                                    <p v-else-if="nodeAbstract" class="lb-an-abstract" data-testid="analysis-card-abstract">{{ nodeAbstract }}</p>
+                                    <p v-else-if="nodeAbstractError" class="lb-an-card-muted" data-testid="analysis-card-abstract-none">{{ nodeAbstractError }}</p>
+                                </template>
+
+                                <!-- Chat: what it answers from, then the conversation. -->
+                                <template v-if="cardTabShown === 'chat'">
+                                    <div v-if="llmReady === false" class="lb-an-nomodel" data-testid="analysis-chat-nomodel">
+                                        <p class="lb-an-nomodel-t">{{ $t('analysis.chat.noModelTitle') }}</p>
+                                        <p class="lb-an-card-muted lb-an-gap-b">{{ $t('analysis.chat.noModelText') }}</p>
+                                        <router-link to="/settings/ai-models" class="lb-key" data-testid="analysis-chat-setup">{{ $t('analysis.bulk.setUpModels') }}</router-link>
+                                    </div>
+                                    <template v-else>
+                                        <div class="lb-an-chat-top">
+                                            <p class="lb-an-card-muted" data-testid="analysis-chat-basis">{{ chatBasis }}</p>
+                                            <button v-if="chatMessages.length && !chatStreaming" type="button" class="lb-an-text-action lb-an-chat-clear"
+                                                    data-testid="analysis-chat-clear" @click="clearChat">{{ $t('analysis.chat.clear') }}</button>
+                                        </div>
+                                        <div v-if="!chatMessages.length && !chatStreaming" class="lb-an-chips" data-testid="analysis-chat-quick">
+                                            <button v-for="q in quickQuestions" :key="q" type="button" class="lb-an-chip is-small" @click="sendChatMessage(q)">{{ q }}</button>
+                                        </div>
+                                        <ol v-else class="lb-an-msgs" data-testid="analysis-chat-messages">
+                                            <li v-for="(msg, i) in chatMessages" :key="i" class="lb-an-msg" :class="msg.role === 'user' ? 'is-user' : 'is-assistant'">
+                                                <span class="lb-an-label">{{ msg.role === 'user' ? $t('analysis.you') : $t('analysis.assistant') }}</span>
+                                                <div class="lb-an-msg-text lb-md" v-html="renderMarkdown(msg.content)"></div>
+                                            </li>
+                                            <li v-if="chatStreaming" class="lb-an-msg is-assistant" :class="{ 'is-thinking': !chatStreamContent }" aria-live="polite">
+                                                <span class="lb-an-label">{{ $t('analysis.assistant') }}</span>
+                                                <div class="lb-an-msg-text lb-md" v-html="renderMarkdown(chatStreamContent || $t('analysis.thinking'))"></div>
+                                            </li>
+                                        </ol>
+                                    </template>
+                                </template>
                             </div>
-                        </div>
+
+                            <!-- Foot, fixed below the scrolling body. -->
+                            <div v-if="cardTabShown === 'details' && selectedNode" class="lb-an-card-foot">
+                                <p class="lb-an-card-status" :class="{ 'is-on': nodeAddResult }" role="status" data-testid="node-add-result">{{ nodeAddResult }}</p>
+                                <div class="lb-an-card-keys">
+                                    <router-link v-if="adoptedPaperId" :to="'/paper/' + adoptedPaperId" class="lb-key" data-testid="node-open-details">{{ $t('analysis.openDetails') }}</router-link>
+                                    <!-- In a Collection the key says "collection", not its name: a long
+                                         name ran out of the 320 px card. The name stays in the tooltip. -->
+                                    <button v-else-if="selectedNode.doi" type="button" class="lb-key" :disabled="nodeAdding"
+                                            :title="scope ? $t('analysis.addToCollection', { name: scope.name }) : null"
+                                            :data-testid="scope ? 'node-add-to-collection' : 'node-add-to-library'" @click="adoptNode">
+                                        <span v-if="nodeAdding" class="lb-an-spin is-ink" aria-hidden="true"></span>
+                                        <svg v-else class="lb-an-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                                        {{ scope ? $t('analysis.card.adoptCollection') : $t('analysis.card.adoptLibrary') }}
+                                    </button>
+                                    <a v-if="selectedNode.doi" :href="'https://doi.org/' + selectedNode.doi" target="_blank" rel="noopener" class="lb-key" data-testid="node-link">{{ $t('analysis.card.doiLink') }}</a>
+                                    <a v-else :href="scholarUrl(selectedNode)" target="_blank" rel="noopener" class="lb-key" data-testid="node-link">{{ $t('analysis.card.scholarLink') }}</a>
+                                </div>
+                            </div>
+                            <div v-else-if="cardTabShown === 'chat' && llmReady !== false" class="lb-an-card-foot">
+                                <label for="lb-an-chat-in" class="lb-an-label lb-an-chat-label">{{ $t('analysis.chat.inputLabel') }}</label>
+                                <div class="lb-an-chat-row">
+                                    <input id="lb-an-chat-in" v-model="chatInput" type="text" class="lb-an-field is-plain" :disabled="chatStreaming"
+                                           :placeholder="collChat ? $t('analysis.chat.placeholderCollection') : $t('analysis.askAboutItem')"
+                                           data-testid="analysis-chat-input" @keydown.enter.prevent="sendChatMessage()">
+                                    <button type="button" class="lb-key lb-key-primary lb-key-icon" :aria-label="$t('analysis.chat.send')" :title="$t('analysis.chat.send')"
+                                            :disabled="chatStreaming || !chatInput.trim()" data-testid="analysis-chat-send" @click="sendChatMessage()">
+                                        <span v-if="chatStreaming" class="lb-an-spin" aria-hidden="true"></span>
+                                        <svg v-else class="lb-an-ic" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </section>
                     </div>
                 </div>
-
                 <!-- Own Paper Stats -->
-                <div v-show="activeTab==='ownstats'">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px">
-                        <p style="font-size:13px;color:var(--lb-ink-3);margin:0">{{ $t('analysis.ownTableHint') }}</p>
-                        <button @click="updateCitations" :disabled="updatingCitations" class="lb-btn lb-btn-ghost">
-                            <span v-if="updatingCitations" class="spinner-sm"></span>
-                            <span v-else v-html="icons.refresh"></span>
-                            {{ $t('analysis.refreshCitations') }}
-                        </button>
+                <div v-show="activeTab==='ownstats'" id="lb-an-panel-ownstats" role="tabpanel" aria-labelledby="lb-an-tab-ownstats">
+                    <div class="lb-an-tabhead">
+                        <p class="lb-an-tabhint">{{ $t('analysis.ownTableHint') }}</p>
+                        <div class="lb-an-tabhead-r">
+                            <span class="lb-an-note" role="status" data-testid="analysis-citations-note">{{ citationsNote }}</span>
+                            <button type="button" @click="updateCitations" :disabled="updatingCitations" class="lb-key" data-testid="analysis-refresh-citations">
+                                <span v-if="updatingCitations" class="lb-an-spin is-ink" aria-hidden="true"></span>
+                                <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                                {{ $t('analysis.refreshCitations') }}
+                            </button>
+                        </div>
                     </div>
                     <div v-if="!networkData.own_paper_stats || networkData.own_paper_stats.length === 0" class="lb-empty">
                         <div class="lb-empty-mark">∅</div>
@@ -8369,7 +15158,7 @@ const AnalysePage = {
                                 <th class="is-sortable" style="text-align:center" @click="sortOwn('year')">{{ $t('common.year') }} ↕</th>
                                 <th class="is-sortable" style="text-align:right" @click="sortOwn('cited_by_count')">{{ $t('common.citations') }} ↕</th>
                                 <th class="is-sortable" style="text-align:right" @click="sortOwn('reference_count')">{{ $t('analysis.colOaRefs') }} ↕</th>
-                                <th class="is-sortable" style="text-align:right" @click="sortOwn('pdf_reference_count')">{{ $t('analysis.stat.pdfRefs') }} ↕</th>
+                                <th class="is-sortable" style="text-align:right" @click="sortOwn('pdf_reference_count')">{{ $t('analysis.colPdfRefs') }} ↕</th>
                                 <th style="text-align:center">OA</th>
                                 <th>DOI</th>
                             </tr></thead>
@@ -8378,26 +15167,26 @@ const AnalysePage = {
                                     <td class="lb-td-title"><router-link :to="'/paper/' + p.paper_id">{{ p.title }}</router-link></td>
                                     <td class="lb-td-authors lb-truncate">{{ p.authors }}</td>
                                     <td class="lb-td-num" style="text-align:center">{{ p.year || '—' }}</td>
-                                    <td class="lb-td-num"><span class="lb-num-pill is-accent">{{ (p.cited_by_count || 0).toLocaleString() }}</span></td>
+                                    <td class="lb-td-num"><span class="lb-num-pill is-accent">{{ (p.cited_by_count || 0).toLocaleString($locale()) }}</span></td>
                                     <td class="lb-td-num">{{ p.reference_count || 0 }}</td>
-                                    <td class="lb-td-num"><span v-if="p.pdf_reference_count" class="lb-num-pill">{{ p.pdf_reference_count }}</span><span v-else style="color:var(--lb-mute-2)">—</span></td>
-                                    <td class="lb-td-c"><span v-if="p.in_openalex" style="color:var(--lb-accent)" v-html="icons.check"></span><span v-else style="color:var(--lb-mute-2)">—</span></td>
+                                    <td class="lb-td-num"><span v-if="p.pdf_reference_count" class="lb-num-pill">{{ p.pdf_reference_count }}</span><span v-else style="color:var(--lb-ink-3)">—</span></td>
+                                    <td class="lb-td-c"><span v-if="p.in_openalex" style="color:var(--lb-accent)" v-html="icons.check"></span><span v-else style="color:var(--lb-ink-3)">—</span></td>
                                     <td><a v-if="p.doi" :href="'https://doi.org/' + p.doi" target="_blank" class="lb-mono" style="font-size:11px;color:var(--lb-accent);text-decoration:none">{{ p.doi }}</a></td>
                                 </tr>
                             </tbody>
                         </table>
                         <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--lb-hairline);display:flex;gap:32px;font-size:13px;color:var(--lb-ink-3)">
-                            <div>{{ $t('analysis.totalCitations') }}: <span class="lb-mono" style="color:var(--lb-ink);font-size:14px">{{ totalOwnCitations.toLocaleString() }}</span></div>
+                            <div>{{ $t('analysis.totalCitations') }}: <span class="lb-mono" style="color:var(--lb-ink);font-size:14px">{{ totalOwnCitations.toLocaleString($locale()) }}</span></div>
                             <div>{{ $t('analysis.average') }}: <span class="lb-mono" style="color:var(--lb-ink);font-size:14px">{{ avgOwnCitations }}</span></div>
-                            <div>{{ $t('analysis.max') }}: <span class="lb-mono" style="color:var(--lb-ink);font-size:14px">{{ maxOwnCitations.toLocaleString() }}</span></div>
+                            <div>{{ $t('analysis.max') }}: <span class="lb-mono" style="color:var(--lb-ink);font-size:14px">{{ maxOwnCitations.toLocaleString($locale()) }}</span></div>
                         </div>
                     </div>
                 </div>
 
-                <!-- Referenced Papers Table -->
-                <div v-show="activeTab==='references'">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px">
-                        <p style="font-size:13px;color:var(--lb-ink-3);margin:0">{{ $t('analysis.refTableHint') }}</p>
+                <!-- Referenced Papers Table ("Cited works" in the UI) -->
+                <div v-show="activeTab==='references'" id="lb-an-panel-references" role="tabpanel" aria-labelledby="lb-an-tab-references">
+                    <div class="lb-an-tabhead">
+                        <p class="lb-an-tabhint">{{ $t('analysis.refTableHint') }}</p>
                         <div style="display:flex;align-items:center;gap:8px">
                             <span class="lb-field-label">{{ $t('analysis.filter') }}</span>
                             <select v-model="refFilter" class="lb-select" style="border:1px solid var(--lb-hairline);border-radius:7px;background:var(--lb-bg-elev)">
@@ -8421,20 +15210,20 @@ const AnalysePage = {
                                 <th class="is-sortable" style="text-align:right" @click="sortRef('cited_by_count')">{{ $t('common.citations') }} ↕</th>
                                 <th class="is-sortable" style="text-align:right" @click="sortRef('referenced_by_own')">{{ $t('analysis.colByOwn') }} ↕</th>
                                 <th style="text-align:center">{{ $t('analysis.colInLibrary') }}</th>
-                                <th style="text-align:center">{{ $t('chat.source') }}</th>
+                                <th style="text-align:center">{{ $t('analysis.colProvenance') }}</th>
                                 <th>DOI</th>
                             </tr></thead>
                             <tbody>
                                 <tr v-for="(ref, idx) in sortedReferencedPapers" :key="ref.openalex_id || idx">
-                                    <td class="lb-td-num" style="text-align:left;color:var(--lb-mute-2)">{{ idx + 1 }}</td>
+                                    <td class="lb-td-num" style="text-align:left;color:var(--lb-ink-3)">{{ idx + 1 }}</td>
                                     <td class="lb-td-title">{{ ref.title }}</td>
                                     <td class="lb-td-authors lb-truncate">{{ ref.authors }}</td>
                                     <td class="lb-td-num" style="text-align:center">{{ ref.year || '—' }}</td>
-                                    <td class="lb-td-num"><span class="lb-num-pill" :class="ref.cited_by_count > 100 ? 'is-strong' : ref.cited_by_count > 20 ? 'is-accent' : ''">{{ (ref.cited_by_count || 0).toLocaleString() }}</span></td>
-                                    <td class="lb-td-num"><span v-if="ref.referenced_by_own > 1" class="lb-num-pill is-accent">{{ ref.referenced_by_own }}×</span><span v-else style="color:var(--lb-mute-2)">1×</span></td>
-                                    <td class="lb-td-c"><span v-if="ref.in_library" style="color:var(--lb-accent)" v-html="icons.check"></span><span v-else style="color:var(--lb-mute-2)">—</span></td>
+                                    <td class="lb-td-num"><span class="lb-num-pill" :class="ref.cited_by_count > 100 ? 'is-strong' : ref.cited_by_count > 20 ? 'is-accent' : ''">{{ (ref.cited_by_count || 0).toLocaleString($locale()) }}</span></td>
+                                    <td class="lb-td-num"><span v-if="ref.referenced_by_own > 1" class="lb-num-pill is-accent">{{ ref.referenced_by_own }}×</span><span v-else style="color:var(--lb-ink-3)">1×</span></td>
+                                    <td class="lb-td-c"><span v-if="ref.in_library" style="color:var(--lb-accent)" v-html="icons.check"></span><span v-else style="color:var(--lb-ink-3)">—</span></td>
                                     <td class="lb-td-c"><span class="lb-num-pill" :class="ref.source === 'pdf' ? 'is-accent' : ''">{{ ref.source === 'pdf' ? 'PDF' : 'OA' }}</span></td>
-                                    <td><a v-if="ref.doi" :href="'https://doi.org/' + ref.doi" target="_blank" class="lb-mono" style="font-size:11px;color:var(--lb-accent);text-decoration:none">{{ ref.doi }}</a><a v-else-if="ref.title" :href="scholarUrl(ref)" target="_blank" style="font-size:11px;color:var(--lb-mute);text-decoration:none" :title="$t('refs.scholarTitle')">Scholar &#8599;</a><span v-else style="color:var(--lb-mute-2)">—</span></td>
+                                    <td><a v-if="ref.doi" :href="'https://doi.org/' + ref.doi" target="_blank" class="lb-mono" style="font-size:11px;color:var(--lb-accent);text-decoration:none">{{ ref.doi }}</a><a v-else-if="ref.title" :href="scholarUrl(ref)" target="_blank" style="font-size:11px;color:var(--lb-ink-3);text-decoration:none" :title="$t('refs.scholarTitle')">Scholar &#8599;</a><span v-else style="color:var(--lb-ink-3)">—</span></td>
                                 </tr>
                             </tbody>
                         </table>
@@ -8442,9 +15231,9 @@ const AnalysePage = {
                 </div>
 
                 <!-- Missing Sources Table -->
-                <div v-show="activeTab==='missing'">
-                    <div style="margin-bottom:18px">
-                        <p style="font-size:13px;color:var(--lb-ink-3);margin:0">{{ $t('analysis.missingTableHint') }}</p>
+                <div v-show="activeTab==='missing'" id="lb-an-panel-missing" role="tabpanel" aria-labelledby="lb-an-tab-missing">
+                    <div class="lb-an-tabhead">
+                        <p class="lb-an-tabhint">{{ $t('analysis.missingTableHint') }}</p>
                     </div>
                     <div v-if="filteredMissing.length === 0" class="lb-empty">
                         <div class="lb-empty-mark">∅</div>
@@ -8466,8 +15255,8 @@ const AnalysePage = {
                                     <td class="lb-td-authors lb-truncate">{{ src.authors }}</td>
                                     <td class="lb-td-num" style="text-align:center">{{ src.year || '—' }}</td>
                                     <td class="lb-td-num"><span class="lb-num-pill is-accent">{{ src.referenced_by_count }}×</span></td>
-                                    <td class="lb-td-num">{{ (src.cited_by_count || 0).toLocaleString() }}</td>
-                                    <td><a v-if="src.doi" :href="'https://doi.org/' + src.doi" target="_blank" class="lb-mono" style="font-size:11px;color:var(--lb-accent);text-decoration:none">{{ src.doi }}</a><a v-else-if="src.title" :href="scholarUrl(src)" target="_blank" style="font-size:11px;color:var(--lb-mute);text-decoration:none" :title="$t('refs.scholarTitle')">Scholar &#8599;</a><span v-else style="color:var(--lb-mute-2)">—</span></td>
+                                    <td class="lb-td-num">{{ (src.cited_by_count || 0).toLocaleString($locale()) }}</td>
+                                    <td><a v-if="src.doi" :href="'https://doi.org/' + src.doi" target="_blank" class="lb-mono" style="font-size:11px;color:var(--lb-accent);text-decoration:none">{{ src.doi }}</a><a v-else-if="src.title" :href="scholarUrl(src)" target="_blank" style="font-size:11px;color:var(--lb-ink-3);text-decoration:none" :title="$t('refs.scholarTitle')">Scholar &#8599;</a><span v-else style="color:var(--lb-ink-3)">—</span></td>
                                 </tr>
                             </tbody>
                         </table>
@@ -8475,25 +15264,33 @@ const AnalysePage = {
                 </div>
             </div>
 
-            <!-- Empty state -->
-            <div v-if="!networkData && !loading" class="lb-empty" style="border:1px solid var(--lb-hairline);border-radius:14px;background:var(--lb-bg-elev);padding:64px 32px">
-                <div class="lb-empty-mark">◌</div>
-                <h3 class="lb-empty-title">{{ $t('analysis.emptyTitle') }}</h3>
-                <p class="lb-empty-text">
-                    {{ $t('analysis.emptyText') }}
-                </p>
-                <div style="margin:24px auto 16px;display:inline-flex;align-items:center;gap:10px;font-size:12.5px;color:var(--lb-ink-3)">
-                    <span class="lb-field-label" style="margin:0">{{ $t('analysis.stat.depth') }}</span>
-                    <div class="lb-segmented">
-                        <button v-for="d in [1,2,3,4,5]" :key="d" @click="depth = d" class="lb-seg" :class="{'is-on': depth === d}" style="min-width:30px;justify-content:center">{{ d }}</button>
-                    </div>
-                    <span class="lb-mono" style="font-size:11px;color:var(--lb-mute)">{{ depthLabel }}</span>
+            <!-- First run: a placeholder in the shape of the network instead
+                 of an empty page, with the depth and how long it has run. -->
+            <section v-if="loading && !networkData" class="lb-an-sheet lb-an-firstrun" aria-labelledby="lb-an-firstrun-t" data-testid="analysis-first-run">
+                <svg class="lb-an-ph" viewBox="0 0 560 250" aria-hidden="true" focusable="false">
+                    <line v-for="(e, i) in placeholder.edges" :key="'e' + i"
+                          :x1="placeholder.nodes[e[0]][0]" :y1="placeholder.nodes[e[0]][1]"
+                          :x2="placeholder.nodes[e[1]][0]" :y2="placeholder.nodes[e[1]][1]" />
+                    <circle v-for="(p, i) in placeholder.nodes" :key="'n' + i" :cx="p[0]" :cy="p[1]" :r="p[2]"
+                            class="lb-an-ph-dot" :class="'is-' + p[3]" :style="{ animationDelay: (i * 140) + 'ms' }" />
+                </svg>
+                <div aria-live="polite">
+                    <h2 id="lb-an-firstrun-t" class="lb-an-sheet-title">{{ $t('analysis.firstRun.title') }}</h2>
+                    <p class="lb-an-sheet-text">{{ $t('analysis.firstRun.text', { reach: $t('analysis.depthReach.' + depth) }) }}</p>
                 </div>
-                <div>
-                    <button @click="runAnalysis" class="lb-btn lb-btn-primary" style="padding:10px 22px;font-size:13px">
-                    {{ $t('analysis.start') }}
-                </button>
-            </div>
+                <p class="lb-an-clock" data-testid="analysis-elapsed"><span v-for="(p, i) in runningForParts" :key="i" :class="{ 'lb-an-n': p.num }" :role="p.num ? 'timer' : null">{{ p.text }}</span></p>
+            </section>
+
+            <!-- Before the first run: the one place to start. -->
+            <section v-if="!networkData && !loading" class="lb-an-sheet lb-an-empty" aria-labelledby="lb-an-empty-t" data-testid="analysis-empty">
+                <div class="lb-an-sheet-mark" aria-hidden="true">◌</div>
+                <h2 id="lb-an-empty-t" class="lb-an-sheet-title">{{ $t('analysis.emptyTitle') }}</h2>
+                <p class="lb-an-sheet-text">{{ $t('analysis.emptyText') }}</p>
+                <analysis-depth-picker v-model="depth" data-testid="analysis-empty-depth" />
+                <p class="lb-an-depth-note" data-testid="analysis-depth-note">{{ $t('analysis.depthNote.' + depth) }}</p>
+                <button type="button" class="lb-key lb-key-primary lb-an-start" data-testid="analysis-start" @click="runAnalysis">{{ $t('analysis.start') }}</button>
+                <p class="lb-an-fine">{{ $t('analysis.openalexNote') }}</p>
+            </section>
         </div>
     `,
     data() {
@@ -8501,14 +15298,33 @@ const AnalysePage = {
             loading: false,
             updatingCitations: false,
             networkData: analysisStore.networkData,
-            graphSearchQuery: '',
-            graphSearchOpen: false,
-            highlightedNodeId: null,
-            graphPanelOpen: false,
-            graphPanelCategory: '',
+            // The net's tools (#242): the search combobox, the own-items
+            // list, category, lens, "View" with colour and filters.
+            searchQuery: '',
+            searchOpen: false,
+            searchActive: 0,
+            ownListOpen: false,
+            graphPanelCategory: analysisStore.category,
             graphPanelSearch: '',
             graphNodes: [],
-            graphDistance: 25,
+            graphDistance: analysisStore.graphDistance,
+            colorBy: analysisStore.colorBy,
+            viewOpen: analysisStore.viewOpen,
+            lensOn: analysisStore.lensOn,
+            sharedCount: 0,
+            categoriesFlat: [],
+            // Bumped whenever the drawn net changes (built, kinds, filters):
+            // what reads the non-reactive d3 state depends on it.
+            netRev: 0,
+            // The stage as measured (fallbacks for a hidden or 0 × 0 sheet).
+            stageWidth: 0,
+            bandBottom: 48,
+            barHeight: 44,
+            // The card: a selected work, or the Collection's chat.
+            cardTab: analysisStore.cardTab,
+            collChat: analysisStore.collChat,
+            llmReady: null,
+            adoptedPaperId: null,
             stats: analysisStore.stats,
             activeTab: analysisStore.activeTab,
             selectedNode: analysisStore.selectedNode,
@@ -8526,31 +15342,51 @@ const AnalysePage = {
             topNRefs: analysisStore.topNRefs,
             error: null,
             icons,
-            bulkExtracting: false,
-            bulkExtractResult: analysisStore.bulkExtractResult,
-            bulkProgress: { percent: 0, message: '', current_paper: 0, total_papers: 0 },
-            bulkPaperResults: [],
+            // Before the first run the meta line counts the scope's items
+            // (GET /api/stats), the network's own numbers come with its build.
+            scopeCounts: null,
+            // The running clocks: the first run and the PDF dialog count from
+            // their start in the SPA; one ticker serves both.
+            runStartedAt: 0,
+            now: Date.now(),
+            citationsNote: '',
+            placeholder: ANALYSIS_PLACEHOLDER,
+            bulk: bulkDialogIdle(),
             // Chat
-            chatOpen: true,
             chatMessages: analysisStore.chatMessages,
             chatInput: '',
             chatStreaming: false,
             chatStreamContent: '',
             chatContextPaper: analysisStore.chatContextPaper,
+            scope: analysisStore.scope,
+            nodeAdding: false,
+            nodeAddResult: '',
             // Node detail
             nodeAbstract: null,
             nodeAbstractLoading: false,
             nodeAbstractError: null,
-            // Editorial UI state
-            mode: 'categories', // categories | years | authors
+            nodeAbstractDone: false,
             hoverNode: null,
         };
     },
-    mounted() {
-        // Restore graph if data exists from previous visit
+    created() {
+        // The drawn net lives outside Vue's reactivity (d3 owns it); the
+        // computed values that read it depend on `netRev` instead.
+        this._net = null;
+        this._netSize = { w: 960, h: 600 };
+    },
+    async mounted() {
+        this.bindNetListeners(true);
+        await this.applyRouteScope();
+        this.loadScopeCounts();
+        this.loadCategories();
+        // Back from a detail view: the net is drawn anew from the store, the
+        // card keeps its work, its tab and its chat; the camera fits anew.
         if (this.networkData && this.activeTab === 'network') {
             this.$nextTick(() => this.renderGraph());
         }
+        if (this.selectedNode && !this.collChat) this.fetchNodeAbstract(this.selectedNode);
+        if (this.chatShown) this.ensureLlmStatus();
     },
     computed: {
         // Uebersetzter Text gehoert nach computed, nicht nach data: `data()`
@@ -8560,57 +15396,196 @@ const AnalysePage = {
                 t('analysis.q.about'),
                 t('analysis.q.findings'),
                 t('analysis.q.methods'),
-                t('analysis.q.mostCited'),
             ];
         },
-        statBlocks() {
-            const s = this.stats || {};
-            return [
-                { label: t('analysis.stat.ownItems'),   value: s.own_papers ?? '—' },
-                { label: t('analysis.stat.inOpenalex'), value: s.papers_found_in_openalex ?? '—' },
-                { label: t('analysis.stat.references'), value: s.total_references ?? '—' },
-                { label: t('analysis.stat.pdfRefs'),    value: s.pdf_reference_edges ?? 0 },
-                { label: t('analysis.stat.shared'),     value: s.shared_references ?? '—' },
-                { label: t('analysis.stat.missing2'),   value: this.filteredMissing.length },
-                { label: t('analysis.stat.depth'),      value: s.depth ?? this.depth ?? 1 },
-            ];
+        // ── The net's tools and card (#242) ─────────────────────────────
+        stageNarrow() {
+            return this.stageWidth > 0 && this.stageWidth < 760;
+        },
+        cardOpen() {
+            return this.collChat || !!this.selectedNode;
+        },
+        // The Collection's chat has no details: it always shows the chat.
+        cardTabShown() {
+            return this.collChat ? 'chat' : this.cardTab;
+        },
+        chatShown() {
+            return this.cardOpen && this.cardTabShown === 'chat';
+        },
+        cardStyle() {
+            return { top: (this.bandBottom + 14) + 'px', bottom: (this.barHeight + 14) + 'px' };
+        },
+        // Shared reference or cited work, as drawn (it follows the slider).
+        cardKind() {
+            this.netRev;
+            const net = this._net;
+            const n = this.selectedNode;
+            return net && n ? (net.kind.get(n.id) || 'external') : 'external';
+        },
+        // The own Items that cite the work directly; none, no section.
+        cardCiters() {
+            this.netRev;
+            const net = this._net;
+            const n = this.selectedNode;
+            if (!net || !n) return [];
+            return (net.citers.get(n.id) || []).map((d) => ({ id: d.id, paper_id: d.paper_id, title: d.title }));
+        },
+        cardCitationParts() {
+            const n = this.selectedNode;
+            const c = n ? Number(n.cited_by_count) || 0 : 0;
+            return textParts('analysis.card.citations' + (c === 1 ? '.one' : '.other'), { n: fmtCount(c) });
+        },
+        cappedParts() {
+            const c = this.chatContextPaper || {};
+            return textParts('analysis.chatCapped', { n: fmtCount((c.paper_ids || []).length), total: fmtCount(c.total) });
+        },
+        // What the chat answers from (#239): a Collection's items, or the
+        // work's title and abstract - or its title alone when it has none.
+        chatBasis() {
+            if (this.collChat) return t('analysis.chat.basisCollection');
+            const noAbstract = !this.nodeAbstract && !this.nodeAbstractLoading && this.nodeAbstractDone;
+            return t(noAbstract ? 'analysis.chat.basisNoAbstract' : 'analysis.chat.basisAbstract');
+        },
+        hintParts() {
+            return t('analysis.hint').split(/(\{key\})/).filter(Boolean)
+                .map((s) => (s === '{key}' ? { key: true } : { key: false, text: s }));
+        },
+        // Search: title or authors, drawn and not filtered out; own Items
+        // first, then shared references, at most eight.
+        searchResults() {
+            this.netRev;
+            const net = this._net;
+            const q = this.searchQuery.trim().toLowerCase();
+            if (!q || !net) return [];
+            return this.graphNodes
+                .filter((n) => net.visible.get(n.id) !== false
+                    && ((n.title || '').toLowerCase().includes(q) || (n.authors || '').toLowerCase().includes(q)))
+                .map((n) => ({ id: n.id, node: n, title: n.title || n.id, year: n.year, kind: net.kind.get(n.id) || 'external' }))
+                .sort((a, b) => NET_KIND_RANK[a.kind] - NET_KIND_RANK[b.kind])
+                .slice(0, 8);
+        },
+        searchActiveIndex() {
+            return Math.min(this.searchActive, Math.max(0, this.searchResults.length - 1));
+        },
+        searchExpanded() {
+            return this.searchOpen && this.searchResults.length > 0;
+        },
+        searchStatus() {
+            if (!this.searchOpen || !this.searchQuery.trim()) return '';
+            const n = this.searchResults.length;
+            return n ? tn('analysis.search.status', n) : t('analysis.search.none');
+        },
+        catById() {
+            return new Map((this.categoriesFlat || []).map((c) => [c.id, c]));
+        },
+        // The meta line: the built network's numbers, or before the first run
+        // the scope's item count. Numbers in mono, formatted for the UI locale.
+        metaLines() {
+            const plural = (key, n) => key + (n === 1 ? '.one' : '.other');
+            const s = this.stats;
+            if (s) {
+                return [
+                    { id: 'items', parts: textParts(plural('analysis.meta.items', s.own_papers),
+                        { own: fmtCount(s.own_papers), found: fmtCount(s.papers_found_in_openalex) }) },
+                    { id: 'references', parts: textParts(plural('analysis.meta.references', s.total_references),
+                        { total: fmtCount(s.total_references), pdf: fmtCount(s.pdf_reference_edges) }) },
+                    { id: 'depth', parts: textParts('analysis.meta.depth', { depth: fmtCount(s.depth) }) },
+                ];
+            }
+            const c = this.scopeCounts;
+            if (c && typeof c.items === 'number') {
+                return [{ id: 'items', parts: textParts(plural('analysis.meta.itemsBefore', c.items),
+                    { count: fmtCount(c.items), doi: fmtCount(c.doi) }) }];
+            }
+            return [];
+        },
+        // "Analyse again", or - when the chosen depth is not the built one -
+        // "Analyse at depth n", so nobody takes the network for the new depth.
+        runLabel() {
+            if (this.loading) return t('analysis.running');
+            const built = this.stats && this.stats.depth;
+            if (built && this.depth !== built) return t('analysis.runAtDepth', { n: this.depth });
+            return t('analysis.rerun');
+        },
+        runElapsed() {
+            return fmtElapsed(this.now - this.runStartedAt);
+        },
+        runningForParts() {
+            return textParts('analysis.runningFor', { time: this.runElapsed });
         },
         tabDefs() {
             const nd = this.networkData || {};
+            const refs = (nd.referenced_papers || []).length;
+            const missing = this.stats && this.stats.missing_sources != null
+                ? this.stats.missing_sources : this.filteredMissing.length;
             return [
-                { id: 'network',    label: t('analysis.tab.network'),    count: null },
-                { id: 'ownstats',   label: t('analysis.tab.ownItems'),   count: (nd.own_paper_stats || []).length || null },
-                { id: 'references', label: t('analysis.tab.references'), count: (nd.referenced_papers || []).length || null },
-                { id: 'missing',    label: t('analysis.tab.missing'),    count: this.filteredMissing.length || null },
+                { id: 'network',    label: t('analysis.tab.network'),    count: '' },
+                { id: 'ownstats',   label: t('analysis.tab.ownItems'),   count: fmtCount((nd.own_paper_stats || []).length) },
+                { id: 'references', label: t('analysis.tab.references'),
+                  count: refs >= ANALYSIS_LIST_CAP ? fmtCount(ANALYSIS_LIST_CAP) + '+' : fmtCount(refs) },
+                { id: 'missing',    label: t('analysis.tab.missing'),    count: fmtCount(missing) },
             ];
         },
-        depthLabel() {
-            return {
-                1: t('analysis.depth.1'), 2: t('analysis.depth.2'), 3: t('analysis.depth.3'),
-                4: t('analysis.depth.4'), 5: t('analysis.depth.5'),
-            }[this.depth] || '';
+        activeTabIndex() {
+            return Math.max(0, this.tabDefs.findIndex((tab) => tab.id === this.activeTab));
         },
-        graphSearchResults() {
-            if (!this.graphSearchQuery || !this.graphNodes.length) return [];
-            const q = this.graphSearchQuery.toLowerCase();
-            return this.graphNodes.filter(n => (n.title || '').toLowerCase().includes(q) || (n.authors || '').toLowerCase().includes(q)).slice(0, 20);
+        bulkCountParts() {
+            return textParts('analysis.bulk.itemOf', { current: fmtCount(this.bulk.current), total: fmtCount(this.bulk.total) });
         },
+        bulkSinceParts() {
+            return textParts('analysis.bulk.since', { time: fmtElapsed(this.now - this.bulk.startedAt) });
+        },
+        bulkSkipped() {
+            const res = this.bulk.result && this.bulk.result.results;
+            return (res || []).filter((r) => r.status !== 'ok');
+        },
+        bulkFacts() {
+            const r = this.bulk.result || {};
+            const skipped = this.bulkSkipped.length;
+            return [
+                { id: 'processed', value: fmtCount(r.processed), label: tn('analysis.bulk.fact.processed', r.processed || 0) },
+                { id: 'found', value: fmtCount(r.total_references), label: tn('analysis.bulk.fact.found', r.total_references || 0) },
+                { id: 'inLibrary', value: fmtCount(r.total_in_library), label: t('analysis.bulk.fact.inLibrary') },
+                { id: 'skipped', value: fmtCount(skipped), label: tn('analysis.bulk.fact.skipped', skipped) },
+            ];
+        },
+        // Why the run broke off: the server's refusal (translated), or how far
+        // it got before the stream ended without its last frame.
+        bulkOutcomeText() {
+            const b = this.bulk;
+            const done = b.rows.length;
+            if (b.state === 'stopped') {
+                return b.total
+                    ? t('analysis.bulk.stoppedAfter', { current: fmtCount(done), total: fmtCount(b.total) })
+                    : t('analysis.bulk.stoppedEarly');
+            }
+            if (b.message) return b.message;
+            return b.total
+                ? t('analysis.bulk.abortedAfter', { current: fmtCount(done), total: fmtCount(b.total) })
+                : t('analysis.bulk.abortedNoAnswer');
+        },
+        // The categories of the own Items in the net, a subcategory with its
+        // path ("Earth › Materials").
         graphPanelCategoryList() {
             if (!this.graphNodes.length) return [];
             const cats = new Map();
             this.graphNodes.filter(n => n.type === 'own' && n.categories).forEach(n => {
-                (n.categories || []).forEach(c => { if (!cats.has(c.id)) cats.set(c.id, c); });
+                (n.categories || []).forEach(c => { if (!cats.has(c.id)) cats.set(c.id, { id: c.id, name: this.categoryPath(c) }); });
             });
-            return [...cats.values()].sort((a, b) => a.name.localeCompare(b.name));
+            return [...cats.values()].sort((a, b) => a.name.localeCompare(b.name, uiLocale()));
         },
-        graphPanelFilteredPapers() {
-            if (!this.graphNodes.length) return [];
+        // The own Items in the chosen category (all without one).
+        ownPapersInCategory() {
             let list = this.graphNodes.filter(n => n.type === 'own');
             if (this.graphPanelCategory) {
                 const cid = parseInt(this.graphPanelCategory);
                 list = list.filter(n => (n.categories || []).some(c => c.id === cid));
             }
-            if (this.graphPanelSearch) {
+            return list;
+        },
+        graphPanelFilteredPapers() {
+            let list = this.ownPapersInCategory.slice();
+            if (this.graphPanelSearch && this.ownPapersInCategory.length >= 20) {
                 const q = this.graphPanelSearch.toLowerCase();
                 list = list.filter(n => (n.title || '').toLowerCase().includes(q) || (n.authors || '').toLowerCase().includes(q));
             }
@@ -8658,7 +15633,7 @@ const AnalysePage = {
         },
         filteredMissing() {
             if (!this.networkData) return [];
-            return this.networkData.missing_sources.filter(s => (s.referenced_by_count || 0) >= 2);
+            return (this.networkData.missing_sources || []).filter(s => (s.referenced_by_count || 0) >= 2);
         },
         sortedMissing() {
             const s = [...this.filteredMissing];
@@ -8671,87 +15646,245 @@ const AnalysePage = {
         },
     },
     methods: {
-        setMode(m) {
-            if (this.mode === m) return;
-            this.mode = m;
-            // Re-render graph to apply new node fill scheme
-            if (this.networkData && this.activeTab === 'network') {
-                this.$nextTick(() => this.renderGraph());
-            }
-        },
         async runAnalysis() {
+            if (this.loading) return;
             this.loading = true;
             this.error = null;
             this.selectedNode = null;
+            this.runStartedAt = Date.now();
+            this.syncTicker();
             try {
-                const data = await api('/api/analysis/build?depth=' + this.depth, { method: 'POST' });
-                this.networkData = data;
-                this.stats = data.stats;
-                this.$nextTick(() => this.renderGraph());
+                let url = '/api/analysis/build?depth=' + this.depth;
+                if (this.scope) url += '&collection_id=' + encodeURIComponent(this.scope.id);
+                const asked = this.scope ? this.scope.id : null;
+                const data = await api(url, { method: 'POST' });
+                // The scope changed meanwhile: this net belongs to the old one.
+                if ((this.scope ? this.scope.id : null) === asked) {
+                    this.networkData = data;
+                    this.stats = data.stats;
+                    // Only a new result builds the net up; the pill stays until
+                    // the layout is done (reduced motion: it is done at once).
+                    this._buildFresh = true;
+                    if (analysisReducedMotion()) {
+                        this.$nextTick(() => this.renderGraph());
+                    } else {
+                        await this.$nextTick();
+                        await this.renderGraph();
+                    }
+                }
             } catch (e) {
                 this.error = t('analysis.failed', { message: e.message });
             }
             this.loading = false;
+            this.syncTicker();
+        },
+        // One second ticker while a clock is shown (first run, re-run pill,
+        // PDF dialog); it stops as soon as neither runs.
+        syncTicker() {
+            const running = this.loading || this.bulk.state === 'running';
+            if (running && !this._ticker) {
+                this.now = Date.now();
+                this._ticker = setInterval(() => { this.now = Date.now(); }, 1000);
+            } else if (!running && this._ticker) {
+                clearInterval(this._ticker);
+                this._ticker = null;
+            }
+        },
+        // The scope's item count for the meta line before the first run.
+        async loadScopeCounts() {
+            const url = this.scope ? '/api/stats?collection_id=' + encodeURIComponent(this.scope.id) : '/api/stats';
+            const asked = this.scope ? this.scope.id : null;
+            try {
+                const s = await api(url);
+                if ((this.scope ? this.scope.id : null) !== asked) return;
+                this.scopeCounts = s && typeof s.paper_count === 'number'
+                    ? { items: s.paper_count, doi: s.with_doi || 0 } : null;
+            } catch (e) {
+                this.scopeCounts = null;
+            }
+        },
+        // The view switch is a tablist: arrows move between the views.
+        onTabKey(e) {
+            const ids = this.tabDefs.map((tab) => tab.id);
+            const i = ids.indexOf(this.activeTab);
+            let next = null;
+            if (e.key === 'ArrowRight') next = (i + 1) % ids.length;
+            else if (e.key === 'ArrowLeft') next = (i - 1 + ids.length) % ids.length;
+            else if (e.key === 'Home') next = 0;
+            else if (e.key === 'End') next = ids.length - 1;
+            if (next == null) return;
+            e.preventDefault();
+            this.activeTab = ids[next];
+            this.$nextTick(() => {
+                const el = document.getElementById('lb-an-tab-' + ids[next]);
+                if (el) el.focus();
+            });
         },
         async updateCitations() {
             this.updatingCitations = true;
+            this.citationsNote = '';
             try {
                 const result = await api('/api/analysis/update-citations', { method: 'POST' });
-                alert(result.updated + ' Paper aktualisiert.');
+                this.citationsNote = tn('analysis.citationsUpdated', result.updated || 0);
                 // Re-run analysis to get fresh data
                 await this.runAnalysis();
             } catch (e) {
-                this.error = 'Aktualisierung fehlgeschlagen: ' + e.message;
+                this.error = t('analysis.citationsUpdateFailed', { message: e.message });
             }
             this.updatingCitations = false;
         },
-        async bulkExtractRefs() {
-            this.bulkExtracting = true;
-            this.bulkExtractResult = null;
-            this.bulkProgress = { percent: 0, message: 'Starte...', current_paper: 0, total_papers: 0 };
-            this.bulkPaperResults = [];
+        // ── PDF references dialog (#241) ─────────────────────────────────
+        // Opening asks whether the fast role is ready (reference extraction
+        // runs on it, falling back to reasoning): without an AI model the
+        // dialog says so and leads to the settings instead.
+        async openBulkDialog(e) {
+            const back = (e && e.currentTarget) || document.activeElement;
+            this._bulkReturnFocus = back;
+            const seq = (this._bulkOpenSeq || 0) + 1;
+            this._bulkOpenSeq = seq;
+            this.bulk = Object.assign(bulkDialogIdle(), { open: true, state: 'checking' });
+            this.bindBulkKeys(true);
+            this.$nextTick(() => this.focusBulkDialog());
+            let ready = true;
             try {
-                const response = await fetch('/api/papers/bulk-extract-references', { method: 'POST' });
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop();
-                    for (const line of lines) {
-                        if (!line.startsWith('data: ')) continue;
-                        try {
-                            const evt = JSON.parse(line.slice(6));
-                            if (evt.type === 'progress') {
-                                this.bulkProgress = {
-                                    percent: evt.percent || 0,
-                                    message: evt.message ? translateDetail(evt.message) : '',
-                                    current_paper: evt.current_paper || 0,
-                                    total_papers: evt.total_papers || 0,
-                                };
-                            } else if (evt.type === 'paper_result') {
-                                this.bulkPaperResults.push(evt);
-                            } else if (evt.type === 'complete') {
-                                this.bulkExtractResult = evt;
-                            }
-                        } catch (parseErr) { /* skip */ }
-                    }
-                }
-                // Show final summary
-                if (this.bulkExtractResult) {
-                    const r = this.bulkExtractResult;
-                    alert(t('analysis.refsExtractedHeading') + '\n' +
-                        r.processed + ' Paper verarbeitet\n' +
-                        t('analysis.refsFound', { count: r.total_references }) + '\n' +
-                        t('analysis.refsInLibrary', { count: r.total_in_library }));
-                }
-            } catch (e) {
-                alert('Bulk-Extraktion fehlgeschlagen: ' + e.message);
+                const status = await api('/api/llm/status');
+                ready = !!(status && status.fast);
+            } catch (err) {
+                // Status unknown: let the run itself say what is wrong.
             }
-            this.bulkExtracting = false;
+            if (seq !== this._bulkOpenSeq || !this.bulk.open || this.bulk.state !== 'checking') return;
+            this.bulk.state = ready ? 'confirm' : 'nomodel';
+        },
+        // One run over the scope (in a Collection: its Items). A stop, a new
+        // run or closing invalidates the token, so a late frame changes nothing.
+        async startBulk() {
+            const run = (this._bulkRun || 0) + 1;
+            this._bulkRun = run;
+            const live = () => run === this._bulkRun;
+            const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+            this._bulkCtrl = ctrl;
+            Object.assign(this.bulk, { state: 'running', current: 0, total: 0, percent: 0, rows: [], result: null, message: '', startedAt: Date.now() });
+            this.syncTicker();
+            let complete = null;
+            let refused = '';   // the server's own reason, translated
+            try {
+                const init = { method: 'POST' };
+                if (ctrl) init.signal = ctrl.signal;
+                if (this.scope) {
+                    let rows = [];
+                    try {
+                        rows = await api('/api/papers?collection_id=' + encodeURIComponent(this.scope.id));
+                    } catch (err) {
+                        refused = err.message;
+                        throw err;
+                    }
+                    init.headers = { 'Content-Type': 'application/json' };
+                    init.body = JSON.stringify({ paper_ids: (rows || []).map((p) => p.id) });
+                }
+                if (!live()) return;
+                const resp = await fetch('/api/papers/bulk-extract-references', init);
+                if (!resp.ok) {
+                    const err = await resp.json().catch(() => ({}));
+                    refused = translateDetail(err.detail, resp.status);
+                } else {
+                    await readSseStream(resp, (evt) => {
+                        if (!live()) return;
+                        if (evt.type === 'progress') {
+                            if (evt.total_papers) this.bulk.total = evt.total_papers;
+                            if (evt.current_paper) this.bulk.current = evt.current_paper;
+                            if (typeof evt.percent === 'number') this.bulk.percent = evt.percent;
+                        } else if (evt.type === 'paper_result') {
+                            this.bulk.rows.push(evt);
+                        } else if (evt.type === 'complete') {
+                            complete = evt;
+                        }
+                    });
+                }
+            } catch (err) {
+                // A dropped connection: the outcome says how far it got.
+            }
+            if (!live()) return;
+            this._bulkCtrl = null;
+            if (complete) {
+                this.bulk.result = complete;
+                this.bulk.percent = 100;
+                this.bulk.state = 'done';
+            } else {
+                this.bulk.message = refused;
+                this.bulk.state = 'aborted';
+            }
+            this.syncTicker();
+        },
+        // "Stop" ends the stream here; what the server already saved stays.
+        stopBulk() {
+            if (this.bulk.state !== 'running') return;
+            this._bulkRun = (this._bulkRun || 0) + 1;
+            if (this._bulkCtrl) {
+                try { this._bulkCtrl.abort(); } catch (e) { /* already closed */ }
+                this._bulkCtrl = null;
+            }
+            this.bulk.state = 'stopped';
+            this.syncTicker();
+        },
+        closeBulk() {
+            if (!this.bulk.open || this.bulk.state === 'running') return;
+            this._bulkOpenSeq = (this._bulkOpenSeq || 0) + 1;
+            this.bulk = bulkDialogIdle();
+            this.bindBulkKeys(false);
+            const back = this._bulkReturnFocus;
+            this._bulkReturnFocus = null;
+            if (back && typeof back.focus === 'function' && document.body.contains(back)) {
+                this.$nextTick(() => back.focus());
+            }
+        },
+        onBulkBackdrop() {
+            if (this.bulk.state !== 'running') this.closeBulk();
+        },
+        bulkRebuild() {
+            this.closeBulk();
+            this.runAnalysis();
+        },
+        bulkGoToModels() {
+            this.closeBulk();
+            this.$router.push('/settings/ai-models');
+        },
+        focusBulkDialog() {
+            const dlg = this.$refs.bulkDialog;
+            if (dlg && !dlg.contains(document.activeElement)) dlg.focus();
+        },
+        // Esc closes - except while a run is going; Tab stays inside.
+        bindBulkKeys(on) {
+            if (on && !this._onBulkKey) {
+                this._onBulkKey = (e) => {
+                    if (!this.bulk.open) return;
+                    if (e.key === 'Escape') {
+                        e.preventDefault();
+                        this.closeBulk();
+                    } else if (e.key === 'Tab') {
+                        const dlg = this.$refs.bulkDialog;
+                        if (!dlg) return;
+                        const focusable = [...dlg.querySelectorAll('button:not([disabled]), a[href], input:not([disabled])')];
+                        if (!focusable.length) { e.preventDefault(); return; }
+                        const first = focusable[0];
+                        const last = focusable[focusable.length - 1];
+                        if (!dlg.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+                        else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+                        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+                    }
+                };
+                document.addEventListener('keydown', this._onBulkKey);
+            } else if (!on && this._onBulkKey) {
+                document.removeEventListener('keydown', this._onBulkKey);
+                this._onBulkKey = null;
+            }
+        },
+        // A skipped Item's reason in words; the status code never shows.
+        bulkReason(status) {
+            const key = 'analysis.bulk.reason.' + status;
+            return t(hasKey(key) ? key : 'analysis.bulk.reason.error');
+        },
+        bulkRowParts(r) {
+            return textParts('analysis.bulk.rowRefs', { refs: fmtCount(r.total_extracted), inLibrary: fmtCount(r.in_library) });
         },
         sortMissing(key) {
             if (this.sortKey === key) this.sortDir *= -1;
@@ -8768,552 +15901,1057 @@ const AnalysePage = {
         scholarUrl(ref) {
             return scholarSearchUrl(ref);
         },
-        nodeTypeBadgeClass(type) {
-            const m = {
-                own: 'bg-accent-soft text-accent-ink',
-                missing: 'bg-accent-soft text-accent-ink',
-                own_ref: 'bg-accent-soft text-accent-ink',
-                external: 'bg-gray-100 text-gray-700',
-                depth2: 'bg-accent-soft text-accent-ink',
-                depth3: 'bg-accent-soft text-accent-ink',
-                depth4: 'bg-slate-100 text-slate-600',
-                depth5: 'bg-gray-50 text-gray-500',
-            };
-            return m[type] || 'bg-gray-100 text-gray-700';
+        // A node's kind in words, for the hover card.
+        nodeKindLabel(d) {
+            const net = this._net;
+            const kind = net ? net.kind.get(d.id) : (d.type === 'own' ? 'own' : 'external');
+            if (kind === 'own') return t('analysis.legendOwnItem');
+            if (kind === 'shared') return t('analysis.sharedReference');
+            const deeper = /^depth(\d+)$/.exec(d.type || '');
+            if (deeper) return t('analysis.nodeDepth', { n: deeper[1] });
+            if (d.type === 'own_ref') return t('refs.inLibrary');
+            return t('analysis.citedWork');
         },
-        nodeTypeLabel(type) {
-            const m = {
-                own: 'Eigenes Paper',
-                missing: t('analysis.nodeMissing'),
-                own_ref: t('refs.inLibrary'),
-                external: t('analysis.nodeExternal'),
-                depth2: 'Tiefe 2',
-                depth3: 'Tiefe 3',
-                depth4: 'Tiefe 4',
-                depth5: 'Tiefe 5',
-            };
-            return m[type] || type;
+        fmtCount(n) {
+            return fmtCount(n);
         },
+        // "Earth › Materials": a category with the names of its parents.
+        categoryPath(c) {
+            const parts = [];
+            const seen = new Set();
+            let cur = this.catById.get(c.id);
+            while (cur && !seen.has(cur.id)) {
+                seen.add(cur.id);
+                parts.unshift(cur.name);
+                cur = cur.parent_id != null ? this.catById.get(cur.parent_id) : null;
+            }
+            return parts.length ? parts.join(' › ') : c.name;
+        },
+        async loadCategories() {
+            try {
+                const rows = await api('/api/categories');
+                this.categoriesFlat = Array.isArray(rows) ? rows : [];
+            } catch (e) {
+                this.categoriesFlat = [];
+            }
+        },
+
+        // ── Drawing the net (#242) ──────────────────────────────────────
+        // The SVG is built once per network. Afterwards the look changes in
+        // place (restyleNet - one function per node, netNodeStyle), the
+        // camera through applyCamera, the labels through layoutLabels and
+        // positionLabels; nothing re-runs the simulation for that.
         renderGraph() {
+            // Only a fresh build result grows the net; a return to the route
+            // shows it standing (#243).
+            const fresh = !!this._buildFresh;
+            this._buildFresh = false;
             const container = this.$refs.graphContainer;
             if (!container || !this.networkData) return;
+            // A re-run draws anew: the previous layout must not tick on.
+            if (this._simulation) this._simulation.stop();
+            this.stopNetMotion();
             container.innerHTML = '';
+            this._net = null;
+            this.measureStage();
+            this.observeStage();
+            const { w: width, h: height } = this._netSize;
+            const reduced = analysisReducedMotion();
+            const vm = this;
 
-            const width = container.clientWidth;
-            const height = container.clientHeight || 600;
-            const allNodes = this.networkData.nodes;
-            const allEdges = this.networkData.edges;
-
-            // Build node ID set
-            const nodeMap = new Map();
-            allNodes.forEach(n => nodeMap.set(n.id, n));
-
-            // Only keep edges where both endpoints exist
-            const validEdges = allEdges.filter(e => nodeMap.has(e.source) && nodeMap.has(e.target));
-
-            // Find connected node IDs
-            const connectedIds = new Set();
-            validEdges.forEach(e => {
-                connectedIds.add(e.source);
-                connectedIds.add(e.target);
-            });
-            // Always include own papers
-            allNodes.forEach(n => { if (n.type === 'own') connectedIds.add(n.id); });
-
-            const nodes = allNodes.filter(n => connectedIds.has(n.id)).map(n => ({...n}));
-            const edges = validEdges.map(e => ({source: e.source, target: e.target, edge_type: e.edge_type}));
-
-            if (nodes.length === 0) {
-                container.innerHTML = '<div class="flex items-center justify-center h-full text-gray-400 text-sm">'
-                    + t('analysis.noNetworkData') + '</div>';
+            const allNodes = this.networkData.nodes || [];
+            const nodeIds = new Set(allNodes.map((n) => n.id));
+            const validEdges = (this.networkData.edges || []).filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target));
+            // Unconnected cited works stay out; own Items always come.
+            const connected = new Set();
+            validEdges.forEach((e) => { connected.add(e.source); connected.add(e.target); });
+            allNodes.forEach((n) => { if (n.type === 'own') connected.add(n.id); });
+            const nodes = allNodes.filter((n) => connected.has(n.id)).map((n) => markRaw({ ...n }));
+            const edges = validEdges.map((e, i) => ({ source: e.source, target: e.target, edge_type: e.edge_type, _i: i, _kind: 'cite' }));
+            if (!nodes.length) {
+                container.innerHTML = '<div class="lb-an-nodata">' + t('analysis.noNetworkData') + '</div>';
+                this.graphNodes = [];
+                this.sharedCount = 0;
+                this.netRev++;
                 return;
             }
 
-            // Editorial color scheme — read live tokens so dark-mode works
-            const cssVar = lbToken;
-            const editorialInk      = cssVar('--lb-ink', '#1a1a1a');
-            const editorialInk3     = cssVar('--lb-ink-3', '#6b6760');
-            const editorialMute     = cssVar('--lb-mute', '#8e8a82');
-            const editorialMute2    = cssVar('--lb-mute-2', '#a8a49c');
-            const editorialHairline = cssVar('--lb-hairline-2', '#d8d1be');
-            const editorialAccent   = cssVar('--lb-accent', '#c2410c');
-            const editorialAccentSoft = cssVar('--lb-accent-soft', '#fce9da');
-            const colorMap = {
-                own:      editorialInk,           // own paper = ink (per spec)
-                missing:  editorialAccent,        // bridge / shared source = accent
-                own_ref:  editorialAccentSoft,    // in library
-                external: editorialInk3,
-                depth2:   editorialMute,
-                depth3:   editorialMute2,
-                depth4:   editorialHairline,
-                depth5:   editorialHairline,
-            };
-            // For Mode "years" we interpolate ink-3 → accent
-            const yearVals = nodes.map(n => n.year).filter(y => y);
-            const yearScale = (yearVals.length >= 2)
-                ? d3.scaleLinear().domain([Math.min(...yearVals), Math.max(...yearVals)]).range([0, 1])
-                : () => 0.5;
-            const yearInterp = d3.interpolateRgb(editorialAccentSoft, editorialAccent);
-
-            // --- Find bridge nodes: non-own nodes that sit on paths between own papers ---
-            const ownNodeIds = new Set(nodes.filter(n => n.type === 'own').map(n => n.id));
-            // Build adjacency: for each node, which nodes are connected (undirected)
+            const byId = new Map(nodes.map((n) => [n.id, n]));
+            const ownIds = new Set(nodes.filter((n) => n.type === 'own').map((n) => n.id));
             const adj = new Map();
-            edges.forEach(e => {
-                const s = typeof e.source === 'object' ? e.source.id : e.source;
-                const t = typeof e.target === 'object' ? e.target.id : e.target;
-                if (!adj.has(s)) adj.set(s, new Set());
-                if (!adj.has(t)) adj.set(t, new Set());
-                adj.get(s).add(t);
-                adj.get(t).add(s);
-            });
-            // BFS-based bridge detection: find non-own nodes reachable from >=2 own papers within minR hops
-            const minR = this.minRefs || 1;
-            const reachability = new Map(); // nodeId -> Set of ownPaperIds that can reach it
-            const bfsParent = new Map();    // nodeId -> Map(ownPaperId -> parentNodeId) for path tracing
-            for (const ownId of ownNodeIds) {
-                // BFS from this own paper up to minR hops
-                let frontier = [ownId];
-                const visited = new Set([ownId]);
-                for (let depth = 0; depth < minR && frontier.length > 0; depth++) {
-                    const nextFrontier = [];
-                    for (const cur of frontier) {
-                        const neighbors = adj.get(cur);
-                        if (!neighbors) continue;
-                        for (const nb of neighbors) {
-                            if (visited.has(nb)) continue;
-                            visited.add(nb);
-                            if (!reachability.has(nb)) reachability.set(nb, new Set());
-                            reachability.get(nb).add(ownId);
-                            if (!bfsParent.has(nb)) bfsParent.set(nb, new Map());
-                            bfsParent.get(nb).set(ownId, cur);
-                            // Don't expand through other own papers
-                            if (!ownNodeIds.has(nb)) nextFrontier.push(nb);
-                        }
-                    }
-                    frontier = nextFrontier;
-                }
-            }
-            const bridgeNodes = new Set();
-            for (const [nid, owners] of reachability) {
-                if (!ownNodeIds.has(nid) && owners.size >= 2) bridgeNodes.add(nid);
-            }
-
-            // Build edge index for fast lookup
+            const incident = new Map();
             const edgeIndex = new Map();
+            const citers = new Map();   // work -> own Items citing it directly
             edges.forEach((e, i) => {
-                const s = typeof e.source === 'object' ? e.source.id : e.source;
-                const t = typeof e.target === 'object' ? e.target.id : e.target;
-                edgeIndex.set(s + '|' + t, i);
-                edgeIndex.set(t + '|' + s, i);
-            });
-
-            // Trace BFS paths from bridge nodes back to own papers to find bridge edges
-            const bridgeEdgeSet = new Set();
-            for (const bNode of bridgeNodes) {
-                const owners = reachability.get(bNode);
-                if (!owners) continue;
-                for (const ownId of owners) {
-                    let cur = bNode;
-                    while (cur && cur !== ownId) {
-                        const parent = bfsParent.get(cur)?.get(ownId);
-                        if (parent == null) break;
-                        const ei = edgeIndex.get(cur + '|' + parent);
-                        if (ei != null) bridgeEdgeSet.add(ei);
-                        cur = parent;
-                    }
+                const s = e.source;
+                const tg = e.target;
+                for (const [a, b] of [[s, tg], [tg, s]]) {
+                    if (!adj.has(a)) adj.set(a, new Set());
+                    if (!incident.has(a)) incident.set(a, []);
+                    adj.get(a).add(b);
+                    edgeIndex.set(a + '|' + b, i);
                 }
-            }
-            // Also mark own<->own edges
-            edges.forEach((e, i) => {
-                const s = typeof e.source === 'object' ? e.source.id : e.source;
-                const t = typeof e.target === 'object' ? e.target.id : e.target;
-                if (ownNodeIds.has(s) && ownNodeIds.has(t)) bridgeEdgeSet.add(i);
+                incident.get(s).push(i);
+                if (tg !== s) incident.get(tg).push(i);
+                if (ownIds.has(s) && !ownIds.has(tg)) {
+                    if (!citers.has(tg)) citers.set(tg, []);
+                    const own = byId.get(s);
+                    if (!citers.get(tg).includes(own)) citers.get(tg).push(own);
+                }
             });
 
-            const maxCited = d3.max(nodes, d => d.cited_by_count) || 1;
-            const sizeScale = d3.scaleSqrt().domain([0, maxCited]).range([5, 22]);
+            // Size = citations, on the board's range (dots 5-18 px); an own
+            // Item keeps a size its ring reads on.
+            const maxCited = d3.max(nodes, (d) => d.cited_by_count) || 1;
+            const sizeScale = d3.scaleSqrt().domain([0, maxCited]).range([2.5, 9]);
+            nodes.forEach((d) => {
+                const r = sizeScale(Math.max(0, d.cited_by_count || 0));
+                d._r = d.type === 'own' ? Math.max(6, r) : r;
+                d._label = d.type === 'own' ? netTrim(d.title || d.id, 34) : '';
+            });
+            const years = nodes
+                .filter((d) => d.type !== 'own' && d.year != null && d.year !== '' && Number.isFinite(Number(d.year)))
+                .map((d) => Number(d.year));
+            const yearDomain = years.length ? d3.extent(years) : null;
 
-            const svg = d3.select(container)
-                .append('svg')
+            // Built apart; it joins the page once the layout rests (at once
+            // under reduced motion).
+            const svg = d3.create('svg')
+                .attr('class', 'lb-an-svg')
                 .attr('width', width)
                 .attr('height', height)
-                .attr('viewBox', [0, 0, width, height]);
+                .attr('role', 'img')
+                .attr('aria-label', t('analysis.netLabel'));
+            // Arrowheads in the colours of their edges (CSS classes on tokens).
+            const defs = svg.append('defs');
+            ['cite', 'bridge', 'pdf', 'hot'].forEach((kind) => {
+                defs.append('marker')
+                    .attr('id', 'lb-an-arrow-' + kind)
+                    .attr('viewBox', '0 -5 10 10')
+                    .attr('refX', 10).attr('refY', 0)
+                    .attr('markerWidth', 5).attr('markerHeight', 5)
+                    .attr('orient', 'auto')
+                    .append('path').attr('d', 'M0,-4L10,0L0,4').attr('class', 'lb-an-arrow is-' + kind);
+            });
+            const cam = svg.append('g').attr('class', 'lb-an-cam');
 
-            const g = svg.append('g');
-
-            // Zoom - track if user has manually zoomed
-            let userHasZoomed = false;
-            const zoomBehavior = d3.zoom()
+            const net = {
+                svg, cam, nodes, edges, byId, ownIds, adj, incident, edgeIndex, citers, yearDomain,
+                ownNodes: nodes.filter((d) => d.type === 'own'),
+                kind: new Map(), visible: new Map(), labelState: new Map(),
+                shared: { shared: new Set(), sharedEdges: new Set(), paths: new Map() },
+                emph: null, k: 1, userZoomed: false, fitOnEnd: true, lastLayout: 0,
+            };
+            // Zoom: a gesture (wheel, drag) counts as "zoomed by hand"; the
+            // camera's own moves come without a source event.
+            net.zoom = d3.zoom()
+                .extent(() => [[0, 0], [vm._netSize.w, vm._netSize.h]])
                 .scaleExtent([0.05, 5])
                 .on('zoom', (event) => {
-                    g.attr('transform', event.transform);
-                    // Mark as user-zoomed only for direct user gestures
-                    if (event.sourceEvent) userHasZoomed = true;
-                });
-            svg.call(zoomBehavior);
-
-            // Arrow markers — editorial palette
-            const defs = svg.append('defs');
-            const mkMarker = (id, fill) => {
-                defs.append('marker')
-                    .attr('id', id)
-                    .attr('viewBox', '0 -5 10 10')
-                    .attr('refX', 20).attr('refY', 0)
-                    .attr('markerWidth', 6).attr('markerHeight', 6)
-                    .attr('orient', 'auto')
-                    .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', fill);
-            };
-            mkMarker('arrowhead', editorialHairline);
-            mkMarker('arrowhead-bridge', editorialAccent);
-            mkMarker('arrowhead-pdfref', editorialMute2);
-
-            // Track PDF-ref edges
-            const pdfRefEdgeSet = new Set();
-            edges.forEach((e, i) => {
-                if (e.edge_type === 'pdf_ref') pdfRefEdgeSet.add(i);
-            });
-
-            // Simulation
-            // Place nodes initially near center to avoid drift
-            nodes.forEach(n => {
-                if (n.x == null) n.x = width / 2 + (Math.random() - 0.5) * 100;
-                if (n.y == null) n.y = height / 2 + (Math.random() - 0.5) * 100;
-            });
-
-            const dist = this.graphDistance || 25;
-            const simulation = d3.forceSimulation(nodes)
-                .force('link', d3.forceLink(edges).id(d => d.id).distance(dist).strength(0.8))
-                .force('charge', d3.forceManyBody().strength(-(dist * 1.2)).distanceMax(200))
-                .force('center', d3.forceCenter(width / 2, height / 2).strength(0.05))
-                .force('collision', d3.forceCollide().radius(d => sizeScale(d.cited_by_count || 0) + 1));
-
-            // Links - normal below, bridge edges and pdf-ref edges on top
-            const link = g.append('g')
-                .selectAll('line')
-                .data(edges)
-                .join('line')
-                .attr('stroke', (d, i) => netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, false))
-                .attr('stroke-width', (d, i) => bridgeEdgeSet.has(i) ? 2.5 : pdfRefEdgeSet.has(i) ? 1.5 : 1)
-                .attr('stroke-opacity', (d, i) => bridgeEdgeSet.has(i) ? 0.7 : pdfRefEdgeSet.has(i) ? 0.5 : 0.3)
-                .attr('marker-end', (d, i) => pdfRefEdgeSet.has(i) ? 'url(#arrowhead-pdfref)' : (bridgeEdgeSet.has(i) ? 'url(#arrowhead-bridge)' : 'url(#arrowhead)'));
-
-            // Nodes
-            const vm = this;
-            const node = g.append('g')
-                .selectAll('circle')
-                .data(nodes)
-                .join('circle')
-                .attr('r', d => sizeScale(d.cited_by_count || 0))
-                .attr('fill', d => {
-                    // Mode "years": interpolate paper-nodes by publication year
-                    if (vm.mode === 'years' && d.year) return yearInterp(yearScale(d.year));
-                    // Color bridge nodes (reachable from >=2 own papers within depth) as accent
-                    if (bridgeNodes.has(d.id)) return colorMap.missing;
-                    return colorMap[d.type] || editorialMute2;
+                    cam.attr('transform', event.transform);
+                    if (event.sourceEvent) net.userZoomed = true;
+                    vm.onNetZoom(event.transform);
                 })
-                .attr('stroke', d => netNodeStroke(d, bridgeNodes, false))
-                .attr('stroke-width', d => d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1))
-                .style('cursor', 'pointer')
+                .on('end', () => vm.layoutLabels());
+            svg.call(net.zoom);
+            svg.on('click', (event) => {
+                if (event.target === svg.node()) vm.onCanvasClick();
+            });
+
+            net.link = cam.append('g').attr('class', 'lb-an-edges')
+                .selectAll('line').data(edges).join('line')
+                .attr('class', 'lb-an-edge');
+
+            // A node: an invisible hit circle (at least 24 px on screen) and
+            // the dot that says what it is. Nodes are no tab stops: the way
+            // to a node by keyboard is the search.
+            net.nodeG = cam.append('g').attr('class', 'lb-an-nodes')
+                .selectAll('g').data(nodes).join('g')
+                .attr('class', 'lb-an-nd')
                 .on('mouseenter', (event, d) => { vm.hoverNode = d; })
                 .on('mouseleave', () => { vm.hoverNode = null; })
                 .on('click', (event, d) => {
                     event.stopPropagation();
-                    // Editorial spec: click on own paper-node navigates to PaperDetail slide-in
-                    if (d.paper_id) {
-                        vm.$router.push('/paper/' + d.paper_id);
-                        return;
-                    }
-                    vm.selectedNode = d;
-                    vm.highlightedNodeId = d.id;
-                    vm._applyHighlight(d.id, node, link, label, citLabel, nodes, edges, adj, colorMap, bridgeNodes, ownNodeIds, bridgeEdgeSet, pdfRefEdgeSet, sizeScale);
+                    vm.selectNode(d, null);
                 })
                 .call(d3.drag()
                     .on('start', (event, d) => {
-                        if (!event.active) simulation.alphaTarget(0.05).restart();
+                        if (!event.active && net.sim) net.sim.alphaTarget(0.05).restart();
                         d.fx = d.x; d.fy = d.y;
                     })
                     .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
                     .on('end', (event, d) => {
-                        if (!event.active) simulation.alphaTarget(0);
-                        // Keep node pinned where user dropped it
+                        if (!event.active && net.sim) net.sim.alphaTarget(0);
+                        // The node stays where it was dropped.
                         d.fx = event.x; d.fy = event.y;
-                    })
-                );
+                    }));
+            net.hit = net.nodeG.append('circle').attr('class', 'lb-an-hit').attr('cx', 0).attr('cy', 0);
+            net.dot = net.nodeG.append('circle').attr('class', 'lb-an-dot')
+                .attr('cx', 0).attr('cy', 0)
+                .attr('r', (d) => d._r)
+                .attr('data-node-id', (d) => d.id)
+                .attr('data-dimmed', 'false');
 
-            node.append('title').text(d => d.title || d.id);
-
-            // Labels for own papers
-            const label = g.append('g')
-                .selectAll('text')
-                .data(nodes.filter(n => n.type === 'own'))
-                .join('text')
-                .text(d => {
-                    const t = d.title || '';
-                    return t.length > 30 ? t.substring(0, 28) + '...' : t;
-                })
-                .attr('font-size', '9px')
-                .attr('fill', lbToken('--lb-ink-2', '#3a3833'))
-                .attr('font-weight', '500')
-                .attr('dx', d => sizeScale(d.cited_by_count || 0) + 4)
-                .attr('dy', 3)
-                .style('pointer-events', 'none');
-
-            // Citation count labels on bridge nodes (connecting nodes)
-            const citLabel = g.append('g')
-                .selectAll('text')
-                .data(nodes.filter(n => bridgeNodes.has(n.id) && n.cited_by_count > 0))
-                .join('text')
-                .text(d => d.cited_by_count >= 1000 ? (d.cited_by_count / 1000).toFixed(1) + 'k' : d.cited_by_count)
-                .attr('font-size', '8px')
-                .attr('fill', lbToken('--lb-accent-ink', '#7a2808'))
-                .attr('font-weight', '600')
+            // Labels: own Items in serif, citation counts of shared
+            // references in mono, the selection's ring and title on top.
+            const labels = cam.append('g').attr('class', 'lb-an-labels');
+            net.ownLabel = labels.selectAll('text.lb-an-label-own')
+                .data(net.ownNodes).join('text')
+                .attr('class', 'lb-an-label-own')
+                .attr('dy', '0.35em')
+                .text((d) => d._label);
+            net.countLabel = labels.selectAll('text.lb-an-count')
+                .data(nodes.filter((d) => d.type !== 'own' && (d.cited_by_count || 0) > 0)).join('text')
+                .attr('class', 'lb-an-count')
                 .attr('text-anchor', 'middle')
-                .attr('dy', -2)
-                .attr('dx', 0)
-                .style('pointer-events', 'none');
+                .text((d) => fmtCount(d.cited_by_count));
+            const selG = cam.append('g').attr('class', 'lb-an-sel').attr('display', 'none');
+            net.selG = selG;
+            // The pulse is a second ring under the static one (transform and
+            // opacity only); it rests invisible.
+            net.selPulse = selG.append('circle').attr('class', 'lb-an-pulse');
+            net.selRing = selG.append('circle').attr('class', 'lb-an-ring');
+            net.selLabel = selG.append('text').attr('class', 'lb-an-sel-label').attr('text-anchor', 'middle').attr('dy', '0.9em');
 
-            simulation.on('tick', () => {
-                link
-                    .attr('x1', d => d.source.x)
-                    .attr('y1', d => d.source.y)
-                    .attr('x2', d => d.target.x)
-                    .attr('y2', d => d.target.y);
-                node
-                    .attr('cx', d => d.x)
-                    .attr('cy', d => d.y);
-                label
-                    .attr('x', d => d.x)
-                    .attr('y', d => d.y);
-                citLabel
-                    .attr('x', d => d.x)
-                    .attr('y', d => d.y - sizeScale(d.cited_by_count || 0) - 2);
+            // Layout: nodes start near the centre so nothing drifts away.
+            nodes.forEach((n) => {
+                if (n.x == null) n.x = width / 2 + (Math.random() - 0.5) * 100;
+                if (n.y == null) n.y = height / 2 + (Math.random() - 0.5) * 100;
             });
+            const dist = this.graphDistance || 25;
+            const sim = d3.forceSimulation(nodes)
+                .force('link', d3.forceLink(edges).id((d) => d.id).distance(dist).strength(0.8))
+                .force('charge', d3.forceManyBody().strength(-(dist * 1.2)).distanceMax(200))
+                .force('center', d3.forceCenter(width / 2, height / 2).strength(0.05))
+                .force('collision', d3.forceCollide().radius((d) => d._r + 1));
+            net.sim = sim;
 
-            // Auto-fit: only on initial load, skip if user already zoomed
-            simulation.on('end', () => {
-                if (userHasZoomed) return;
-                const pad = 40;
-                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-                nodes.forEach(n => {
-                    const r = sizeScale(n.cited_by_count || 0);
-                    if (n.x - r < minX) minX = n.x - r;
-                    if (n.y - r < minY) minY = n.y - r;
-                    if (n.x + r > maxX) maxX = n.x + r;
-                    if (n.y + r > maxY) maxY = n.y + r;
+            const ticked = () => {
+                // Edges end at the rim of their target, so the arrowhead shows.
+                net.link.each(function (e) {
+                    const s = e.source;
+                    const tg = e.target;
+                    const dx = tg.x - s.x;
+                    const dy = tg.y - s.y;
+                    const len = Math.hypot(dx, dy) || 1;
+                    const ux = dx / len;
+                    const uy = dy / len;
+                    const rs = Math.min(s._r, len / 3);
+                    const rt = Math.min(tg._r + 2, len / 2);
+                    this.setAttribute('x1', s.x + ux * rs);
+                    this.setAttribute('y1', s.y + uy * rs);
+                    this.setAttribute('x2', tg.x - ux * rt);
+                    this.setAttribute('y2', tg.y - uy * rt);
                 });
-                const bw = maxX - minX + pad * 2;
-                const bh = maxY - minY + pad * 2;
-                const scale = Math.min(width / bw, height / bh, 1.5);
-                const cx = (minX + maxX) / 2;
-                const cy = (minY + maxY) / 2;
-                const transform = d3.zoomIdentity
-                    .translate(width / 2, height / 2)
-                    .scale(scale)
-                    .translate(-cx, -cy);
-                svg.transition().duration(750).call(zoomBehavior.transform, transform);
-            });
-
-            this._simulation = simulation;
-            this.graphNodes = nodes;
-            this._graphNodes = nodes;
-            this._graphEdges = edges;
-            this._graphAdj = adj;
-            this._graphSvg = svg;
-            this._graphZoom = zoomBehavior;
-            this._graphD3 = { node, link, label, citLabel, colorMap, bridgeNodes, ownNodeIds, bridgeEdgeSet, pdfRefEdgeSet, sizeScale };
-
-            // Apply visibility filters on initial render
-            this._applyVisibilityFilters();
-        },
-        graphNodeColor(type) {
-            const m = {
-                own: lbToken('--lb-ink', '#1a1a1a'),
-                missing: lbToken('--lb-accent', '#c2410c'),
-                own_ref: lbToken('--lb-accent-soft', '#fce9da'),
-                external: lbToken('--lb-ink-3', '#6b6760'),
-                depth2: lbToken('--lb-mute', '#8e8a82'),
-                depth3: lbToken('--lb-mute-2', '#a8a49c'),
-                depth4: lbToken('--lb-hairline-2', '#d8d1be'),
-                depth5: lbToken('--lb-hairline', '#e7e2d6'),
+                net.nodeG.attr('transform', (d) => 'translate(' + d.x + ',' + d.y + ')');
+                vm.positionLabels();
+                if (Date.now() - net.lastLayout > 250) vm.layoutLabels();
             };
-            return m[type] || lbToken('--lb-mute-2', '#a8a49c');
-        },
-        navigateToNode(n) {
-            this.graphSearchOpen = false;
-            this.graphSearchQuery = '';
-            this.selectedNode = n;
-            this.highlightedNodeId = n.id;
-            // Apply highlight
-            if (this._graphD3) {
-                const { node, link, label, citLabel, colorMap, bridgeNodes, ownNodeIds, bridgeEdgeSet, pdfRefEdgeSet, sizeScale } = this._graphD3;
-                this._applyHighlight(n.id, node, link, label, citLabel, this.graphNodes, this._graphEdges, this._graphAdj, colorMap, bridgeNodes, ownNodeIds, bridgeEdgeSet, pdfRefEdgeSet, sizeScale);
-            }
-            // Pan to node
-            if (this._graphSvg && this._graphZoom && n.x != null) {
-                const container = this.$refs.graphContainer;
-                const width = container.clientWidth;
-                const height = container.clientHeight || 600;
-                const scale = 1.5;
-                const transform = d3.zoomIdentity.translate(width / 2, height / 2).scale(scale).translate(-n.x, -n.y);
-                this._graphSvg.transition().duration(600).call(this._graphZoom.transform, transform);
-            }
-        },
-        clearHighlight() {
-            this.highlightedNodeId = null;
-            if (this._graphD3) {
-                const { node, link, label, citLabel, colorMap, bridgeNodes, ownNodeIds, bridgeEdgeSet, pdfRefEdgeSet, sizeScale } = this._graphD3;
-                this._applyHighlight(null, node, link, label, citLabel, this.graphNodes, this._graphEdges, this._graphAdj, colorMap, bridgeNodes, ownNodeIds, bridgeEdgeSet, pdfRefEdgeSet, sizeScale);
-            }
-        },
-        _applyHighlight(nodeId, node, link, label, citLabel, nodes, edges, adj, colorMap, bridgeNodes, ownNodeIds, bridgeEdgeSet, pdfRefEdgeSet, sizeScale) {
-            if (!nodeId) {
-                // Reset all to defaults
-                node.attr('opacity', 1)
-                    .attr('fill', d => colorMap[d.type] || lbToken('--lb-mute-2', '#a8a49c'))
-                    .attr('stroke', d => netNodeStroke(d, bridgeNodes, false))
-                    .attr('stroke-width', d => d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1));
-                link.attr('stroke-opacity', (d, i) => bridgeEdgeSet.has(i) ? 0.7 : pdfRefEdgeSet.has(i) ? 0.5 : 0.3)
-                    .attr('stroke-width', (d, i) => bridgeEdgeSet.has(i) ? 2.5 : pdfRefEdgeSet.has(i) ? 1.5 : 1)
-                    .attr('stroke', (d, i) => netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, false));
-                label.attr('opacity', 1);
-                citLabel.attr('opacity', 1);
-                return;
-            }
-            const neighbors = adj.get(nodeId) || new Set();
-            // Dim all, highlight selected + neighbors
-            node.attr('opacity', d => d.id === nodeId || neighbors.has(d.id) ? 1 : 0.12)
-                .attr('stroke', d => netNodeStroke(d, bridgeNodes, d.id === nodeId))
-                .attr('stroke-width', d => d.id === nodeId ? 4 : (d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1)));
-            link.attr('stroke-opacity', (d) => {
-                const s = typeof d.source === 'object' ? d.source.id : d.source;
-                const t = typeof d.target === 'object' ? d.target.id : d.target;
-                return (s === nodeId || t === nodeId) ? 0.9 : 0.04;
-            }).attr('stroke-width', (d) => {
-                const s = typeof d.source === 'object' ? d.source.id : d.source;
-                const t = typeof d.target === 'object' ? d.target.id : d.target;
-                return (s === nodeId || t === nodeId) ? 3 : 0.5;
-            }).attr('stroke', (d, i) => {
-                const s = typeof d.source === 'object' ? d.source.id : d.source;
-                const t = typeof d.target === 'object' ? d.target.id : d.target;
-                return netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, s === nodeId || t === nodeId);
-            });
-            label.attr('opacity', d => d.id === nodeId || neighbors.has(d.id) ? 1 : 0.1);
-            citLabel.attr('opacity', d => d.id === nodeId || neighbors.has(d.id) ? 1 : 0.1);
-        },
-        applyCategoryFilter() {
-            if (!this._graphD3) return;
-            const { node, link, label, citLabel, colorMap, bridgeNodes, ownNodeIds, bridgeEdgeSet, pdfRefEdgeSet } = this._graphD3;
-            const catId = this.graphPanelCategory ? parseInt(this.graphPanelCategory) : null;
-            if (!catId) {
-                // Reset - show everything
-                node.attr('opacity', 1)
-                    .attr('fill', d => colorMap[d.type] || lbToken('--lb-mute-2', '#a8a49c'))
-                    .attr('stroke', d => netNodeStroke(d, bridgeNodes, false))
-                    .attr('stroke-width', d => d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1));
-                link.attr('stroke-opacity', (d, i) => bridgeEdgeSet.has(i) ? 0.7 : pdfRefEdgeSet.has(i) ? 0.5 : 0.3)
-                    .attr('stroke-width', (d, i) => bridgeEdgeSet.has(i) ? 2.5 : pdfRefEdgeSet.has(i) ? 1.5 : 1)
-                    .attr('stroke', (d, i) => netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, false));
-                label.attr('opacity', 1);
-                citLabel.attr('opacity', 1);
-                return;
-            }
-            // Find own paper IDs matching this category
-            const matchIds = new Set();
-            this.graphNodes.forEach(n => {
-                if (n.type === 'own' && (n.categories || []).some(c => c.id === catId)) {
-                    matchIds.add(n.id);
-                }
-            });
-            // Also include their direct neighbors
-            const relevantIds = new Set(matchIds);
-            const adj = this._graphAdj;
-            matchIds.forEach(mid => {
-                const neighbors = adj.get(mid);
-                if (neighbors) neighbors.forEach(nb => relevantIds.add(nb));
-            });
-            // Dim non-relevant nodes
-            node.attr('opacity', d => relevantIds.has(d.id) ? 1 : 0.08)
-                .attr('fill', d => colorMap[d.type] || lbToken('--lb-mute-2', '#a8a49c'))
-                .attr('stroke', d => netNodeStroke(d, bridgeNodes, matchIds.has(d.id)))
-                .attr('stroke-width', d => matchIds.has(d.id) ? 4 : (d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1)));
-            link.attr('stroke-opacity', d => {
-                const s = typeof d.source === 'object' ? d.source.id : d.source;
-                const t = typeof d.target === 'object' ? d.target.id : d.target;
-                return (matchIds.has(s) || matchIds.has(t)) ? 0.7 : 0.03;
-            }).attr('stroke-width', d => {
-                const s = typeof d.source === 'object' ? d.source.id : d.source;
-                const t = typeof d.target === 'object' ? d.target.id : d.target;
-                return (matchIds.has(s) || matchIds.has(t)) ? 2.5 : 0.5;
-            }).attr('stroke', (d, i) => {
-                const s = typeof d.source === 'object' ? d.source.id : d.source;
-                const t = typeof d.target === 'object' ? d.target.id : d.target;
-                return netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, matchIds.has(s) || matchIds.has(t));
-            });
-            label.attr('opacity', d => relevantIds.has(d.id) ? 1 : 0.05);
-            citLabel.attr('opacity', d => relevantIds.has(d.id) ? 1 : 0.05);
-        },
-        async fetchNodeAbstract(node) {
-            this.nodeAbstract = null;
-            this.nodeAbstractError = null;
-            if (!node) return;
+            sim.on('tick', ticked);
+            net.ticked = ticked;
 
-            // If it's an own paper, check if we already have abstract in DB
-            if (node.paper_id) {
-                this.nodeAbstractLoading = true;
-                try {
-                    const data = await api('/api/papers/' + node.paper_id);
-                    if (data.abstract) {
-                        this.nodeAbstract = data.abstract;
-                        this.nodeAbstractLoading = false;
+            this._net = net;
+            this._simulation = sim;
+            this.graphNodes = markRaw(nodes);
+            this.applyNetKinds();
+            this._applyVisibilityFilters();
+            // A selection that came back with the store is this net's node now.
+            if (this.selectedNode) {
+                const again = byId.get(this.selectedNode.id);
+                this.selectedNode = again && again.type !== 'own' ? again : null;
+            }
+            this.restyleNet();
+            this.onNetZoom(d3.zoomIdentity);
+
+            // The camera fits when the layout rests - unless someone zoomed.
+            sim.on('end', () => {
+                if (net.fitOnEnd && !net.userZoomed) {
+                    this.fitNet();
+                    this.focusSelection();
+                }
+                net.fitOnEnd = false;
+                this.layoutLabels();
+            });
+            // Reduced motion: the layout settles at once and the camera jumps.
+            if (reduced) {
+                container.appendChild(svg.node());
+                settleSimulation(sim);
+                ticked();
+                net.fitOnEnd = false;
+                this.fitNet();
+                this.focusSelection();
+                this.layoutLabels();
+                svg.classed('is-live', true);
+                this.netRev++;
+                return;
+            }
+            // Otherwise the layout comes to rest unseen (the svg is not on
+            // the page yet), in slices between frames so the main thread
+            // stays free; the camera jumps to the fit, and only then the net
+            // shows - growing in stages after a fresh build, standing at
+            // once on a return.
+            sim.stop();
+            net.fitOnEnd = false;
+            const layoutRun = (this._layoutRun = (this._layoutRun || 0) + 1);
+            const done = () => {
+                ticked();
+                container.appendChild(svg.node());
+                this.fitNet();
+                this.focusSelection();
+                this.layoutLabels();
+                if (fresh) this.buildUpNet();
+                else svg.classed('is-live', true);
+                this.netRev++;
+            };
+            const alive = () => this._net === net && this._layoutRun === layoutRun;
+            return new Promise((resolve) => {
+                let left = simulationTicksToRest(sim);
+                const slice = (budget) => {
+                    if (!alive()) { resolve(); return; }
+                    const until = performance.now() + budget;
+                    while (left > 0 && performance.now() < until) {
+                        const n = Math.min(left, 10);
+                        sim.tick(n);
+                        left -= n;
+                    }
+                    if (left > 0) {
+                        this._layoutFrame = analysisFrame(() => slice(10));
                         return;
                     }
-                } catch (e) { /* continue to OpenAlex */ }
+                    done();
+                    resolve();
+                };
+                // A return to the route gets a head start inside this call,
+                // so a small net stands before the first frame.
+                slice(fresh ? 10 : 40);
+            });
+        },
+        // The build-up after a fresh result (#243): every node and edge gets
+        // its stage (--lb-i); the CSS lets each fade in over --lb-dur-4, 35 ms
+        // after the stage before. The class goes when the last one landed.
+        buildUpNet() {
+            const net = this._net;
+            if (!net) return;
+            const stageOf = (d) => netStage(d, net.kind.get(d.id));
+            net.nodeG.each(function (d) { this.style.setProperty('--lb-i', String(stageOf(d))); });
+            net.link.each(function (e) {
+                this.style.setProperty('--lb-i', String(Math.max(stageOf(netEnd(e.source)), stageOf(netEnd(e.target)))));
+            });
+            net.ownLabel.each(function () { this.style.setProperty('--lb-i', '0'); });
+            net.countLabel.each(function (d) { this.style.setProperty('--lb-i', String(stageOf(d))); });
+            const ms = analysisMotionMs(4);
+            if (ms <= 0) {
+                net.svg.classed('is-live', true);
+                return;
             }
+            net.svg.classed('is-building', true);
+            this._buildTimer = setTimeout(() => {
+                this._buildTimer = null;
+                net.svg.classed('is-building', false).classed('is-live', true);
+            }, ms + 5 * ANALYSIS_STAGGER + 60);
+        },
+        // Ends a running layout, build-up and flight (a new net, leaving).
+        stopNetMotion() {
+            this._layoutRun = (this._layoutRun || 0) + 1;
+            if (this._layoutFrame != null) { analysisCancelFrame(this._layoutFrame); this._layoutFrame = null; }
+            if (this._buildTimer) { clearTimeout(this._buildTimer); this._buildTimer = null; }
+            if (this._net) this._net.svg.interrupt();
+        },
+        // Which nodes are shared at the current "path between two items",
+        // and so the kind of every node and edge - in place, on the slider.
+        applyNetKinds() {
+            const net = this._net;
+            if (!net) return;
+            net.shared = netSharedReferences(net.ownIds, net.adj, net.edgeIndex, this.minRefs || 1);
+            net.nodes.forEach((d) => net.kind.set(d.id, netNodeKind(d, net.shared.shared)));
+            net.edges.forEach((e) => {
+                e._kind = net.shared.sharedEdges.has(e._i) ? 'bridge' : (e.edge_type === 'pdf_ref' ? 'pdf' : 'cite');
+            });
+            net.dot.attr('data-node-kind', (d) => net.kind.get(d.id));
+            net.link = net.link
+                .attr('class', (e) => 'lb-an-edge lb-an-edge-' + e._kind)
+                .attr('data-edge-kind', (e) => e._kind)
+                .sort((a, b) => (NET_EDGE_RANK[a._kind] - NET_EDGE_RANK[b._kind]) || (a._i - b._i));
+            this.sharedCount = net.shared.shared.size;
+            this.netRev++;
+        },
+        // What stands out: the selection (the work, its neighbours and the
+        // path to the own Items that make it shared), else the lens (own
+        // Items and shared references), else the category (its Items and
+        // their neighbours). Everything else steps back.
+        netEmphasis() {
+            const net = this._net;
+            if (!net) return null;
+            const sel = this.selectedNode && net.byId.get(this.selectedNode.id);
+            if (sel) {
+                const nodes = new Set([sel.id]);
+                const edges = new Set();
+                for (const i of net.incident.get(sel.id) || []) {
+                    edges.add(i);
+                    nodes.add(netEnd(net.edges[i].source));
+                    nodes.add(netEnd(net.edges[i].target));
+                }
+                const path = net.shared.paths.get(sel.id);
+                if (path) {
+                    path.nodes.forEach((id) => nodes.add(id));
+                    path.edges.forEach((i) => edges.add(i));
+                }
+                return { mode: 'select', nodes, edges };
+            }
+            if (this.lensOn) {
+                return { mode: 'lens', nodes: new Set([...net.ownIds, ...net.shared.shared]), edges: net.shared.sharedEdges };
+            }
+            const cid = this.graphPanelCategory ? parseInt(this.graphPanelCategory) : null;
+            if (cid) {
+                const match = net.ownNodes.filter((n) => (n.categories || []).some((c) => c.id === cid)).map((n) => n.id);
+                const nodes = new Set(match);
+                const edges = new Set();
+                match.forEach((id) => (net.incident.get(id) || []).forEach((i) => {
+                    edges.add(i);
+                    nodes.add(netEnd(net.edges[i].source));
+                    nodes.add(netEnd(net.edges[i].target));
+                }));
+                return { mode: 'category', nodes, edges };
+            }
+            return null;
+        },
+        // Recolours the net in place: colour mode, emphasis and theme all
+        // come through netNodeStyle / netEdgeStyle.
+        restyleNet() {
+            const net = this._net;
+            if (!net) return;
+            const emph = this.netEmphasis();
+            net.emph = emph;
+            const ctx = { colorBy: this.colorBy, years: net.yearDomain, emph };
+            net.dot.each(function (d) {
+                const s = netNodeStyle(d, net.kind.get(d.id), ctx);
+                d._op = s.opacity;
+                this.style.setProperty('fill', s.fill);
+                this.style.setProperty('stroke', s.stroke);
+                d._sw = s.strokeWidth;
+                this.style.setProperty('stroke-width', String(s.strokeWidth));
+                this.setAttribute('data-dimmed', s.dimmed ? 'true' : 'false');
+            });
+            // The ring width, for the hover rule that keeps it constant
+            // while the dot grows.
+            net.nodeG.style('opacity', (d) => d._op).style('--lb-sw', (d) => String(d._sw));
+            net.link.each(function (e) {
+                const s = netEdgeStyle(e._kind, ctx, !!emph && emph.edges.has(e._i));
+                this.style.setProperty('stroke', s.stroke);
+                this.style.setProperty('stroke-width', String(s.width));
+                this.style.setProperty('opacity', String(s.opacity));
+                this.setAttribute('marker-end', 'url(#lb-an-arrow-' + s.marker + ')');
+            });
+            const labelOpacity = (d) => (emph && !emph.nodes.has(d.id) ? 0.15 : 1);
+            net.ownLabel.style('opacity', labelOpacity);
+            net.countLabel.style('opacity', labelOpacity);
+            this.positionLabels();
+        },
+        onNetZoom(transform) {
+            const net = this._net;
+            if (!net) return;
+            net.k = transform.k;
+            net.hit.attr('r', (d) => Math.max(d._r + 1, 12 / transform.k));
+            this.positionLabels();
+        },
+        // Sizes and places the labels for the current zoom: the type keeps
+        // its screen size, own labels show from k 0.5, the citation counts
+        // of shared references from k 1.1.
+        positionLabels() {
+            const net = this._net;
+            if (!net) return;
+            const k = net.k || 1;
+            const halo = (3 / k) + 'px';
+            const ownOn = k >= 0.5;
+            const ownSize = (12.5 / k) + 'px';
+            net.ownLabel.each(function (d) {
+                const st = net.labelState.get(d.id) || { show: true, side: 'right' };
+                const on = ownOn && st.show && net.visible.get(d.id) !== false && Number.isFinite(d.x);
+                this.setAttribute('display', on ? 'inline' : 'none');
+                if (!on) return;
+                const off = d._r + 6 / k;
+                this.setAttribute('x', st.side === 'left' ? d.x - off : d.x + off);
+                this.setAttribute('y', d.y);
+                this.setAttribute('text-anchor', st.side === 'left' ? 'end' : 'start');
+                this.style.setProperty('font-size', ownSize);
+                this.style.setProperty('stroke-width', halo);
+            });
+            const countOn = k >= 1.1;
+            const countSize = (10.5 / k) + 'px';
+            net.countLabel.each(function (d) {
+                const on = countOn && net.kind.get(d.id) === 'shared' && net.visible.get(d.id) !== false && Number.isFinite(d.x);
+                this.setAttribute('display', on ? 'inline' : 'none');
+                if (!on) return;
+                this.setAttribute('x', d.x);
+                this.setAttribute('y', d.y - d._r - 4 / k);
+                this.style.setProperty('font-size', countSize);
+                this.style.setProperty('stroke-width', halo);
+            });
+            const sel = this.selectedNode && net.byId.get(this.selectedNode.id);
+            if (!sel || !Number.isFinite(sel.x) || net.visible.get(sel.id) === false) {
+                net.selG.attr('display', 'none');
+                return;
+            }
+            net.selG.attr('display', 'inline');
+            net.selRing.attr('cx', sel.x).attr('cy', sel.y).attr('r', sel._r + 5 / k)
+                .style('stroke-width', (2 / k) + 'px');
+            net.selPulse.attr('cx', sel.x).attr('cy', sel.y).attr('r', sel._r + 5 / k);
+            net.selLabel.attr('x', sel.x).attr('y', sel.y + sel._r + 6 / k)
+                .style('font-size', (13 / k) + 'px').style('stroke-width', halo)
+                .text(netTrim(sel.title || sel.id, 36));
+        },
+        // Which own labels show and on which side, for the current camera.
+        layoutLabels() {
+            const net = this._net;
+            if (!net) return;
+            const t = d3.zoomTransform(net.svg.node());
+            const emph = net.emph;
+            const items = net.ownNodes
+                .filter((d) => Number.isFinite(d.x) && net.visible.get(d.id) !== false)
+                .map((d) => ({
+                    id: d.id, x: d.x, y: d.y, r: d._r, text: d._label,
+                    degree: (net.incident.get(d.id) || []).length,
+                    prio: emph && emph.nodes.has(d.id) ? 1 : 0,
+                }));
+            const reserved = [];
+            const sel = this.selectedNode && net.byId.get(this.selectedNode.id);
+            if (sel && Number.isFinite(sel.x)) {
+                const w = netTrim(sel.title || sel.id, 36).length * 13 * 0.5;
+                const sx = sel.x * t.k + t.x;
+                const sy = (sel.y + sel._r) * t.k + t.y + 6;
+                reserved.push({ x0: sx - w / 2, x1: sx + w / 2, y0: sy, y1: sy + 17 });
+            }
+            net.labelState = netPlaceLabels(items, t, (this._netSize || { w: 960 }).w, reserved);
+            net.lastLayout = Date.now();
+            this.positionLabels();
+        },
 
-            // Try OpenAlex if we have DOI or openalex_id
+        // ── Camera (#242) ───────────────────────────────────────────────
+        // The one place the camera moves. It jumps - unless the caller asks
+        // for a flight (selection, zoom keys, "show the whole network") and
+        // motion is on: then it flies over --lb-dur-4 with --lb-ease-out.
+        // The flight is the *unnamed* transition on the svg: a new flight
+        // and d3-zoom's own interrupt at the start of a wheel or drag both
+        // end it (a named one would not be ended by a gesture).
+        applyCamera(transform, fly) {
+            const net = this._net;
+            if (!net) return;
+            const ms = fly ? analysisMotionMs(4) : 0;
+            net.svg.interrupt();
+            if (ms <= 0 || sameCamera(d3.zoomTransform(net.svg.node()), transform)) {
+                net.svg.call(net.zoom.transform, transform);
+                return;
+            }
+            net.svg.transition().duration(ms).ease(analysisEaseOut)
+                .call(net.zoom.transform, transform);
+        },
+        // The free part of the net area in its own pixels: below the tool
+        // band, right of the card, left of the open "View" popover.
+        netFree() {
+            const { w, h } = this._netSize || { w: 960, h: 600 };
+            const narrow = this.stageNarrow;
+            const l = this.cardOpen && !narrow ? 14 + 320 + 18 : 18;
+            let r = w - 18;
+            if (this.viewOpen && !narrow) {
+                const pop = this.$refs.viewPop;
+                r = w - 14 - ((pop && pop.offsetWidth) || 296) - 10;
+            }
+            const top = this.bandBottom + 14;
+            const b = h - 14;
+            return { l, r: Math.max(r, l + 120), t: top, b: Math.max(b, top + 120) };
+        },
+        netBox(list) {
+            let x0 = Infinity;
+            let y0 = Infinity;
+            let x1 = -Infinity;
+            let y1 = -Infinity;
+            for (const d of list) {
+                if (!d || !Number.isFinite(d.x) || !Number.isFinite(d.y)) continue;
+                x0 = Math.min(x0, d.x - d._r);
+                y0 = Math.min(y0, d.y - d._r);
+                x1 = Math.max(x1, d.x + d._r);
+                y1 = Math.max(y1, d.y + d._r);
+            }
+            return Number.isFinite(x0) ? { x0, y0, x1, y1 } : null;
+        },
+        // Puts `box` (graph units) in the middle of the free area, zoomed at
+        // most to `maxK`. With `onlyIfOutside` the camera stays while the
+        // box is fully in view already. `fly` makes the move a flight.
+        cameraToBox(box, maxK, onlyIfOutside, fly) {
+            const net = this._net;
+            if (!net || !box) return;
+            const f = this.netFree();
+            const pad = 24;
+            if (onlyIfOutside) {
+                const t0 = d3.zoomTransform(net.svg.node());
+                const inside = box.x0 * t0.k + t0.x - pad >= f.l && box.x1 * t0.k + t0.x + pad <= f.r
+                    && box.y0 * t0.k + t0.y - pad >= f.t && box.y1 * t0.k + t0.y + pad <= f.b;
+                if (inside) return;
+            }
+            const uw = Math.max(40, f.r - f.l - 2 * pad);
+            const uh = Math.max(40, f.b - f.t - 2 * pad);
+            const bw = Math.max(box.x1 - box.x0, 1);
+            const bh = Math.max(box.y1 - box.y0, 1);
+            const k = Math.min(5, Math.max(0.05, Math.min(uw / bw, uh / bh, maxK)));
+            const tx = (f.l + f.r) / 2 - ((box.x0 + box.x1) / 2) * k;
+            const ty = (f.t + f.b) / 2 - ((box.y0 + box.y1) / 2) * k;
+            this.applyCamera(d3.zoomIdentity.translate(tx, ty).scale(k), fly);
+        },
+        fitNet(fly) {
+            const net = this._net;
+            if (!net) return;
+            this.cameraToBox(this.netBox(net.nodes.filter((d) => net.visible.get(d.id) !== false)), 1.15, false, fly);
+        },
+        // The frame of a selection: the work and the own Items citing it -
+        // directly or along the path that makes it shared; without either,
+        // its neighbours. Zoom at most 1.3.
+        focusSelection(fly) {
+            const net = this._net;
+            const sel = net && this.selectedNode && net.byId.get(this.selectedNode.id);
+            if (!sel) return;
+            const ids = new Set([sel.id]);
+            (net.citers.get(sel.id) || []).forEach((d) => ids.add(d.id));
+            const path = net.shared.paths.get(sel.id);
+            if (path) path.owners.forEach((id) => ids.add(id));
+            if (ids.size === 1) (net.adj.get(sel.id) || []).forEach((id) => ids.add(id));
+            const box = this.netBox([...ids].map((id) => net.byId.get(id)));
+            if (!box) return;
+            // The work's title under it belongs to the frame as well.
+            const k = d3.zoomTransform(net.svg.node()).k || 1;
+            const half = (netTrim(sel.title || sel.id, 36).length * 13 * 0.5) / 2 / k;
+            box.x0 = Math.min(box.x0, sel.x - half);
+            box.x1 = Math.max(box.x1, sel.x + half);
+            box.y1 = Math.max(box.y1, sel.y + sel._r + 24 / k);
+            this.cameraToBox(box, 1.3, true, fly);
+        },
+        // The free area changed (popover, card, size): fit again - unless
+        // someone zoomed by hand or a selection holds the camera.
+        maybeRefit() {
+            const net = this._net;
+            if (net && !net.userZoomed && !this.selectedNode) {
+                this.fitNet();
+                this.layoutLabels();
+            }
+        },
+        // Zoom keys zoom about the middle of the free area.
+        zoomBy(factor) {
+            const net = this._net;
+            if (!net) return;
+            const f = this.netFree();
+            const p = [(f.l + f.r) / 2, (f.t + f.b) / 2];
+            const t0 = d3.zoomTransform(net.svg.node());
+            const k = Math.min(5, Math.max(0.05, t0.k * factor));
+            const g = t0.invert(p);
+            net.userZoomed = true;
+            this.applyCamera(d3.zoomIdentity.translate(p[0] - g[0] * k, p[1] - g[1] * k).scale(k), true);
+        },
+        // "Show the whole network": fits anew and ends the selection.
+        zoomFit() {
+            this.closeCard({ focus: false });
+            const net = this._net;
+            if (!net) return;
+            net.userZoomed = false;
+            this.fitNet(true);
+            this.layoutLabels();
+        },
+
+        // ── The stage: measured, observed (#242) ────────────────────────
+        // jsdom and a hidden tab measure 0: then the fallbacks hold.
+        measureStage() {
+            const area = this.$refs.netArea;
+            const stage = this.$refs.stage;
+            const tools = this.$refs.toolbar;
+            const bar = this.$refs.bar;
+            this._netSize = { w: (area && area.clientWidth) || 960, h: (area && area.clientHeight) || 600 };
+            this.stageWidth = (stage && stage.clientWidth) || 0;
+            this.bandBottom = tools && tools.offsetHeight ? tools.offsetTop + tools.offsetHeight : 48;
+            this.barHeight = bar && bar.offsetHeight ? bar.offsetHeight : 44;
+        },
+        onStageResize() {
+            const before = this._netSize || { w: 0, h: 0 };
+            this.measureStage();
+            const net = this._net;
+            if (!net) return;
+            const { w, h } = this._netSize;
+            if (w !== before.w || h !== before.h) {
+                net.svg.attr('width', w).attr('height', h);
+                this.maybeRefit();
+            }
+            this.layoutLabels();
+        },
+        // Container widths drive the breakpoints (hint, card under the net)
+        // and the camera; without ResizeObserver the window's size does.
+        observeStage() {
+            const stage = this.$refs.stage;
+            if (!stage || this._observedStage === stage) return;
+            this._observedStage = stage;
+            if (typeof ResizeObserver === 'function') {
+                if (this._stageObserver) this._stageObserver.disconnect();
+                this._stageObserver = new ResizeObserver(() => this.onStageResize());
+                this._stageObserver.observe(stage);
+                if (this.$refs.toolbar) this._stageObserver.observe(this.$refs.toolbar);
+                if (this.$refs.bar) this._stageObserver.observe(this.$refs.bar);
+            } else if (!this._onWinResize) {
+                this._onWinResize = () => this.onStageResize();
+                window.addEventListener('resize', this._onWinResize);
+            }
+        },
+        // A theme or palette switch restyles the net in place.
+        observeTheme(on) {
+            if (on && !this._themeObserver && typeof MutationObserver === 'function') {
+                this._themeObserver = new MutationObserver(() => this.restyleNet());
+                this._themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'data-palette'] });
+            } else if (!on && this._themeObserver) {
+                this._themeObserver.disconnect();
+                this._themeObserver = null;
+            }
+        },
+        bindNetListeners(on) {
+            if (on && !this._onNetKey) {
+                this._onNetKey = (e) => this.onNetKey(e);
+                this._onNetDown = (e) => this.onNetPointerDown(e);
+                document.addEventListener('keydown', this._onNetKey);
+                // Capture: d3 swallows the mousedown of a pan or a drag.
+                document.addEventListener('mousedown', this._onNetDown, true);
+                this.observeTheme(true);
+            } else if (!on && this._onNetKey) {
+                document.removeEventListener('keydown', this._onNetKey);
+                document.removeEventListener('mousedown', this._onNetDown, true);
+                this._onNetKey = null;
+                this._onNetDown = null;
+                this.observeTheme(false);
+            }
+        },
+        // Keys on the net: Esc closes the innermost open thing (list,
+        // popover, card); "/" jumps into the search and + - 0 zoom while no
+        // field has the focus.
+        onNetKey(e) {
+            if (e.defaultPrevented || this.bulk.open) return;
+            if (!this.networkData || this.activeTab !== 'network') return;
+            if (e.key === 'Escape') {
+                if (this.searchOpen) {
+                    this.searchOpen = false;
+                } else if (this.ownListOpen) {
+                    this.ownListOpen = false;
+                    this.focusEl(this.$refs.ownMenu && this.$refs.ownMenu.querySelector('button'));
+                } else if (this.viewOpen) {
+                    this.viewOpen = false;
+                    this.focusEl(this.$refs.viewKey);
+                } else if (this.cardOpen) {
+                    this.closeCard();
+                } else {
+                    return;
+                }
+                e.preventDefault();
+                return;
+            }
+            if (e.ctrlKey || e.metaKey || e.altKey || netIsField(e.target)) return;
+            if (e.key === '/') {
+                e.preventDefault();
+                this.focusEl(this.$refs.searchInput);
+            } else if (e.key === '+' || e.key === '=') {
+                e.preventDefault();
+                this.zoomBy(1.25);
+            } else if (e.key === '-' || e.key === '_') {
+                e.preventDefault();
+                this.zoomBy(1 / 1.25);
+            } else if (e.key === '0') {
+                e.preventDefault();
+                this.zoomFit();
+            }
+        },
+        // A click outside closes the search list, the own-items list and
+        // the "View" popover (its own key toggles it).
+        onNetPointerDown(e) {
+            const inside = (el) => !!el && el.contains(e.target);
+            if (this.searchOpen && !inside(this.$refs.search)) this.searchOpen = false;
+            if (this.ownListOpen && !inside(this.$refs.ownMenu)) this.ownListOpen = false;
+            if (this.viewOpen && !inside(this.$refs.viewPop) && !inside(this.$refs.viewKey)) this.viewOpen = false;
+        },
+        focusEl(el) {
+            if (el && typeof el.focus === 'function') el.focus();
+        },
+
+        // ── Search: an ARIA combobox (#242) ─────────────────────────────
+        onSearchInput() {
+            this.searchOpen = true;
+            this.searchActive = 0;
+        },
+        onSearchFocus() {
+            if (this.searchQuery.trim()) this.searchOpen = true;
+        },
+        onSearchKey(e) {
+            const list = this.searchResults;
+            const n = list.length;
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                if (!n) return;
+                e.preventDefault();
+                const step = e.key === 'ArrowDown' ? 1 : -1;
+                if (!this.searchOpen) {
+                    this.searchOpen = true;
+                    this.searchActive = step > 0 ? 0 : n - 1;
+                    return;
+                }
+                this.searchActive = (this.searchActiveIndex + step + n) % n;
+            } else if (e.key === 'Enter') {
+                if (!n) return;
+                e.preventDefault();
+                this.pickResult(list[this.searchActiveIndex]);
+            } else if (e.key === 'Escape' && this.searchOpen) {
+                e.preventDefault();
+                e.stopPropagation();
+                this.searchOpen = false;
+            }
+        },
+        // Picking a hit does what a click on its node does.
+        pickResult(r) {
+            if (!r) return;
+            this.searchOpen = false;
+            this.searchQuery = '';
+            this.searchActive = 0;
+            this.selectNode(r.node, this.$refs.searchInput);
+        },
+
+        // ── Selection and card (#242) ───────────────────────────────────
+        // An own Item opens its detail view; a cited work opens the card,
+        // and what is not involved steps back. The camera moves only if the
+        // work and its citers are not in view yet. The focus returns to
+        // `trigger` when the card closes: the search, the lens, else the net.
+        selectNode(d, trigger) {
+            if (!d) return;
+            if (d.type === 'own') {
+                if (d.paper_id) this.$router.push('/paper/' + d.paper_id);
+                return;
+            }
+            const active = document.activeElement;
+            const fromTools = active && this.$refs.toolbar && this.$refs.toolbar.contains(active) ? active : null;
+            this._cardReturn = trigger || fromTools || this.$refs.netArea || null;
+            this.lensOn = false;
+            this.collChat = false;
+            this.viewOpen = false;
+            this.ownListOpen = false;
+            this.cardTab = 'details';
+            this.selectedNode = d;
+            this.restyleNet();
+            this.$nextTick(() => {
+                this.focusSelection(true);
+                this.layoutLabels();
+                this.focusCardTitle();
+                this.pulseSelection();
+            });
+        },
+        // The chosen work's ring pulses twice over --lb-dur-4: a second ring
+        // grows and fades (transform and opacity), then only the static ring
+        // stays. Not under reduced motion, and only where the engine animates.
+        pulseSelection() {
+            const net = this._net;
+            const el = net && net.selPulse && net.selPulse.node();
+            if (!el || typeof el.animate !== 'function') return;
+            const ms = analysisMotionMs(4);
+            if (ms <= 0) return;
+            if (typeof el.getAnimations === 'function') el.getAnimations().forEach((a) => a.cancel());
+            el.animate(
+                [{ transform: 'scale(1)', opacity: 0.8 }, { transform: 'scale(2.1)', opacity: 0 }],
+                { duration: ms, iterations: 2, easing: 'cubic-bezier(.16, 1, .3, 1)', fill: 'backwards' },
+            );
+        },
+        focusCardTitle() {
+            this.$nextTick(() => this.focusEl(this.$refs.cardTitle));
+        },
+        // Esc, its key, "Show the whole network": the card closes and the
+        // focus goes back where it came from. The camera stays.
+        closeCard(opts) {
+            const focus = !opts || opts.focus !== false;
+            const wasOpen = this.cardOpen;
+            this.selectedNode = null;
+            this.collChat = false;
+            this.restyleNet();
+            this.layoutLabels();
+            const back = this._cardReturn;
+            this._cardReturn = null;
+            if (!focus || !wasOpen) return;
+            this.$nextTick(() => this.focusEl(back && document.body.contains(back) ? back : this.$refs.netArea));
+        },
+        onCanvasClick() {
+            if (this.selectedNode) this.closeCard({ focus: false });
+        },
+        showCardTab(tab) {
+            if (tab === 'details' && this.collChat) return;
+            this.cardTab = tab;
+        },
+        onCardTabKey(e) {
+            if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+            e.preventDefault();
+            if (this.collChat) return;
+            const next = this.cardTab === 'chat' ? 'details' : 'chat';
+            this.cardTab = next;
+            this.$nextTick(() => this.focusEl(document.getElementById('lb-an-card-tab-' + next)));
+        },
+        onColorKey(e) {
+            if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+            e.preventDefault();
+            this.colorBy = this.colorBy === 'year' ? 'type' : 'year';
+            this.$nextTick(() => this.focusEl(this.$refs.viewPop && this.$refs.viewPop.querySelector('[data-color-by="' + this.colorBy + '"]')));
+        },
+        // The lens: own Items and shared references come forward. It and a
+        // selection exclude each other.
+        toggleLens() {
+            this.lensOn = !this.lensOn;
+            if (this.lensOn && this.cardOpen) {
+                this.selectedNode = null;
+                this.collChat = false;
+                this._cardReturn = null;
+            }
+            this.restyleNet();
+            this.layoutLabels();
+        },
+        async ensureLlmStatus() {
+            if (this.llmReady !== null || this._llmAsking) return;
+            this._llmAsking = true;
+            let ready = true;
+            try {
+                const status = await api('/api/llm/status');
+                ready = !!(status && status.reasoning);
+            } catch (e) {
+                // Status unknown: let the chat itself say what is wrong.
+            }
+            this._llmAsking = false;
+            this.llmReady = ready;
+        },
+        async fetchNodeAbstract(node) {
+            const seq = (this._abstractSeq || 0) + 1;
+            this._abstractSeq = seq;
+            const live = () => seq === this._abstractSeq;
+            this.nodeAbstract = null;
+            this.nodeAbstractError = null;
+            this.nodeAbstractDone = false;
+            this.nodeAbstractLoading = false;
+            if (!node) return;
             const doi = node.doi;
             const oaId = node.openalex_id || node.id;
             if (!doi && !oaId) {
-                this.nodeAbstractLoading = false;
                 this.nodeAbstractError = t('analysis.abstractNoDoi');
+                this.nodeAbstractDone = true;
                 return;
             }
-
             this.nodeAbstractLoading = true;
             try {
                 const data = await api('/api/analysis/node-abstract?doi=' + encodeURIComponent(doi || '') + '&openalex_id=' + encodeURIComponent(oaId || ''));
-                if (data.abstract) {
-                    this.nodeAbstract = data.abstract;
-                } else {
-                    this.nodeAbstractError = t('analysis.abstractNotInOpenalex');
-                }
+                if (!live()) return;
+                if (data && data.abstract) this.nodeAbstract = data.abstract;
+                else this.nodeAbstractError = t('analysis.abstractNotInOpenalex');
             } catch (e) {
+                if (!live()) return;
                 this.nodeAbstractError = t('analysis.abstractLoadFailed');
             } finally {
-                this.nodeAbstractLoading = false;
+                if (live()) {
+                    this.nodeAbstractLoading = false;
+                    this.nodeAbstractDone = true;
+                }
             }
         },
-        askAboutSelectedNode() {
-            if (!this.selectedNode) return;
-            // Set up chat context with this paper
-            this.chatContextPaper = {
-                title: this.selectedNode.title,
-                authors: this.selectedNode.authors,
-                year: this.selectedNode.year,
-                doi: this.selectedNode.doi,
-                abstract: this.nodeAbstract || '',
-                paper_id: this.selectedNode.paper_id || null,
-                openalex_id: this.selectedNode.openalex_id || this.selectedNode.id || null,
-            };
+        // The scope follows the route: /analyse?collection_id=N is that
+        // Collection, plain /analyse the Library. A scope change drops the
+        // previous network — its nodes belong to the other scope.
+        async applyRouteScope() {
+            const raw = this.$route.query.collection_id;
+            const id = raw ? parseInt(raw) : null;
+            const current = this.scope ? this.scope.id : null;
+            if (id === current) return;
+            let next = null;
+            if (id) {
+                try {
+                    const c = await api(`/api/collections/${id}`);
+                    next = { id: c.id, name: c.name };
+                } catch (e) {
+                    this.error = e.message;
+                }
+            }
+            this.scope = next;
+            analysisStore.scope = next;
+            if (this._simulation) this._simulation.stop();
+            this._net = null;
+            this.graphNodes = [];
+            this.networkData = null;
+            this.stats = null;
+            this.scopeCounts = null;
+            this.collChat = false;
+            this.lensOn = false;
+            this.cardTab = 'details';
+            this.selectedNode = null;
+            this.resetChat();
+        },
+        // "Add to the library" / "Add to <Collection>" (ADR-0016): only with
+        // a DOI; the answer says what happened and whether a PDF came, and
+        // the key turns into "Open details" for the new Item.
+        async adoptNode() {
+            const n = this.selectedNode;
+            if (!n || !n.doi || this.nodeAdding) return;
+            const id = n.id;
+            const still = () => this.selectedNode && this.selectedNode.id === id;
+            this.nodeAdding = true;
+            this.nodeAddResult = '';
+            const body = JSON.stringify({ doi: n.doi, title: n.title || '', authors: n.authors || '', year: n.year || null });
+            const pdf = (has) => t(has ? 'analysis.addResult.pdfYes' : 'analysis.addResult.pdfNo');
+            try {
+                let what;
+                let hasPdf;
+                let res;
+                if (this.scope) {
+                    res = await api(`/api/collections/${this.scope.id}/items/by-doi`, { method: 'POST', body });
+                    what = res.created ? t('analysis.addResult.created')
+                        : (res.added ? t('analysis.addResult.existing') : t('analysis.addResult.already'));
+                    hasPdf = !!res.has_pdf;
+                } else {
+                    res = await api('/api/papers/by-doi', { method: 'POST', body });
+                    what = res.created ? t('analysis.addResult.created') : t('analysis.addResult.inLibrary');
+                    hasPdf = res.pdf === 'fetched';
+                }
+                if (!still()) return;
+                this.nodeAddResult = t('analysis.addResult.text', { what, pdf: pdf(hasPdf) });
+                this.adoptedPaperId = res.paper_id || null;
+            } catch (e) {
+                if (still()) this.nodeAddResult = e.message;
+            } finally {
+                this.nodeAdding = false;
+            }
+        },
+        // "Ask about <Collection>": the card opens without a work, straight
+        // in the chat; at most NETWORK_CHAT_MAX_ITEMS items go along.
+        async askAboutCollection(e) {
+            if (!this.scope) return;
+            const trigger = e && e.currentTarget;
+            try {
+                const rows = await api(`/api/papers?collection_id=${this.scope.id}`);
+                const ids = (rows || []).map((p) => p.id);
+                if (!ids.length) return;
+                this._cardReturn = trigger || null;
+                this.lensOn = false;
+                this.viewOpen = false;
+                this.ownListOpen = false;
+                this.collChat = true;
+                this.selectedNode = null;
+                this.resetChat();
+                this.chatContextPaper = {
+                    collection_id: this.scope.id,
+                    title: this.scope.name,
+                    paper_ids: ids.slice(0, NETWORK_CHAT_MAX_ITEMS),
+                    total: ids.length,
+                    capped: ids.length > NETWORK_CHAT_MAX_ITEMS,
+                };
+                this.restyleNet();
+                this.focusCardTitle();
+            } catch (err) {
+                this.error = err.message;
+            }
+        },
+        // A new selection starts a new chat; a running answer is dropped.
+        resetChat() {
+            this._chatRun = (this._chatRun || 0) + 1;
             this.chatMessages = [];
             this.chatStreamContent = '';
-            this.chatOpen = true;
-            // Scroll to chat
-            this.$nextTick(() => {
-                const chatEl = this.$refs.chatMessages;
-                if (chatEl) chatEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-            });
+            this.chatStreaming = false;
+            this.chatContextPaper = null;
         },
         clearChat() {
             this.chatMessages = [];
@@ -9322,304 +16960,239 @@ const AnalysePage = {
         renderMarkdown(text) {
             return renderMarkdownSafe(text);
         },
-        async sendChatMessage() {
-            const question = this.chatInput.trim();
-            if (!question || this.chatStreaming || !this.chatContextPaper) return;
-
-            this.chatInput = '';
+        scrollChat() {
+            this.$nextTick(() => {
+                const body = this.$refs.cardBody;
+                if (body) body.scrollTop = body.scrollHeight;
+            });
+        },
+        // What the chat answers from: the Collection's items, or the selected
+        // work with the abstract the card holds by now.
+        chatContextNow() {
+            if (this.collChat) {
+                return this.chatContextPaper && this.chatContextPaper.paper_ids ? this.chatContextPaper : null;
+            }
+            const n = this.selectedNode;
+            if (!n) return null;
+            return {
+                node_id: n.id,
+                title: n.title || '',
+                authors: n.authors || '',
+                year: n.year || null,
+                doi: n.doi || '',
+                abstract: this.nodeAbstract || '',
+                openalex_id: n.openalex_id || n.id,
+            };
+        },
+        async sendChatMessage(preset) {
+            const question = (typeof preset === 'string' ? preset : this.chatInput).trim();
+            if (!question || this.chatStreaming || this.llmReady === false) return;
+            const ctx = this.chatContextNow();
+            if (!ctx) return;
+            this.chatContextPaper = ctx;
+            if (typeof preset !== 'string') this.chatInput = '';
+            const run = (this._chatRun || 0) + 1;
+            this._chatRun = run;
+            const live = () => run === this._chatRun;
+            const history = this.chatMessages.filter((m) => m.role !== 'system');
             this.chatMessages.push({ role: 'user', content: question });
             this.chatStreaming = true;
             this.chatStreamContent = '';
-
-            this.$nextTick(() => {
-                if (this.$refs.chatMessages) {
-                    this.$refs.chatMessages.scrollTop = this.$refs.chatMessages.scrollHeight;
-                }
-            });
-
+            this.scrollChat();
+            const body = { question, history };
+            if (ctx.paper_ids) {
+                // A Collection (#202): its resolved Items.
+                body.paper_ids = ctx.paper_ids.slice();
+            } else {
+                // A cited work: its metadata and abstract.
+                body.paper_ids = [];
+                body.external_papers = [{
+                    title: ctx.title, authors: ctx.authors, year: ctx.year, doi: ctx.doi, abstract: ctx.abstract,
+                }];
+            }
+            const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+            this._chatCtrl = ctrl;
             try {
-                const history = this.chatMessages.filter(m => m.role !== 'system').slice(0, -1);
-
-                const body = {
-                    question,
-                    history,
-                };
-                // Own paper (in DB) — pass paper_id
-                if (this.chatContextPaper.paper_id) {
-                    body.paper_ids = [this.chatContextPaper.paper_id];
-                } else {
-                    // External paper — pass metadata
-                    body.paper_ids = [];
-                    body.external_papers = [{
-                        title: this.chatContextPaper.title,
-                        authors: this.chatContextPaper.authors,
-                        year: this.chatContextPaper.year,
-                        doi: this.chatContextPaper.doi,
-                        abstract: this.chatContextPaper.abstract,
-                    }];
-                }
-
                 const resp = await fetch('/api/analysis/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(body),
+                    signal: ctrl ? ctrl.signal : undefined,
                 });
-
                 if (!resp.ok) {
-                    const err = await resp.json();
-                    this.chatMessages.push({ role: 'assistant', content: translateDetail(err.error, resp.status) });
-                    this.chatStreaming = false;
+                    const err = await resp.json().catch(() => ({}));
+                    if (live()) this.chatMessages.push({ role: 'assistant', content: translateDetail(err.error || err.detail, resp.status) });
                     return;
                 }
-
-                const reader = resp.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || '';
-
-                    for (const line of lines) {
-                        const trimmed = line.trim();
-                        if (!trimmed.startsWith('data: ')) continue;
-                        const data = trimmed.slice(6);
-                        if (data === '[DONE]') break;
-                        try {
-                            const parsed = JSON.parse(data);
-                            if (parsed.error) {
-                                this.chatStreamContent += '\n\nFehler: ' + parsed.error;
-                            } else if (parsed.content) {
-                                this.chatStreamContent += parsed.content;
-                            }
-                        } catch (e) { /* ignore parse errors */ }
-                    }
-
-                    this.$nextTick(() => {
-                        if (this.$refs.chatMessages) {
-                            this.$refs.chatMessages.scrollTop = this.$refs.chatMessages.scrollHeight;
-                        }
-                    });
-                }
-
-                if (this.chatStreamContent) {
+                await readSseStream(resp, (evt) => {
+                    if (!live()) return;
+                    if (evt.error) this.chatStreamContent += '\n\n' + translateDetail(evt.error);
+                    else if (evt.content) this.chatStreamContent += evt.content;
+                    this.scrollChat();
+                });
+                if (live() && this.chatStreamContent) {
                     this.chatMessages.push({ role: 'assistant', content: translateDetail(this.chatStreamContent) });
                 }
             } catch (e) {
-                this.chatMessages.push({ role: 'assistant', content: t('error.generic', { message: e.message }) });
+                if (live()) this.chatMessages.push({ role: 'assistant', content: t('error.generic', { message: e.message }) });
             } finally {
-                this.chatStreaming = false;
-                this.chatStreamContent = '';
-                this.$nextTick(() => {
-                    if (this.$refs.chatMessages) {
-                        this.$refs.chatMessages.scrollTop = this.$refs.chatMessages.scrollHeight;
-                    }
-                });
+                if (live()) {
+                    this.chatStreaming = false;
+                    this.chatStreamContent = '';
+                    this.scrollChat();
+                }
             }
         },
         _updateGraphDistance(dist) {
-            if (!this._simulation) return;
-            const linkForce = this._simulation.force('link');
-            const chargeForce = this._simulation.force('charge');
+            const net = this._net;
+            const sim = this._simulation;
+            if (!net || !sim) return;
+            const linkForce = sim.force('link');
+            const chargeForce = sim.force('charge');
             if (linkForce) linkForce.distance(dist);
-            // Scale charge proportionally: base -30 at distance 25
+            // Charge in proportion: -30 at a distance of 25.
             if (chargeForce) chargeForce.strength(-(dist * 1.2));
-            this._simulation.alpha(0.3).restart();
+            sim.alpha(0.3);
+            net.fitOnEnd = true;
+            if (analysisReducedMotion()) {
+                settleSimulation(sim);
+                net.ticked();
+                net.fitOnEnd = false;
+                if (!net.userZoomed) {
+                    this.fitNet();
+                    this.focusSelection();
+                }
+                this.layoutLabels();
+            } else {
+                sim.restart();
+            }
         },
-        _updateMinRefs(minR) {
-            if (!this._graphD3) return;
-            const { node, link, colorMap, ownNodeIds, sizeScale } = this._graphD3;
-            const adj = this._graphAdj;
-            const edges = this._graphEdges;
-
-            // BFS-based bridge detection: find non-own nodes reachable from >=2 own papers within minR hops
-            const reachability = new Map();
-            const bfsParent = new Map();
-            for (const ownId of ownNodeIds) {
-                let frontier = [ownId];
-                const visited = new Set([ownId]);
-                for (let depth = 0; depth < minR && frontier.length > 0; depth++) {
-                    const nextFrontier = [];
-                    for (const cur of frontier) {
-                        const neighbors = adj.get(cur);
-                        if (!neighbors) continue;
-                        for (const nb of neighbors) {
-                            if (visited.has(nb)) continue;
-                            visited.add(nb);
-                            if (!reachability.has(nb)) reachability.set(nb, new Set());
-                            reachability.get(nb).add(ownId);
-                            if (!bfsParent.has(nb)) bfsParent.set(nb, new Map());
-                            bfsParent.get(nb).set(ownId, cur);
-                            if (!ownNodeIds.has(nb)) nextFrontier.push(nb);
-                        }
-                    }
-                    frontier = nextFrontier;
-                }
-            }
-            const bridgeNodes = new Set();
-            for (const [nid, owners] of reachability) {
-                if (!ownNodeIds.has(nid) && owners.size >= 2) bridgeNodes.add(nid);
-            }
-
-            // Build edge index
-            const edgeIndex = new Map();
-            edges.forEach((e, i) => {
-                const s = typeof e.source === 'object' ? e.source.id : e.source;
-                const t = typeof e.target === 'object' ? e.target.id : e.target;
-                edgeIndex.set(s + '|' + t, i);
-                edgeIndex.set(t + '|' + s, i);
-            });
-
-            // Trace BFS paths for bridge edges
-            const bridgeEdgeSet = new Set();
-            for (const bNode of bridgeNodes) {
-                const owners = reachability.get(bNode);
-                if (!owners) continue;
-                for (const ownId of owners) {
-                    let cur = bNode;
-                    while (cur && cur !== ownId) {
-                        const parent = bfsParent.get(cur)?.get(ownId);
-                        if (parent == null) break;
-                        const ei = edgeIndex.get(cur + '|' + parent);
-                        if (ei != null) bridgeEdgeSet.add(ei);
-                        cur = parent;
-                    }
-                }
-            }
-            edges.forEach((e, i) => {
-                const s = typeof e.source === 'object' ? e.source.id : e.source;
-                const t = typeof e.target === 'object' ? e.target.id : e.target;
-                if (ownNodeIds.has(s) && ownNodeIds.has(t)) bridgeEdgeSet.add(i);
-            });
-
-            // Track PDF-ref edges
-            const pdfRefEdgeSet = new Set();
-            edges.forEach((e, i) => {
-                if (e.edge_type === 'pdf_ref') pdfRefEdgeSet.add(i);
-            });
-
-            // Update node colors and strokes
-            node.attr('fill', d => {
-                if (bridgeNodes.has(d.id)) return colorMap.missing;
-                return colorMap[d.type] || lbToken('--lb-mute-2', '#a8a49c');
-            })
-            .attr('stroke', d => netNodeStroke(d, bridgeNodes, false))
-            .attr('stroke-width', d => d.type === 'own' ? 3 : (bridgeNodes.has(d.id) ? 2 : 1));
-
-            // Update edge colors
-            link.attr('stroke', (d, i) => netEdgeStroke(i, bridgeEdgeSet, pdfRefEdgeSet, false))
-                .attr('stroke-width', (d, i) => bridgeEdgeSet.has(i) ? 2.5 : pdfRefEdgeSet.has(i) ? 1.5 : 1)
-                .attr('stroke-opacity', (d, i) => bridgeEdgeSet.has(i) ? 0.7 : pdfRefEdgeSet.has(i) ? 0.5 : 0.3)
-                .attr('marker-end', (d, i) => pdfRefEdgeSet.has(i) ? 'url(#arrowhead-pdfref)' : (bridgeEdgeSet.has(i) ? 'url(#arrowhead-bridge)' : 'url(#arrowhead)'));
-
-            // Update stored reference
-            this._graphD3.bridgeNodes = bridgeNodes;
-            this._graphD3.bridgeEdgeSet = bridgeEdgeSet;
-            this._graphD3.pdfRefEdgeSet = pdfRefEdgeSet;
-
-            // Re-apply visibility filters after bridge detection update
+        // "Path between two items": shared references, kinds and the lens
+        // count follow it in place.
+        _updateMinRefs() {
+            if (!this._net) return;
+            this.applyNetKinds();
             this._applyVisibilityFilters();
+            this.restyleNet();
+            this.layoutLabels();
         },
+        // "Cited at least" and "References per item" hide cited works; own
+        // Items and shared references always stay.
         _applyVisibilityFilters() {
-            if (!this._graphD3 || !this._graphNodes) return;
-            const { node, link, label, citLabel, ownNodeIds, bridgeNodes } = this._graphD3;
-            const adj = this._graphAdj;
-            const edges = this._graphEdges;
+            const net = this._net;
+            if (!net) return;
             const minCit = this.minCitations || 0;
             const topN = this.topNRefs || 0;
-
-            // Build nodeId -> node lookup
-            const nodeById = new Map();
-            this._graphNodes.forEach(n => nodeById.set(n.id, n));
-
-            // Determine top-N allowed set per own paper
-            let topNAllowed = null;
+            let topAllowed = null;
             if (topN > 0) {
-                topNAllowed = new Set();
-                for (const ownId of ownNodeIds) {
-                    const neighbors = adj.get(ownId);
-                    if (!neighbors) continue;
-                    const refs = [];
-                    for (const nb of neighbors) {
-                        if (ownNodeIds.has(nb)) continue;
-                        const n = nodeById.get(nb);
-                        if (n) refs.push(n);
-                    }
-                    refs.sort((a, b) => (b.cited_by_count || 0) - (a.cited_by_count || 0));
-                    for (let i = 0; i < Math.min(topN, refs.length); i++) {
-                        topNAllowed.add(refs[i].id);
-                    }
+                topAllowed = new Set();
+                for (const ownId of net.ownIds) {
+                    [...(net.adj.get(ownId) || [])]
+                        .filter((id) => !net.ownIds.has(id))
+                        .map((id) => net.byId.get(id))
+                        .filter(Boolean)
+                        .sort((a, b) => (b.cited_by_count || 0) - (a.cited_by_count || 0))
+                        .slice(0, topN)
+                        .forEach((n) => topAllowed.add(n.id));
                 }
             }
-
-            // Determine visibility per node
-            const visible = new Map();
-            this._graphNodes.forEach(n => {
-                // Own papers: always visible
-                if (ownNodeIds.has(n.id)) { visible.set(n.id, true); return; }
-                // Bridge nodes (shared refs): always visible
-                if (bridgeNodes && bridgeNodes.has(n.id)) { visible.set(n.id, true); return; }
-                // Filter 1: min citations
-                if (minCit > 0 && (n.cited_by_count || 0) < minCit) { visible.set(n.id, false); return; }
-                // Filter 2: top-N per paper
-                if (topNAllowed && !topNAllowed.has(n.id)) { visible.set(n.id, false); return; }
-                visible.set(n.id, true);
+            net.nodes.forEach((n) => {
+                let on = true;
+                if (!net.ownIds.has(n.id) && !net.shared.shared.has(n.id)) {
+                    if (minCit > 0 && (n.cited_by_count || 0) < minCit) on = false;
+                    else if (topAllowed && !topAllowed.has(n.id)) on = false;
+                }
+                net.visible.set(n.id, on);
             });
-
-            // Apply to D3 selections
-            node.style('display', d => visible.get(d.id) === false ? 'none' : null);
-
-            link.style('display', (d, i) => {
-                const s = typeof d.source === 'object' ? d.source.id : d.source;
-                const t = typeof d.target === 'object' ? d.target.id : d.target;
-                return (visible.get(s) === false || visible.get(t) === false) ? 'none' : null;
-            });
-
-            // Labels only for own papers (always visible)
-            // citLabel for bridge nodes — show/hide based on visibility
-            if (citLabel) {
-                citLabel.style('display', d => visible.get(d.id) === false ? 'none' : null);
-            }
+            net.nodeG.style('display', (d) => (net.visible.get(d.id) ? null : 'none'));
+            net.link.style('display', (e) => (net.visible.get(netEnd(e.source)) && net.visible.get(netEnd(e.target)) ? null : 'none'));
+            this.positionLabels();
+            this.netRev++;
         },
     },
     watch: {
         activeTab(val) {
-            if (val === 'network' && this.networkData) {
-                this.$nextTick(() => {
-                    if (this.$refs.graphContainer && !this.$refs.graphContainer.querySelector('svg')) {
-                        this.renderGraph();
-                    }
-                });
-            }
+            if (val !== 'network' || !this.networkData) return;
+            this.$nextTick(() => {
+                const c = this.$refs.graphContainer;
+                // No svg yet, but a net: its layout is still coming to rest
+                // and joins the page by itself - drawing anew would restart it.
+                if (c && !c.querySelector('svg') && !this._net) {
+                    this.renderGraph();
+                    return;
+                }
+                // Drawn while a table was open: measure and fit now it shows.
+                this.onStageResize();
+            });
         },
         graphDistance(val) {
             this._updateGraphDistance(val);
         },
-        minRefs(val) {
-            this._updateMinRefs(val);
-            this._applyVisibilityFilters();
+        minRefs() {
+            this._updateMinRefs();
         },
         minCitations() {
             this._applyVisibilityFilters();
+            this.layoutLabels();
         },
         topNRefs() {
             this._applyVisibilityFilters();
+            this.layoutLabels();
         },
-        selectedNode(node) {
-            if (node) {
-                this.fetchNodeAbstract(node);
-            } else {
-                this.nodeAbstract = null;
-                this.nodeAbstractError = null;
-            }
+        colorBy() {
+            this.restyleNet();
+        },
+        graphPanelCategory() {
+            this.restyleNet();
+            this.layoutLabels();
+        },
+        viewOpen() {
+            this.$nextTick(() => this.maybeRefit());
+        },
+        collChat() {
+            this.$nextTick(() => this.maybeRefit());
+        },
+        chatShown(on) {
+            if (on) this.ensureLlmStatus();
+        },
+        '$route.query.collection_id'() {
+            if (this.$route.name === 'analyse') this.applyRouteScope().then(() => this.loadScopeCounts());
+        },
+        // Another work: a fresh card - no adoption result, a new chat, its
+        // abstract. The same work again (back from a detail view) keeps all.
+        selectedNode(node, old) {
+            if (node && old && node.id === old.id) return;
+            this.nodeAddResult = '';
+            this.adoptedPaperId = null;
+            if (!this.collChat) this.resetChat();
+            this.fetchNodeAbstract(node || null);
+        },
+        // A state change can take the focused key away; keep focus inside.
+        'bulk.state'() {
+            if (this.bulk.open) this.$nextTick(() => this.focusBulkDialog());
         },
     },
     beforeUnmount() {
         if (this._simulation) this._simulation.stop();
+        this.stopNetMotion();
+        this.bindNetListeners(false);
+        if (this._stageObserver) { this._stageObserver.disconnect(); this._stageObserver = null; }
+        if (this._onWinResize) { window.removeEventListener('resize', this._onWinResize); this._onWinResize = null; }
+        // Leaving the page ends a running PDF read like "Stop" does.
+        this._bulkRun = (this._bulkRun || 0) + 1;
+        if (this._bulkCtrl) {
+            try { this._bulkCtrl.abort(); } catch (e) { /* already closed */ }
+            this._bulkCtrl = null;
+        }
+        this.bindBulkKeys(false);
+        // A running chat answer is dropped too: the remounted page starts
+        // idle, so a late answer must not land in the shared history.
+        this._chatRun = (this._chatRun || 0) + 1;
+        if (this._chatCtrl) {
+            try { this._chatCtrl.abort(); } catch (e) { /* already closed */ }
+            this._chatCtrl = null;
+        }
+        if (this._ticker) { clearInterval(this._ticker); this._ticker = null; }
         // Persist state to global store
         analysisStore.networkData = this.networkData;
         analysisStore.stats = this.stats;
@@ -9636,7 +17209,13 @@ const AnalysePage = {
         analysisStore.minRefs = this.minRefs;
         analysisStore.minCitations = this.minCitations;
         analysisStore.topNRefs = this.topNRefs;
-        analysisStore.bulkExtractResult = this.bulkExtractResult;
+        analysisStore.graphDistance = this.graphDistance;
+        analysisStore.category = this.graphPanelCategory;
+        analysisStore.colorBy = this.colorBy;
+        analysisStore.viewOpen = this.viewOpen;
+        analysisStore.lensOn = this.lensOn;
+        analysisStore.cardTab = this.cardTab;
+        analysisStore.collChat = this.collChat;
         analysisStore.chatMessages = this.chatMessages;
         analysisStore.chatContextPaper = this.chatContextPaper;
     },
@@ -9720,9 +17299,11 @@ function syncRouteRecords(records, removers) {
 //     emits  update:selection  { value, label, citeKeys: string[] } | null
 //     The core keeps one selection per Add-on, sends its `citeKeys` as the
 //     existing `cite_keys` parameter of GET /api/papers (intersected when
-//     several sources contribute; an empty list means "no Items"), counts
-//     each non-null selection in the filter badge, clears them on reset and
-//     drops an Add-on's selection when it is switched off.
+//     several sources contribute; an empty list means "no Items"), renders
+//     the component in the popover of the Add-on's own pill (named after the
+//     Add-on, showing the selection's `label`, active while it is non-null),
+//     clears them on reset and drops an Add-on's selection when it is
+//     switched off.
 //   item-detail-aside      Item detail, metadata column (PaperDetail).
 //     props  { itemId, citeKey }
 //     Keyed on the Item id: navigating to another Item remounts it.
@@ -10047,7 +17628,8 @@ window.LocalBib = Object.freeze({
 // Add-on on and its frontend loads live. Lifecycle (#193): the card's switch,
 // update (a running Add-on switches on the next start; new Berechtigungen ask
 // for the difference first), rollback, removal, the states and the restart
-// button; the Add-on's settings live in its slide-over.
+// button; the Add-on's settings live on its page under Settings → Add-ons
+// (#207), which the slide-over links to.
 // =============================================================================
 
 const MARKETPLACE_FILTERS = ['all', 'installed', 'updates', 'dev'];
@@ -10066,6 +17648,19 @@ const MARKETPLACE_PERMISSION_KEYS = {
 
 // Whether LocalBib enforces `key`, as the card's index rows say (the pending
 // version's own rows first). Unknown counts as declared only — never overclaim.
+// The label of one Berechtigung row: enforced, declared only, or reserved
+// (files/storage: may be declared, grant nothing yet - ADD-2).
+function permissionLabelKey(p) {
+    if (p && p.reserved) return 'marketplace.permissions.reserved';
+    return p && p.enforced ? 'marketplace.permissions.enforced' : 'marketplace.permissions.declared';
+}
+
+function permissionReserved(addon, key) {
+    const rows = [...(addon.permissions || []), ...(addon.installed_permissions || [])];
+    const row = rows.find((p) => p.key === key);
+    return !!(row && row.reserved);
+}
+
 function permissionEnforced(addon, key) {
     const pending = addon.pending_update ? addon.pending_update.version : '';
     const version = (addon.versions || []).find((v) => v.version === pending);
@@ -10261,8 +17856,9 @@ const MarketplaceCard = {
             const a = this.addon;
             if (a.pending_removal) return null;
             if (a.addon_state === 'consent_pending') return 'consent';
-            // A file or folder that was never confirmed stays off until it is.
-            if (!a.enabled && a.needs_confirmation && (a.origin === 'file' || a.origin === 'dev')) return 'consent';
+            // A file, a folder or code of unrecognised Herkunft that was never
+            // confirmed stays off until it is.
+            if (!a.enabled && a.needs_confirmation && ['file', 'dev', 'unknown'].includes(a.origin)) return 'consent';
             if (pendingNeedsConsent(a)) return 'updateConsent';
             if (a.update_available && a.in_index && !a.requires_source) return 'update';
             if (a.state === 'not_installed' && !a.requires_source && a.in_index) return 'install';
@@ -10318,7 +17914,7 @@ const AddonConsentDialog = {
                         <span v-if="request.version" class="lb-chip">{{ request.version }}</span>
                         <span v-if="request.origin === 'dev'" class="lb-chip">{{ $t('marketplace.state.dev') }}</span>
                     </div>
-                    <div v-if="request.origin === 'file'" class="mb-3 text-xs px-3 py-2 rounded bg-amber-50 text-amber-700 border border-hairline"
+                    <div v-if="request.origin === 'file' || request.origin === 'unknown'" class="mb-3 text-xs px-3 py-2 rounded bg-amber-50 text-amber-700 border border-hairline"
                          data-testid="consent-file-warning">{{ $t('marketplace.file.warning') }}</div>
                     <p v-if="request.sha256" class="mb-3 text-xs text-ink-3" data-testid="consent-sha256">
                         {{ $t('marketplace.file.checksum') }} <code class="break-all">{{ request.sha256 }}</code>
@@ -10330,7 +17926,7 @@ const AddonConsentDialog = {
                         <li v-for="p in request.permissions" :key="p.key" class="flex items-start justify-between gap-2"
                             :data-testid="'consent-permission-' + p.key">
                             <span>{{ $t(permissionLabel(p.key)) }}</span>
-                            <span class="lb-chip flex-shrink-0">{{ $t(p.enforced ? 'marketplace.permissions.enforced' : 'marketplace.permissions.declared') }}</span>
+                            <span class="lb-chip flex-shrink-0">{{ $t($permissionBadge(p)) }}</span>
                         </li>
                     </ul>
                     <p v-if="official" class="mb-3 text-xs text-ink-3" data-testid="consent-rights">{{ $t('marketplace.permissions.allRights') }}</p>
@@ -10361,7 +17957,7 @@ const AddonConsentDialog = {
 
 const MarketplacePage = {
     name: 'MarketplacePage',
-    components: { MarketplaceCard, AddonConsentDialog, AddonLifecycleNotes, AddonSettingsSection },
+    components: { MarketplaceCard, AddonConsentDialog, AddonLifecycleNotes },
     template: `
         <div class="p-6 max-w-6xl mx-auto">
             <div class="flex items-baseline justify-between gap-2 mb-1 flex-wrap">
@@ -10507,9 +18103,10 @@ const MarketplacePage = {
                             <p v-if="lifecycleError" class="w-full text-xs text-red-600" data-testid="marketplace-lifecycle-error">{{ lifecycleError }}</p>
                         </div>
 
-                        <!-- The Add-on's own settings (moved here from Settings, #193) -->
-                        <div v-if="selected.installed && !selected.pending_removal" class="mb-5" data-testid="marketplace-settings">
-                            <addon-settings-section :key="selected.id + ':' + selected.installed_version" :addon-id="selected.id" />
+                        <!-- The Add-on's own settings live under Settings → Add-ons (#207) -->
+                        <div v-if="hasSettingsPage(selected)" class="mb-5">
+                            <router-link :to="'/settings/addons/' + encodeURIComponent(selected.id)" class="lb-btn text-xs"
+                                         data-testid="marketplace-settings-link">{{ $t('marketplace.openSettings') }} →</router-link>
                         </div>
 
                         <div v-if="selected.description" class="mb-5">
@@ -10532,7 +18129,7 @@ const MarketplacePage = {
                                 <li v-for="p in selected.permissions" :key="p.key" class="flex items-start justify-between gap-2">
                                     <span>{{ $t(permissionLabel(p.key)) }}</span>
                                     <span class="lb-chip flex-shrink-0" :data-testid="'marketplace-permission-' + p.key">
-                                        {{ $t(p.enforced ? 'marketplace.permissions.enforced' : 'marketplace.permissions.declared') }}
+                                        {{ $t($permissionBadge(p)) }}
                                     </span>
                                 </li>
                             </ul>
@@ -10802,7 +18399,9 @@ const MarketplacePage = {
                 sha256: addon.pending_update.sha256 || '',
                 update: true,
                 staged: true,
-                permissions: missing.map((key) => ({ key, enforced: permissionEnforced(addon, key) })),
+                permissions: missing.map((key) => ({
+                    key, enforced: permissionEnforced(addon, key), reserved: permissionReserved(addon, key),
+                })),
                 missing,
             };
         },
@@ -10901,6 +18500,10 @@ const MarketplacePage = {
         },
         closeDetail() {
             this.selectedId = null;
+            if (this.$route.query.addon) this.$router.replace({ path: '/marketplace' });
+        },
+        hasSettingsPage(addon) {
+            return addonHasSettingsPage(addon);
         },
         assetUrl(relPath) {
             return '/api/marketplace/assets/' + relPath.split('/').map(encodeURIComponent).join('/');
@@ -10913,6 +18516,9 @@ const MarketplacePage = {
         },
     },
     mounted() {
+        // "Open in the Marketplace" from an Add-on's settings page (#207)
+        // opens that Add-on's slide-over; an unknown id simply opens none.
+        if (typeof this.$route.query.addon === 'string') this.selectedId = this.$route.query.addon;
         this.load();
     },
 };
@@ -10925,12 +18531,13 @@ const MarketplacePage = {
 const routes = [
     { path: '/', component: PaperList, name: 'home' },
     { path: '/category/:id', component: PaperList, name: 'category' },
+    { path: '/collection/:id', component: PaperList, name: 'collection' },
     { path: '/paper/:id', component: PaperDetail, name: 'paper' },
     { path: '/import', component: ImportPage, name: 'import' },
     { path: '/migrate', component: MigratePage, name: 'migrate' },
     { path: '/analyse', component: AnalysePage, name: 'analyse' },
     { path: '/marketplace', component: MarketplacePage, name: 'marketplace' },
-    { path: '/settings', component: SettingsPage, name: 'settings' },
+    { path: '/settings', component: SettingsPage, children: SETTINGS_ROUTES },
     { path: '/thesis', component: ThesisPage, name: 'thesis' },
     { path: '/research-chat', component: ResearchChatPage, name: 'research-chat' },
     { path: '/category-planner', component: CategoryPlanner, name: 'category-planner' },
@@ -10954,6 +18561,7 @@ const app = createApp(App);
 app.config.globalProperties.$t = t;
 app.config.globalProperties.$tn = tn;
 app.config.globalProperties.$locale = uiLocale;
+app.config.globalProperties.$permissionBadge = permissionLabelKey;
 app.config.globalProperties.$lang = () => uiLang.value;
 
 // Boot (#187): Add-on frontends first, then the router, then the mount — so

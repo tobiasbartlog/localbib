@@ -29,6 +29,7 @@ import hashlib
 import logging
 import os
 import re
+import ssl
 import tempfile
 from typing import Optional
 
@@ -132,6 +133,22 @@ def ca_bundle() -> Optional[str]:
     except OSError as exc:
         logging.warning("CA-Bundle %s nicht lesbar (%s) — es gilt certifi.", extra, exc)
         return None
+
+
+def httpx_verify():
+    """The ``verify=`` value for httpx: a ready ``ssl.SSLContext`` (certifi plus
+    the house bundle) or ``True`` (certifi) when none is configured.
+
+    httpx reads no ``REQUESTS_CA_BUNDLE`` and deprecates a path string for
+    ``verify=``; ``requests`` call sites keep using :func:`ca_bundle`."""
+    bundle = ca_bundle()
+    if not bundle:
+        return True
+    try:
+        return ssl.create_default_context(cafile=bundle)
+    except (OSError, ssl.SSLError) as exc:
+        logging.warning("CA-Bundle %s unbrauchbar (%s) — es gilt certifi.", bundle, exc)
+        return True
 
 
 def install() -> Optional[str]:

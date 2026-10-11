@@ -15,17 +15,21 @@ the domain routers already use; it runs after ``Config.init_paths()`` because
 
 from __future__ import annotations
 
+import json
 import logging
-import os
 from typing import Optional
 
 import bibtex_builder
 import embedding_index
+import library_events
 import paper_ingest
 from cite_key_generator import base_key as _legacy_cite_key_base
 from context import get_conn
+from filenames import stored_pdf_path
 from literature_manager import Config, Database, extract_text_from_pdf
 from llm_client import embed_texts, llm_for
+from services import collection_export
+from services import library_collections as collections_svc
 
 # Aliases / shared resources so the relocated adapter bodies keep working
 # verbatim (they used these private names in webapp.py).
@@ -77,6 +81,46 @@ def _cite_key(paper: dict) -> str:
     )
 
 
+
+def _has_pdf_file(paper: dict) -> bool:
+    """The Item's PDF is in the library folder (contract 2.3, ``has_pdf``)."""
+    return stored_pdf_path(paper.get("filename")) is not None
+
+
+def _reference_details(paper: dict) -> dict:
+    """``volume``/``issue``/``pages`` (contract 2.3) from what the Item's
+    stored metadata knows — a BibTeX import keeps them in ``raw_metadata``.
+    The library has no columns for them; unknown is ``None``, never a guess."""
+    try:
+        raw = json.loads(paper.get("raw_metadata") or "{}")
+    except (TypeError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def pick(*keys):
+        for key in keys:
+            value = raw.get(key)
+            if value not in (None, "", [], {}):
+                return str(value).strip() or None
+        return None
+
+    return {
+        "volume": pick("volume"),
+        "issue": pick("issue", "number"),
+        "pages": pick("pages", "page"),
+    }
+
+
+# ``idx_papers_cite_key`` is partial (``WHERE cite_key != ''``): SQLite uses it
+# only when the query repeats that condition — without it, a full scan.
+_CITE_KEY_LOOKUP = "SELECT * FROM papers WHERE cite_key = ? AND cite_key != ''"
+# Rows without a stored key, counted on covering indexes (no row is read).
+_KEYLESS_ROWS = (
+    "SELECT (SELECT COUNT(*) FROM papers) - (SELECT COUNT(*) FROM papers WHERE cite_key != '')"
+)
+
+
 class _CoreLibraryApi:
     """plugin_api.LibraryApi: Lesezugriff auf die Bibliothek per Citekey,
     plus die eine Schreibmethode ``create_by_doi`` (``library.write``).
@@ -89,6 +133,7 @@ class _CoreLibraryApi:
 
     @staticmethod
     def _wire(paper: dict) -> dict:
+        details = _reference_details(paper)
         return {
             "citekey": _cite_key(paper),
             "id": paper.get("id"),
@@ -98,15 +143,37 @@ class _CoreLibraryApi:
             "journal": paper.get("journal"),
             "doi": paper.get("doi"),
             "abstract": paper.get("abstract"),
+            # Contract 2.3 (additive): what a literature check needs.
+            "has_pdf": _has_pdf_file(paper),
+            **details,
         }
 
     def _find(self, citekey: str) -> Optional[dict]:
+        """The Item with this Cite Key: one search on the unique
+        ``idx_papers_cite_key``, never a full table load — an Add-on's
+        literature check asks once per key. Rows without a stored key (from
+        before the backfill) still match on their legacy key; whether there
+        are any is asked of two covering indexes first, so a miss in a fully
+        keyed library reads no row."""
         if not citekey:
             return None
-        for paper in db.get_all_papers():
-            if _cite_key(paper) == citekey:
-                return paper
-        return None
+        conn = _get_conn()
+        try:
+            row = conn.execute(_CITE_KEY_LOOKUP, (citekey,)).fetchone()
+            if row is not None:
+                return dict(row)
+            if not conn.execute(_KEYLESS_ROWS).fetchone()[0]:
+                return None
+            for row in conn.execute(
+                "SELECT * FROM papers WHERE cite_key IS NULL OR cite_key = '' "
+                "ORDER BY year DESC, authors"
+            ):
+                paper = dict(row)
+                if _cite_key(paper) == citekey:
+                    return paper
+            return None
+        finally:
+            conn.close()
 
     def get_reference(self, citekey: str) -> Optional[dict]:
         paper = self._find(citekey)
@@ -132,11 +199,8 @@ class _CoreLibraryApi:
     def get_full_text(self, citekey: str) -> Optional[str]:
         # Darf None liefern (discovery A5) — Plugins muessen auf Abstract degradieren.
         paper = self._find(citekey)
-        filename = (paper or {}).get("filename")
-        if not filename:
-            return None
-        filepath = os.path.join(Config.ALL_DIR, os.path.basename(filename))
-        if not os.path.isfile(filepath):
+        filepath = stored_pdf_path((paper or {}).get("filename"))
+        if filepath is None:
             return None
         try:
             return extract_text_from_pdf(filepath, max_pages=Config.MAX_OCR_PAGES) or None
@@ -211,6 +275,67 @@ class _CoreLibraryApi:
             raise ValueError(error)
         return result
 
+    # --- Collections (#204): read-only, under library.read -----------------
+    # Unlike every user-facing read, these include tombstones: an Add-on that
+    # was off when a Collection was deleted still finds its frozen membership.
+
+    @staticmethod
+    def _collection_wire(summary: dict) -> dict:
+        return {key: summary[key] for key in COLLECTION_FIELDS}
+
+    def list_collections(self) -> list:
+        conn = _get_conn()
+        try:
+            rows = collections_svc.list_collections(
+                conn, archived=collections_svc.ARCHIVED_ALL, include_deleted=True)
+        finally:
+            conn.close()
+        return [self._collection_wire(r) for r in rows]
+
+    def get_collection(self, collection_id: int) -> Optional[dict]:
+        conn = _get_conn()
+        try:
+            found = collections_svc.get_collection(conn, int(collection_id), include_deleted=True)
+        finally:
+            conn.close()
+        return self._collection_wire(found) if found else None
+
+    def _collection_papers(self, collection_id: int) -> list:
+        conn = _get_conn()
+        try:
+            ids = collections_svc.member_ids(conn, int(collection_id))
+            if not ids:
+                return []
+            marks = ",".join("?" * len(ids))
+            rows = conn.execute(f"SELECT * FROM papers WHERE id IN ({marks})", ids).fetchall()
+        finally:
+            conn.close()
+        by_id = {r["id"]: dict(r) for r in rows}
+        return [by_id[pid] for pid in ids if pid in by_id]
+
+    def get_collection_refs(self, collection_id: int) -> list:
+        # Membership order (oldest addition first) — stable across calls.
+        refs: list = []
+        for paper in self._collection_papers(collection_id):
+            key = _cite_key(paper)
+            if key and key not in refs:
+                refs.append(key)
+        return refs
+
+    def export_collection_bibtex(self, collection_id: int) -> str:
+        # The same builder (and the same Cite Keys) as the Collection's .bib
+        # download (#202) and export_bibtex().
+        return collection_export.bibtex_text(self._collection_papers(collection_id))
+
     def on_change(self, callback):
-        # Kein Change-Feed im Kern — bewusster No-op-Unsubscriber.
-        return lambda: None
+        # The core's change feed (library_events): Collection events after
+        # every committed write. The Add-on unsubscribes in deactivate();
+        # plugin_loader drops whatever it left behind on unload.
+        return library_events.subscribe(callback)
+
+
+#: The wire shape of one Collection in the Add-on Contract.
+COLLECTION_FIELDS = (
+    "id", "name", "description", "archived", "archived_at", "deleted",
+    "deleted_at", "created_at", "updated_at", "item_count",
+)

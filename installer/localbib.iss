@@ -29,6 +29,14 @@
 #define MyAppPublisher "Tobias Bartlog"
 #define MyAppURL "https://github.com/tobiasbartlog/localbib"
 #define MyAppExeName "LocalBib.exe"
+; Start with Windows (#214, ADR-0023): the same HKCU Run value the app reads
+; and writes (autostart.py - RUN_KEY, VALUE_NAME, AUTOSTART_ARG; the tests pin
+; that both sides agree). The argument makes the app start silently: tray
+; icon only, no browser tab at every sign-in.
+#define AutostartRunKey "Software\Microsoft\Windows\CurrentVersion\Run"
+#define AutostartApprovedKey "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+#define AutostartValue "LocalBib"
+#define AutostartArg "--autostart"
 
 [Setup]
 ; Stable AppId — it is the identity an upgrade or uninstall is matched on.
@@ -89,8 +97,15 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "german"; MessagesFile: "compiler:Languages\German.isl"
 
+[CustomMessages]
+english.AutostartTask=Start with Windows
+german.AutostartTask=Mit Windows starten
+
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+; Off by default, like the desktop icon. The [Code] below shows the entry's
+; real state on a reinstall and writes or removes the Run value accordingly.
+Name: "autostart"; Description: "{cm:AutostartTask}"; GroupDescription: "{cm:AutoStartProgramGroupDescription}"; Flags: unchecked
 
 [InstallDelete]
 ; Wipe the old bundle before writing the new one. `ignoreversion` below only
@@ -141,4 +156,68 @@ Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifnotsilent runasoriginalus
 ; There is deliberately no uninstall-delete section: the user's library lives
 ; outside {app} (LITERATUR_BASE_DIR, default ~\Literatur) and an uninstall must
 ; never touch it. Everything the installer wrote is inside {app} and Inno
-; removes exactly that.
+; removes exactly that - plus the autostart value below, which is not a file.
+
+[Code]
+// Start with Windows (#214, ADR-0023). The HKCU Run value is the one truth:
+// the app's Settings switch and its tray menu read and write the same entry.
+// So the task shows what is there, and only a run someone looked at changes it.
+
+var
+  AutostartTaskShown: Boolean;
+
+// On = the Run value exists and Task Manager has not disabled it (an odd
+// first byte under StartupApproved) - the rule of autostart.is_enabled.
+function AutostartIsOn(): Boolean;
+var
+  Approved: AnsiString;
+begin
+  Result := RegValueExists(HKCU, '{#AutostartRunKey}', '{#AutostartValue}');
+  if Result and RegQueryBinaryValue(HKCU, '{#AutostartApprovedKey}', '{#AutostartValue}', Approved) then
+    if (Length(Approved) > 0) and ((Ord(Approved[1]) and 1) = 1) then
+      Result := False;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpSelectTasks) and not AutostartTaskShown then
+  begin
+    AutostartTaskShown := True;
+    if AutostartIsOn() then
+      WizardSelectTasks('autostart')
+    else
+      WizardSelectTasks('!autostart');
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  // A silent run is the in-app one-click update (#148): nobody saw the task,
+  // so the entry stays exactly as the user last set it.
+  if (CurStep = ssPostInstall) and not WizardSilent() then
+  begin
+    if WizardIsTaskSelected('autostart') then
+    begin
+      RegWriteStringValue(HKCU, '{#AutostartRunKey}', '{#AutostartValue}',
+        '"' + ExpandConstant('{app}\{#MyAppExeName}') + '" {#AutostartArg}');
+      // Switching on lifts a Task Manager "disabled", as the app does.
+      RegDeleteValue(HKCU, '{#AutostartApprovedKey}', '{#AutostartValue}');
+    end
+    else if AutostartTaskShown then
+    begin
+      RegDeleteValue(HKCU, '{#AutostartRunKey}', '{#AutostartValue}');
+      RegDeleteValue(HKCU, '{#AutostartApprovedKey}', '{#AutostartValue}');
+    end;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  // Nothing stays behind, however the entry got there (this task, the
+  // Settings switch or the tray menu).
+  if CurUninstallStep = usUninstall then
+  begin
+    RegDeleteValue(HKCU, '{#AutostartRunKey}', '{#AutostartValue}');
+    RegDeleteValue(HKCU, '{#AutostartApprovedKey}', '{#AutostartValue}');
+  end;
+end;

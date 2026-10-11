@@ -20,10 +20,11 @@ DB-Zugriff pro Request via Database(Config.DB_PATH). Kein I/O beim Import.
 from __future__ import annotations
 
 import socket
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
+import ca_trust
 from fastapi import APIRouter
 from pydantic import BaseModel
 
@@ -154,7 +155,7 @@ def _status_payload(db: Database) -> dict:
 
 
 @router.post("/api/license/activate")
-async def activate_license(data: LicenseKeyRequest) -> dict:
+def activate_license(data: LicenseKeyRequest) -> dict:
     """Aktiviert einen Lizenzschluessel — genau einmal, danach nie wieder."""
     db = _get_db()
     key = (data.key or "").strip()
@@ -176,6 +177,7 @@ async def activate_license(data: LicenseKeyRequest) -> dict:
                 "label": _device_label(),
             },
             timeout=10,
+            verify=ca_trust.httpx_verify(),
         )
     except Exception:
         return {"activated": False, "error": ERR_NETWORK}
@@ -191,7 +193,7 @@ async def activate_license(data: LicenseKeyRequest) -> dict:
     db.set_app_setting("license_activated", "1")
     db.set_app_setting("license_key", key)
     db.set_app_setting("license_activation_id", str(result.get("id", "")))
-    db.set_app_setting("license_activated_at", datetime.utcnow().isoformat())
+    db.set_app_setting("license_activated_at", datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
 
     payload = _status_payload(db)
     # Nur auftauchen, wenn Polar es tatsaechlich mitschickt (#156) — sonst

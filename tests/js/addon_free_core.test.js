@@ -25,17 +25,17 @@ describe('Core without Add-ons', () => {
             { method: 'GET', url: /^\/api\/research-chat\/chunk-status/, reply: { papers: [{ paper_id: 1, chunked: true, chunk_count: 2 }] } },
         ]);
 
-        const filterButton = await vi.waitFor(() => {
-            const b = document.querySelector('.lb-toolbar-l button');
-            if (!b) throw new Error('item list not rendered');
+        const bar = await vi.waitFor(() => {
+            const b = document.querySelector('[data-testid="filter-bar"]');
+            if (!b || !document.querySelector('li[data-paper-id="1"]')) throw new Error('item list not rendered');
             return b;
         });
-        filterButton.click();
         await flush();
-        const bar = document.querySelector('.lb-filter-grid');
-        expect(bar).not.toBeNull();
-        expect(bar.style.gridTemplateColumns).toBe('140px 140px 1fr 1fr 1fr 1fr');
-        expect(bar.querySelectorAll('select').length).toBe(4);
+        // Core pills only: year, PDF, DOI, provenance, collection (#201) - no
+        // Add-on pill, no slot (categories are the rail below the bar).
+        const pills = [...bar.querySelectorAll('.lb-fbar-pills .lb-fbar-pill')].map((b) => b.getAttribute('data-testid'));
+        expect(pills).toEqual(['filter-year', 'filter-pdf', 'filter-doi', 'filter-provenance', 'filter-collection']);
+        expect(bar.querySelector('[data-addon-slot]')).toBeNull();
 
         go('#/paper/1');
         await vi.waitFor(() => {

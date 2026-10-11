@@ -94,6 +94,11 @@ ORIGIN_INDEX = "index"
 ORIGIN_FILE = "file"
 ORIGIN_DEV = "dev"
 ORIGINS = (ORIGIN_INDEX, ORIGIN_FILE, ORIGIN_DEV)
+#: A non-empty origin the core does not recognise (a damaged or foreign
+#: document). Fails closed: never treated as the index, it needs the
+#: Zustimmungsdialog with the file warning, and a legacy consent never
+#: passes to it. An entry with *no* origin stays ``index`` (legacy/dev).
+ORIGIN_UNKNOWN = "unknown"
 
 
 def empty_consent() -> dict:
@@ -127,8 +132,15 @@ def ensure_entry(doc: dict, addon_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def provenance(origin: str, sha256: str = "", path: str = "") -> dict:
-    """``{origin, sha256, path}`` — only the part the origin is judged by."""
-    origin = origin if origin in ORIGINS else ORIGIN_INDEX
+    """``{origin, sha256, path}`` — only the part the origin is judged by.
+
+    No origin is ``index`` (entries from before Herkunft was recorded); an
+    unrecognised one is ``unknown`` and fails closed."""
+    origin = (origin or "").strip()
+    if not origin:
+        origin = ORIGIN_INDEX
+    elif origin not in ORIGINS:
+        origin = ORIGIN_UNKNOWN
     return {
         "origin": origin,
         "sha256": (sha256 or "").strip().lower() if origin == ORIGIN_FILE else "",
@@ -137,7 +149,8 @@ def provenance(origin: str, sha256: str = "", path: str = "") -> dict:
 
 
 def source_provenance(entry: Mapping) -> dict:
-    """The Herkunft of the installed Bundle of ``entry`` (``index`` when unknown)."""
+    """The Herkunft of the installed Bundle of ``entry`` (``index`` when none
+    is recorded, ``unknown`` when the recorded one is not recognised)."""
     source = entry.get("source") or {}
     return provenance(str(source.get("origin") or ""), str(source.get("sha256") or ""))
 
@@ -159,7 +172,8 @@ def consent_binds(consent: Mapping, prov: Mapping) -> bool:
     binds it on the next look)."""
     consent = consent or {}
     if is_unbound(consent):
-        return True
+        # Never for code of an unrecognised Herkunft: that fails closed.
+        return provenance(str(prov.get("origin") or "")).get("origin") != ORIGIN_UNKNOWN
     mine = provenance(str(consent.get("origin") or ""), str(consent.get("sha256") or ""),
                       str(consent.get("path") or ""))
     theirs = provenance(str(prov.get("origin") or ""), str(prov.get("sha256") or ""), str(prov.get("path") or ""))
@@ -194,7 +208,8 @@ def confirmation_needed(consent: Mapping, prov: Mapping, declared) -> bool:
     rights (and, for a file, its checksum)."""
     if missing_for(consent, prov, declared):
         return True
-    return prov.get("origin") in (ORIGIN_FILE, ORIGIN_DEV) and not consent_binds(consent, prov)
+    return (prov.get("origin") in (ORIGIN_FILE, ORIGIN_DEV, ORIGIN_UNKNOWN)
+            and not consent_binds(consent, prov))
 
 
 def bind_unbound_consent(entry: dict) -> bool:
@@ -203,7 +218,12 @@ def bind_unbound_consent(entry: dict) -> bool:
     so a legacy consent never passes to code the user has not seen."""
     if not is_unbound(entry.get("consent") or {}):
         return False
-    bind_consent(entry, source_provenance(entry))
+    prov = source_provenance(entry)
+    if prov["origin"] == ORIGIN_UNKNOWN:
+        # The installed code's Herkunft is not recognised: the legacy grant
+        # goes to nobody rather than to code the user has not seen.
+        entry["consent"] = empty_consent()
+    bind_consent(entry, prov)
     return True
 
 
@@ -241,11 +261,15 @@ def _error(value: Any) -> Optional[dict]:
 
 
 def _source(value: Any) -> dict:
-    """A Bundle folder's Herkunft ``{origin, sha256}``; empty when unknown or damaged."""
+    """A Bundle folder's Herkunft ``{origin, sha256}``; empty when none is
+    recorded, ``unknown`` when the recorded one is not recognised (fails
+    closed instead of passing as the index)."""
     source = value if isinstance(value, dict) else {}
     origin = _str(source.get("origin"))
-    if origin not in (ORIGIN_INDEX, ORIGIN_FILE):
+    if not origin:
         return {"origin": "", "sha256": ""}
+    if origin not in (ORIGIN_INDEX, ORIGIN_FILE):
+        return {"origin": ORIGIN_UNKNOWN, "sha256": ""}
     return {"origin": origin, "sha256": _str(source.get("sha256")).lower() if origin == ORIGIN_FILE else ""}
 
 
@@ -262,8 +286,12 @@ def _entry(raw: Any) -> dict:
         "permissions": sorted(_str_list(consent.get("permissions"))),
         "origin": "", "sha256": "", "path": "",
     }
-    if _str(consent.get("origin")) in ORIGINS:
-        # An unknown origin stays unbound — a damaged file, not a new grant.
+    consent_origin = _str(consent.get("origin"))
+    if consent_origin and consent_origin not in ORIGINS:
+        # An unrecognised origin (a damaged file, or consent given to code of
+        # unknown Herkunft) binds to unknown code only, never to anything else.
+        entry["consent"]["origin"] = ORIGIN_UNKNOWN
+    elif consent_origin:
         entry["consent"].update(provenance(_str(consent.get("origin")), _str(consent.get("sha256")),
                                            _str(consent.get("path"))))
     settings = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
@@ -275,7 +303,10 @@ def _entry(raw: Any) -> dict:
     pending = raw.get("pending_update")
     if isinstance(pending, dict) and _str(pending.get("version")):
         pending_origin = _str(pending.get("origin"))
-        pending_origin = pending_origin if pending_origin in (ORIGIN_INDEX, ORIGIN_FILE) else ORIGIN_INDEX
+        if not pending_origin:
+            pending_origin = ORIGIN_INDEX
+        elif pending_origin not in (ORIGIN_INDEX, ORIGIN_FILE):
+            pending_origin = ORIGIN_UNKNOWN
         entry["pending_update"] = {
             "version": _str(pending.get("version")),
             "permissions": sorted(_str_list(pending.get("permissions"))),

@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import time  # noqa: F401 — re-exported; tests patch webapp.time
 import signal
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 # .env laden VOR allen Projekt-Imports, da metadata_validation -> literature_manager -> os.getenv
@@ -39,13 +39,19 @@ if _FROZEN:
     # Assets (static/, templates/) werden von PyInstaller nach _MEIPASS entpackt
     _BUNDLE_DIR = _Path(getattr(sys, "_MEIPASS", _Path(sys.executable).parent))
     _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # The Windows .exe has no console (#214): stdout/stderr are None, and the
+    # first library that writes to them (uvicorn asks isatty()) would fail.
+    # Before anything else may write, they get the rotating log file of #211.
+    from logging_setup import log_dir_for as _log_dir_for, redirect_missing_std_streams
+    redirect_missing_std_streams(_log_dir_for(str(_ENV_PATH.parent)))
     if not _ENV_PATH.exists():
         _ENV_PATH.write_text("", encoding="utf-8")
 else:
     _BUNDLE_DIR = _Path(__file__).parent.resolve()
 
 _SCRIPT_DIR = _BUNDLE_DIR
-load_dotenv(_ENV_PATH)
+_PROCESS_ENV_KEYS = frozenset(os.environ)  # real env, before the .env (SET-B5)
+load_dotenv(_ENV_PATH, interpolate=False)
 
 
 import ca_trust
@@ -61,6 +67,7 @@ import requests as http_requests
 from llm_client import LLMClient  # noqa: F401
 import metadata_validation  # noqa: F401
 from context import registry  # noqa: F401 — tests reach webapp.registry
+import detail_layout
 import plugin_loader
 import settings_store
 
@@ -82,10 +89,17 @@ from literature_manager import extract_text_from_pdf  # noqa: F401 — re-export
 
 # Pfad portabel halten: ~ und %VARS% expandieren, damit dieselbe .env auf
 # Rechnern mit unterschiedlichem Benutzernamen funktioniert.
-BASE_DIR = os.path.expanduser(os.path.expandvars(os.getenv(
-    "LITERATUR_BASE_DIR",
-    os.path.join("~", "Literatur"),
-)))
+settings_store.remember_process_env(_PROCESS_ENV_KEYS)
+# An empty value means "use the default", not "the current directory". An
+# unusable one (control character, not absolute) falls back to the default
+# instead of killing the console-less .exe at import; the Startup check tells
+# the user that their folder was ignored.
+BASE_DIR, _base_dir_notice = Config.resolve_base_dir(os.getenv("LITERATUR_BASE_DIR", ""))
+if _base_dir_notice:
+    logging.warning("LITERATUR_BASE_DIR %r ignored (%s), using %s",
+                    _base_dir_notice["params"]["value"],
+                    _base_dir_notice["params"]["reason"], BASE_DIR)
+    Config.STARTUP_NOTICES = [_base_dir_notice]
 Config.init_paths(BASE_DIR)
 
 
@@ -112,7 +126,27 @@ from origin_guard import OriginGuardMiddleware
 
 app.add_middleware(OriginGuardMiddleware)
 
-app.mount("/static", StaticFiles(directory=str(SCRIPT_DIR / "static")), name="static")
+
+class SpaStaticFiles(StaticFiles):
+    """``/static`` with a fixed JavaScript type for scripts and modules.
+
+    Starlette takes the type from ``mimetypes``, which on Windows reads the
+    registry: a machine that maps ``.js`` to ``text/plain`` - or does not know
+    ``.mjs`` at all, as Python 3.11 in the frozen build does not - would serve
+    the vendored PDF.js (#229) with a type the browser refuses for a module
+    ``import()`` and a module worker. The suffix decides here, not the machine.
+    """
+
+    JS_SUFFIXES = (".js", ".mjs")
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        if str(full_path).lower().endswith(self.JS_SUFFIXES) and "content-type" in response.headers:
+            response.headers["content-type"] = "text/javascript; charset=utf-8"
+        return response
+
+
+app.mount("/static", SpaStaticFiles(directory=str(SCRIPT_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(SCRIPT_DIR / "templates"))
 
 db = Database(Config.DB_PATH)
@@ -176,9 +210,9 @@ def _reconcile_plugin_routers() -> None:
 
 from routers.stats import router as _stats_router
 from routers.version import router as _version_router, APP_VERSION  # noqa: F401  (re-export)
+from routers.version import run_exit_hooks as _run_exit_hooks
 from routers.banner import router as _banner_router
 from routers.license import router as _license_router
-from routers.appearance import router as _appearance_router
 from routers.settings import router as _settings_router, set_reconcile_hook as _set_settings_reconcile_hook
 from routers.categories import router as _categories_router
 from routers.export import router as _export_router
@@ -186,17 +220,22 @@ from routers.custom_fields import router as _custom_fields_router
 from routers.bibtex_import import router as _bibtex_import_router
 from routers.paper_by_doi import router as _paper_by_doi_router
 from routers.papers import router as _papers_router
+from routers.annotations import router as _annotations_router
+from routers.collections import router as _collections_router
 from routers.validate import router as _validate_router
 from routers.references import router as _references_router
 from routers.research_chat import router as _research_chat_router
 from routers.analysis import router as _analysis_router
 from routers.duplicates import router as _duplicates_router
 from routers.maintenance import router as _maintenance_router
+from routers.refresh_review import router as _refresh_review_router
+from routers.diagnosis import router as _diagnosis_router
 from routers.search import router as _search_router
 from routers.migration import router as _migration_router
-from routers.llm import router as _llm_router
+from routers.llm import router as _llm_router, start_startup_check as _start_llm_check
 from routers.plugins import router as _plugins_router
 from routers.marketplace import router as _marketplace_router
+from routers import backup as _backup_router_mod
 
 # Re-exports kept ONLY for tests that reach them via ``webapp.<name>``
 # (``from webapp import _normalize_title``; ``webapp.detect_book_structure``).
@@ -212,11 +251,17 @@ _import_router = _importlib.import_module("routers.import").router
 # plugin routes without importing webapp (which would be circular).
 _set_settings_reconcile_hook(_reconcile_plugin_routers)
 
+@app.exception_handler(settings_store.EnvLocked)
+async def _env_locked_handler(request: Request, exc: settings_store.EnvLocked):
+    """The .env is held by another process: nothing was changed (423)."""
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=423, content={"detail": {"code": "error.settings.locked"}})
+
+
 app.include_router(_stats_router)
 app.include_router(_version_router)
 app.include_router(_banner_router)
 app.include_router(_license_router)
-app.include_router(_appearance_router)
 app.include_router(_settings_router)
 app.include_router(_categories_router)
 app.include_router(_export_router)
@@ -225,6 +270,8 @@ app.include_router(_bibtex_import_router)
 # Literal /api/papers/by-doi… before the parametric /api/papers/{paper_id} family.
 app.include_router(_paper_by_doi_router)
 app.include_router(_papers_router)
+app.include_router(_annotations_router)
+app.include_router(_collections_router)
 app.include_router(_validate_router)
 app.include_router(_references_router)
 app.include_router(_research_chat_router)
@@ -232,20 +279,36 @@ app.include_router(_analysis_router)
 app.include_router(_import_router)
 app.include_router(_duplicates_router)
 app.include_router(_maintenance_router)
+app.include_router(_refresh_review_router)
+app.include_router(_diagnosis_router)
 app.include_router(_search_router)
 app.include_router(_migration_router)
 app.include_router(_llm_router)
 app.include_router(_plugins_router)
 app.include_router(_marketplace_router)
+app.include_router(_backup_router_mod.router)
 
 # Add-on loader (ADR-0021): persists through the one plugins.json writer;
 # the release version feeds the min_core check of a frozen build.
 plugin_loader.configure(persist=settings_store.save_plugins_document, core_version=APP_VERSION)
+# Backups: the version goes into each manifest, the restore steps of its
+# README.txt come from the bundled catalogs.
+_backup_router_mod.configure(app_version=APP_VERSION, locales_dir=str(SCRIPT_DIR / "static" / "locales"))
 
 
 # =============================================================================
 # SPA ENTRY POINT
 # =============================================================================
+
+def _ui_prefs() -> dict:
+    """The server-held look of this installation, read from the .env file the
+    settings router writes (not from ``os.environ``, which keeps stale values)."""
+    held = settings_store.read_env(_Path(Config.ENV_PATH), {"DARK_MODE", "THESIS_MODE", "DETAIL_LAYOUT"})
+    return {"darkMode": held.get("DARK_MODE", ""), "thesisMode": held.get("THESIS_MODE", ""),
+            # The detail layout (#230): always the effective, normalized one.
+            "detailLayout": detail_layout.effective(held.get("DETAIL_LAYOUT")),
+            "detailLayoutRules": detail_layout.rules()}
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -257,7 +320,10 @@ async def index(request: Request):
         {"request": request, "ui_language": Config.UI_LANGUAGE,
          # Add-on frontends (#187): rendered in, so the boot loads their
          # scripts before the router resolves the first route — no round trip.
-         "addons": plugin_loader.frontends()},
+         "addons": plugin_loader.frontends(),
+         # Dark mode / thesis area (#208): the .env is the truth, rendered in
+         # so the first frame is right in any browser. "" = not set yet.
+         "prefs": _ui_prefs()},
     )
 
 
@@ -283,10 +349,11 @@ async def shutdown_server():
     def _shutdown():
         import time
         time.sleep(0.5)
+        _run_exit_hooks()  # the .exe's tray icon leaves with the process (#214)
         os.kill(os.getpid(), signal.SIGTERM)
 
     threading.Thread(target=_shutdown, daemon=True).start()
-    return {"status": "ok", "message": "Server wird heruntergefahren..."}
+    return {"status": "ok", "message": "app.shuttingDown"}
 
 
 # =============================================================================
@@ -330,30 +397,28 @@ async def _increment_start_count() -> None:
     count = int(db.get_app_setting("app_start_count") or "0")
     db.set_app_setting("app_start_count", str(count + 1))
     if not db.get_app_setting("license_first_run_at"):
-        db.set_app_setting("license_first_run_at", datetime.utcnow().isoformat())
+        db.set_app_setting("license_first_run_at", datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
 
 
 @app.on_event("startup")
-async def _check_available_models() -> None:
-    """Warn at startup when a bound role names a model its connection does
-    not offer — the mistake that otherwise surfaces as a 4xx mid-import."""
-    from routers.llm import fetch_models
+async def _start_auto_backup() -> None:
+    """The automatic backup schedule: a background thread that looks every
+    few minutes whether a backup is due (``routers/backup.py``)."""
+    _backup_router_mod.start_schedule()
 
-    seen: dict[str, tuple[list, object]] = {}
-    for tier in ("reasoning", "fast", "embedding"):
-        ep = Config.llm_endpoint(tier)
-        if ep is None:
-            continue
-        if ep["base_url"] not in seen:
-            seen[ep["base_url"]] = fetch_models(ep["base_url"], ep["api_key"])
-        models, error = seen[ep["base_url"]]
-        if error:
-            logging.warning("%s: Modell-Liste von %s nicht abrufbar (%s)", tier, ep["base_url"], error.get("code"))
-        elif models and ep["model"] not in models:
-            logging.warning(
-                "⚠️  Rolle %s: Modell '%s' ist bei %s nicht verfügbar. Verfügbare Modelle: %s",
-                tier, ep["model"], ep["base_url"], models,
-            )
+
+@app.on_event("shutdown")
+async def _stop_auto_backup() -> None:
+    _backup_router_mod.stop_schedule()
+
+
+@app.on_event("startup")
+async def _start_llm_startup_check() -> None:
+    """Startup check of the AI models (#209): ask every bound role's
+    connection for its model list — in the background, the start does not
+    wait. A role whose model is gone, whose key is rejected or whose host does
+    not answer surfaces now, in the SPA's popup, instead of mid-import."""
+    _start_llm_check()
 
 
 # Core Projects feature removed (issue #52, ADR-0004): the /api/projects CRUD and
@@ -396,8 +461,27 @@ if __name__ == "__main__":
 
     import uvicorn
 
+    # Rotating log file in <settings folder>/logs (#211). In the source tree the
+    # console keeps its output too; attaching a file handler to a handler-less
+    # root would otherwise swallow the stderr fallback.
+    from logging_setup import console_handler, log_dir_for, quiet_url_loggers, setup_file_logging
+    if not _FROZEN and not logging.getLogger().handlers:
+        logging.getLogger().addHandler(console_handler())
+    setup_file_logging(log_dir_for(os.path.dirname(Config.ENV_PATH)))
+    quiet_url_loggers()
+
     _PORT = int(os.getenv("LOCALBIB_PORT", "8000"))
     _URL = f"http://localhost:{_PORT}"
+
+    # The Windows .exe runs without a console (#214, ADR-0023): the starter
+    # takes over - running-instance check, server thread, tray icon, browser.
+    # The source tree (and a frozen build elsewhere) keeps the path below.
+    if _FROZEN and sys.platform == "win32":
+        import starter
+        sys.exit(starter.run_frozen(
+            app, port=_PORT, argv=sys.argv[1:], bundle_dir=str(SCRIPT_DIR),
+            wait_for_free_port=lambda port: wait_for_free_port("127.0.0.1", port),
+        ))
 
     print()
     print("  ========================================")

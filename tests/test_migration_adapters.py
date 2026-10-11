@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import bibtex_migration
 import ris_import
+from migration_items import collection_name, collection_paths_of
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +121,26 @@ class TestBibtexAdapter:
         assert bibtex_migration.split_tags("a, b; c") == ["a", "b", "c"]
         assert bibtex_migration.split_tags("a, a") == ["a"]
         assert bibtex_migration.split_collection("Diss/Kap 2, Andere") == ["Diss", "Kap 2"]
+
+    def test_every_group_is_its_own_collection_path(self):
+        """#203: an item may sit in many Collections, so every group counts."""
+        assert bibtex_migration.split_collections("Diss/Kap 2, Andere; Diss/Kap 2") == [
+            ["Diss", "Kap 2"], ["Andere"]]
+        assert bibtex_migration.split_collections("") == []
+
+    def test_mendeley_and_citavi_groups_arrive_as_collection_paths(self, tmp_path):
+        """Mendeley writes ``groups``/``mendeley-groups``-style fields, Citavi
+        ``citavi-groups``: both end up in ``collection_paths``, which the
+        migration turns into Collections, not categories."""
+        (tmp_path / "x.bib").write_text(
+            "@misc{m, title={M}, groups={Reading/Papers, Thesis}}\n"
+            "@misc{c, title={C}, citavi-groups={Projekt A}}\n",
+            encoding="utf-8")
+        items = bibtex_migration.read_items(str(tmp_path / "x.bib"))
+        assert items[0].collection_paths == [["Reading", "Papers"], ["Thesis"]]
+        assert items[1].collection_paths == [["Projekt A"]]
+        assert [collection_name(p) for p in collection_paths_of(items[0])] == [
+            "Reading / Papers", "Thesis"]
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
-import { bootApp, flush } from './helpers.js';
+import { bootApp, filterPillActive, flush, openFilterPill } from './helpers.js';
 
 const FIXTURE = resolve(__dirname, '../../plugin_api/tests/fixtures/hello');
 const read = (rel) => readFileSync(resolve(FIXTURE, rel), 'utf-8');
@@ -32,18 +32,6 @@ const PAPERS = [
 ];
 
 const papersCalls = (calls) => calls.filter((c) => c.method === 'GET' && c.url.startsWith('/api/papers?'));
-const filterButton = () => document.querySelector('.lb-toolbar-l button');
-const badge = () => filterButton().querySelector('.lb-pill-accent');
-
-async function openFilters() {
-    const btn = await vi.waitFor(() => {
-        const b = filterButton();
-        if (!b) throw new Error('item list not rendered');
-        return b;
-    });
-    if (!document.querySelector('.lb-filter-bar')) btn.click();
-    await flush();
-}
 
 describe('PaperList drops an Add-on filter live on lb-plugins-changed', () => {
     it('clears the selection and reloads without cite_keys while the list stays open', async () => {
@@ -64,10 +52,14 @@ describe('PaperList drops an Add-on filter live on lb-plugins-changed', () => {
         ]);
 
         expect(window.LocalBib.isActive('hello')).toBe(true);
-        const list = document.querySelector('.lb-toolbar-l');
-        await openFilters();
+        const bar = await vi.waitFor(() => {
+            const b = document.querySelector('[data-testid="filter-bar"]');
+            if (!b) throw new Error('item list not rendered');
+            return b;
+        });
+        const pop = await openFilterPill('addon-hello');
         const select = await vi.waitFor(() => {
-            const s = document.querySelector('select.hello-filter-select');
+            const s = pop.querySelector('select.hello-filter-select');
             if (!s) throw new Error('hello filter not rendered');
             return s;
         });
@@ -79,7 +71,7 @@ describe('PaperList drops an Add-on filter live on lb-plugins-changed', () => {
         });
         expect(papersCalls(calls).at(-1).url).toContain(`cite_keys=${encodeURIComponent('hello2024,hello2025')}&`);
         await flush();
-        expect(badge().textContent.trim()).toBe('1');
+        expect(filterPillActive('addon-hello')).toBe(true);
         const before = papersCalls(calls).length;
 
         // The exact event `applyAddons`/`emitAddonChange` dispatches on a
@@ -92,9 +84,9 @@ describe('PaperList drops an Add-on filter live on lb-plugins-changed', () => {
         });
         expect(papersCalls(calls).at(-1).url).not.toContain('cite_keys');
         await flush();
-        expect(badge()).toBeNull();
+        expect(filterPillActive('addon-hello')).toBe(false);
         expect(document.querySelector('select.hello-filter-select').value).toBe('');
         // Still the same list -- not a remount from navigating away and back.
-        expect(document.querySelector('.lb-toolbar-l')).toBe(list);
+        expect(document.querySelector('[data-testid="filter-bar"]')).toBe(bar);
     });
 });

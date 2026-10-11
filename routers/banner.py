@@ -15,7 +15,7 @@ DB-Zugriff pro Request via Database(Config.DB_PATH). Kein I/O beim Import.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter
 
@@ -66,7 +66,7 @@ def _banner_should_show(db: Database, activated: bool,
         return True  # Never dismissed -> show
 
     dismissed_at = datetime.fromisoformat(dismissed_at_str)
-    days_since_dismiss = (datetime.utcnow() - dismissed_at).days
+    days_since_dismiss = (datetime.now(timezone.utc).replace(tzinfo=None) - dismissed_at).days
     dismiss_count = int(db.get_app_setting("banner_dismiss_count") or "0")
 
     if days_since_dismiss < 90:
@@ -96,6 +96,6 @@ async def dismiss_banner() -> dict:
     """Record that the user dismissed the banner."""
     db = _get_db()
     count = int(db.get_app_setting("banner_dismiss_count") or "0")
-    db.set_app_setting("banner_dismissed_at", datetime.utcnow().isoformat())
+    db.set_app_setting("banner_dismissed_at", datetime.now(timezone.utc).replace(tzinfo=None).isoformat())
     db.set_app_setting("banner_dismiss_count", str(count + 1))
     return {"status": "ok"}

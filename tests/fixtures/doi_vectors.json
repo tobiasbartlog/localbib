@@ -1,0 +1,24 @@
+{
+  "about": "One DOI rule for the server and the SPA (#227). `normalized` is what the intake's identity `paper_ingest.normalize_doi` returns and what the import page's DOI list shows; both tests/test_doi_vectors.py and tests/js/import_doi_vectors.test.js check every vector. `is_doi` is the SPA's shape check of the normalized value (a row it may send, or one it marks as not a DOI) - the server does not judge shape, so only the vitest reads it. An empty `normalized` makes no row.",
+  "vectors": [
+    { "input": "10.1000/xyz123", "normalized": "10.1000/xyz123", "is_doi": true },
+    { "input": "10.1000/XYZ123", "normalized": "10.1000/xyz123", "is_doi": true },
+    { "input": "https://doi.org/10.1000/abc", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "http://dx.doi.org/10.1000/abc", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "https://www.doi.org/10.1000/abc", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "HTTPS://DOI.ORG/10.1000/ABC", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "doi.org/10.1000/abc", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "doi:10.1000/abc", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "DOI:10.1000/ABC", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "10.1000/abc.", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "https://doi.org/10.1000/abc..", "normalized": "10.1000/abc", "is_doi": true },
+    { "input": "10.1002/(SICI)1097-4636(199706)35:4<419::AID-JBM1>3.0.CO;2-L", "normalized": "10.1002/(sici)1097-4636(199706)35:4<419::aid-jbm1>3.0.co;2-l", "is_doi": true },
+    { "input": "10.1000/a,b", "normalized": "10.1000/a,b", "is_doi": true },
+    { "input": "10.1000.10/sub-registrant", "normalized": "10.1000.10/sub-registrant", "is_doi": true },
+    { "input": "not-a-doi", "normalized": "not-a-doi", "is_doi": false },
+    { "input": "10.12/short-registrant", "normalized": "10.12/short-registrant", "is_doi": false },
+    { "input": "https://example.org/paper", "normalized": "https://example.org/paper", "is_doi": false },
+    { "input": "doi:", "normalized": "", "is_doi": false },
+    { "input": "   ", "normalized": "", "is_doi": false }
+  ]
+}

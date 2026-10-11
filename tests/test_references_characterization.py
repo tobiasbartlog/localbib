@@ -311,7 +311,7 @@ class TestExtractReferences:
         events = _parse_sse(resp)
         err = _event_by_type(events, "error")
         assert err is not None, f"Expected error event; events={events}"
-        assert "extrahierbar" in err["message"]
+        assert err["message"] == "refs.error.noText"
 
     def test_no_ref_section_emits_error(self, client, db):
         """When _find_reference_section returns empty text the stream emits an error."""
@@ -321,18 +321,18 @@ class TestExtractReferences:
         events = _parse_sse(resp)
         err = _event_by_type(events, "error")
         assert err is not None, f"Expected error event; events={events}"
-        assert "Literaturverzeichnis" in err["message"]
+        assert err["message"] == "refs.error.noSection"
 
     def test_llm_returns_empty_emits_error(self, client, db):
         """When _llm_extract_references returns [] the stream emits an error event.
-        Quirk frozen: exact message is 'KI konnte keine Referenzen extrahieren'."""
+        The message is a code (LIB-B8); the SPA translates it."""
         pid = _seed_paper(db, filename="nollm_ref.pdf")
         with _patch_pages(), _patch_ref_section(), _patch_llm_refs([]):
             resp = client.post(f"/api/papers/{pid}/extract-references")
         events = _parse_sse(resp)
         err = _event_by_type(events, "error")
         assert err is not None, f"Expected error event; events={events}"
-        assert "Referenzen" in err["message"]
+        assert err["message"] == "refs.error.noneExtracted"
 
     def test_crossref_doi_lookup_called_for_refs_without_doi(self, client, db):
         """CrossRef lookup is triggered for references that have no DOI from LLM."""

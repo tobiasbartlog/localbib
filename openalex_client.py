@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+import ca_trust
+
 BASE_URL = "https://api.openalex.org"
 BATCH_SIZE = 50
 _WORK_SELECT = (
@@ -108,7 +110,7 @@ class OpenAlexClient:
         if self.api_key:
             params["api_key"] = self.api_key
         for attempt in range(3):
-            r = httpx.get(url, params=params, timeout=30)
+            r = httpx.get(url, params=params, timeout=30, verify=ca_trust.httpx_verify())
             if r.status_code == 429:
                 retry_after = int(r.headers.get("Retry-After", 5))
                 logging.warning("OpenAlex 429, waiting %ss (attempt %s)", retry_after, attempt + 1)
@@ -119,8 +121,12 @@ class OpenAlexClient:
             return {}
         return {}
 
-    def fetch_works_by_doi(self, dois: list[str]) -> list[Work]:
-        """Batch-fetch full Work objects by DOI list. Handles chunking at BATCH_SIZE."""
+    def fetch_works_by_doi(self, dois: list[str], raise_errors: bool = False) -> list[Work]:
+        """Batch-fetch full Work objects by DOI list. Handles chunking at BATCH_SIZE.
+
+        A failed batch is logged and skipped — unless ``raise_errors``, for a
+        caller that must tell "not found" from "could not ask" (the recompute
+        step counts the latter as errors)."""
         results: list[Work] = []
         for i in range(0, len(dois), BATCH_SIZE):
             batch = dois[i : i + BATCH_SIZE]
@@ -132,6 +138,8 @@ class OpenAlexClient:
                 )
                 results.extend(_parse_work(w) for w in data.get("results", []))
             except Exception as e:
+                if raise_errors:
+                    raise
                 logging.warning("OpenAlex DOI batch failed: %s", e)
             if i + BATCH_SIZE < len(dois):
                 time.sleep(0.15)

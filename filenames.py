@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Datei-Management: Dateinamen-Generierung und Symlink-Erstellung."""
+"""Datei-Management: Dateinamen-Generierung und die Eintraege der Kategorie-Ordner.
+
+Ein Eintrag in einem Kategorie-Ordner zeigt auf die PDF in ``Config.ALL_DIR``.
+Wie er dort liegt, bestimmt der Link-Modus (``Config.LINK_MODE``, #213):
+
+* ``hardlink`` - harter Link; scheitert er (anderes Laufwerk, Dateisystem ohne
+  harte Links), liegt dort eine Verknuepfung (Windows: ``.lnk``, sonst ein
+  symbolischer Link) und der Rueckfall wird gezaehlt.
+* ``symlink``  - "Verknuepfung": unter Windows eine ``.lnk``-Datei (echte
+  symbolische Links braucht dort Adminrechte), sonst ``os.symlink``.
+* ``copy``     - eine Kopie der PDF.
+
+Ohne Eintrag in der ``.env`` gilt unter Windows ``hardlink`` und sonst
+``symlink`` - genau das Verhalten von vor der Einstellung.
+"""
+
+from __future__ import annotations
 
 import os
 import re
@@ -37,68 +53,178 @@ def generate_filename(metadata: Dict) -> str:
     return filename
 
 
-def create_symlinks(db: Database, paper_id: int, filename: str):
-    """Erstellt Symlinks in Kategorie-Ordnern."""
+def stored_pdf_path(filename: str) -> str | None:
+    """Pfad der gespeicherten PDF eines Eintrags — oder ``None``, wenn keine da ist.
+
+    Eintraege ohne PDF (BibTeX-/DOI-Import) haben ``filename == ""``; ein
+    ``os.path.join(ALL_DIR, "")`` waere dann der Ordner selbst, und
+    ``os.path.exists`` ist fuer einen Ordner wahr. Daher ``isfile``."""
+    if not (filename or "").strip():
+        return None
+    path = os.path.join(Config.ALL_DIR, os.path.basename(filename))
+    return path if os.path.isfile(path) else None
+
+
+def _category_path_parts(cat: dict, cat_map: dict) -> list:
+    """Ordnerpfad einer Kategorie (mit ihren Eltern) als Liste von Namen."""
+    path_parts = [cat["name"]]
+    parent_id = cat.get("parent_id")
+    while parent_id is not None:
+        parent = cat_map.get(parent_id)
+        if not parent:
+            break
+        path_parts.insert(0, parent["name"])
+        parent_id = parent.get("parent_id")
+    return path_parts
+
+
+def _remove_entry(link_path: str) -> None:
+    """Entfernt einen alten Eintrag - in jeder Form, die ein Modus hinterlaesst
+    (Link/Kopie unter dem Namen selbst, Verknuepfung mit ``.lnk``), damit ein
+    Moduswechsel keine Doppelten stehen laesst."""
+    for path in (link_path, link_path + ".lnk"):
+        if os.path.islink(path) or os.path.isfile(path):
+            os.remove(path)
+
+
+def _place_shortcut(source: str, link_path: str) -> str:
+    """Die Verknuepfung: unter Windows eine ``.lnk``-Datei, sonst ein
+    symbolischer Link. Gibt zurueck, was entstanden ist."""
+    if sys.platform == "win32":
+        return _create_windows_shortcut(source, link_path)
+    os.symlink(source, link_path)
+    return "symlink"
+
+
+def place_entry(source: str, link_path: str, mode: str) -> tuple:
+    """Legt EINEN Eintrag ``link_path`` fuer die PDF ``source`` an.
+
+    Returns ``(art, rueckfall)`` - ``art`` ist ``hardlink``, ``symlink``,
+    ``shortcut`` oder ``copy``; ``rueckfall`` ist wahr, wenn nicht die Art des
+    Modus entstanden ist. Wirft ``OSError``, wenn gar nichts angelegt werden
+    konnte. Ein unbekannter Modus gilt als ``symlink``.
+    """
+    if mode == "copy":
+        shutil.copy2(source, link_path)
+        return "copy", False
+    if mode == "hardlink":
+        try:
+            os.link(source, link_path)
+            return "hardlink", False
+        except OSError as e:
+            # Anderes Laufwerk oder ein Dateisystem ohne harte Links: dann
+            # wenigstens eine Verknuepfung, wie es unter Windows immer war.
+            logging.info("Harter Link nicht moeglich (%s), lege Verknuepfung an: %s", e, link_path)
+            return _place_shortcut(source, link_path), True
+    kind = _place_shortcut(source, link_path)
+    return kind, kind == "copy"
+
+
+def create_symlinks(db: Database, paper_id: int, filename: str, mode: str | None = None) -> dict:
+    """Legt die Eintraege eines Papers in seinen Kategorie-Ordnern an.
+
+    ``mode`` ist der Link-Modus, ohne Angabe der eingestellte
+    (``Config.LINK_MODE``). Ein einzelner Fehlschlag wird geloggt und gezaehlt,
+    nie geworfen. Returns ``{"placed": n, "fallbacks": n, "failed": n}``.
+    """
+    result = {"placed": 0, "fallbacks": 0, "failed": 0}
+    source_path = stored_pdf_path(filename)
+    if source_path is None:
+        # Ohne Datei gibt es nichts zu verknuepfen. Eine fehlende Datei zeigt
+        # die Diagnose (Einstellungen) an, statt hier pro Kategorie zu scheitern.
+        if filename:
+            logging.debug("Keine Verknuepfung fuer Paper %s: %s fehlt", paper_id, filename)
+        return result
+
+    mode = mode or Config.LINK_MODE
+    name = os.path.basename(filename)
     categories = db.get_paper_categories(paper_id)
-    all_categories = db.get_categories()
-
-    # Category ID -> Name Mapping
-    cat_map = {c["id"]: c for c in all_categories}
-
-    source_path = os.path.join(Config.ALL_DIR, filename)
+    cat_map = {c["id"]: c for c in db.get_categories()}
 
     for cat_assignment in categories:
-        cat_id = cat_assignment["id"]
-        cat = cat_map.get(cat_id)
+        cat = cat_map.get(cat_assignment["id"])
         if not cat:
             continue
-
-        # Ordnerpfad aufbauen (mit Parent)
-        path_parts = [cat["name"]]
-        parent_id = cat.get("parent_id")
-        while parent_id is not None:
-            parent = cat_map.get(parent_id)
-            if parent:
-                path_parts.insert(0, parent["name"])
-                parent_id = parent.get("parent_id")
-            else:
-                break
-
-        cat_dir = os.path.join(Config.CATEGORIES_DIR, *path_parts)
-        os.makedirs(cat_dir, exist_ok=True)
-
-        link_path = os.path.join(cat_dir, filename)
-
-        # Symlink erstellen (Windows: Verknüpfung / Junction)
+        path_parts = _category_path_parts(cat, cat_map)
+        link_path = os.path.join(Config.CATEGORIES_DIR, *path_parts, name)
         try:
-            if os.path.exists(link_path) or os.path.islink(link_path):
-                os.remove(link_path)
-
-            if sys.platform == "win32":
-                # Windows: Hardlink oder Shortcut
-                # Symlinks brauchen Admin-Rechte, daher Hardlink
-                try:
-                    os.link(source_path, link_path)
-                except OSError:
-                    # Fallback: Shortcut via .lnk
-                    _create_windows_shortcut(source_path, link_path)
-            else:
-                os.symlink(source_path, link_path)
-
-            logging.info(f"  🔗 Verknüpfung: {os.path.join(*path_parts, filename)}")
+            os.makedirs(os.path.dirname(link_path), exist_ok=True)
+            _remove_entry(link_path)
+            kind, fell_back = place_entry(source_path, link_path, mode)
+            result["placed"] += 1
+            if fell_back:
+                result["fallbacks"] += 1
+            logging.info(f"  🔗 Verknüpfung ({kind}): {os.path.join(*path_parts, name)}")
         except Exception as e:
+            result["failed"] += 1
             logging.error(f"  ❌ Symlink-Fehler: {e}")
+    return result
 
 
-def _create_windows_shortcut(target: str, link_path: str):
-    """Erstellt Windows .lnk Verknüpfung."""
+def clear_category_folders() -> int:
+    """Leert ``Config.CATEGORIES_DIR``: entfernt jeden Eintrag und danach die
+    leeren Unterordner (veraltete Kategorien). Der Ordner selbst bleibt.
+
+    Beruehrt nie ``Config.ALL_DIR`` - auch dann nicht, wenn der (falsch
+    eingerichtet) innerhalb der Kategorie-Ordner laege. Ein harter Link oder
+    eine Verknuepfung zu entfernen laesst die PDF selbst unberuehrt.
+    Returns die Zahl der entfernten Eintraege.
+    """
+    root_dir = Config.CATEGORIES_DIR
+    if not root_dir or not os.path.isdir(root_dir):
+        return 0
+    protected = os.path.normcase(os.path.abspath(Config.ALL_DIR)) if Config.ALL_DIR else None
+
+    def _protected(path: str) -> bool:
+        if not protected:
+            return False
+        p = os.path.normcase(os.path.abspath(path))
+        return p == protected or p.startswith(protected + os.sep)
+
+    removed = 0
+    for root, dirs, files in os.walk(root_dir):
+        dirs[:] = [d for d in dirs if not _protected(os.path.join(root, d))]
+        for fname in files:
+            try:
+                os.remove(os.path.join(root, fname))
+                removed += 1
+            except OSError as e:
+                logging.warning(f"Konnte Datei nicht entfernen: {fname}: {e}")
+    for root, _dirs, _files in os.walk(root_dir, topdown=False):
+        if os.path.normcase(os.path.abspath(root)) == os.path.normcase(os.path.abspath(root_dir)) or _protected(root):
+            continue
+        try:
+            os.rmdir(root)  # schlaegt fehl, wenn der Ordner nicht leer ist - gewollt
+        except OSError:
+            pass
+    return removed
+
+
+def _create_windows_shortcut(target: str, link_path: str) -> str:
+    """Erstellt eine Windows-``.lnk``-Verknuepfung neben ``link_path``.
+
+    Ohne pywin32 entsteht eine Kopie unter ``link_path`` (nicht ideal, aber
+    sie funktioniert). Returns ``"shortcut"`` oder ``"copy"``. Laeuft auch in
+    einem Worker-Thread: COM wird dafuer pro Aufruf initialisiert.
+    """
     try:
+        import pythoncom
         import win32com.client
-        shell = win32com.client.Dispatch("WScript.Shell")
-        shortcut = shell.CreateShortCut(link_path.replace(".pdf", ".pdf.lnk"))
-        shortcut.Targetpath = target
-        shortcut.save()
     except ImportError:
-        # Fallback: einfach kopieren (nicht ideal, aber funktioniert)
         logging.warning("  ⚠️  pywin32 nicht installiert. Erstelle Kopie statt Verknüpfung.")
         shutil.copy2(target, link_path)
+        return "copy"
+    try:
+        pythoncom.CoInitialize()
+        initialized = True
+    except pythoncom.com_error:
+        initialized = False  # der Thread hat COM schon in anderer Art - nutzbar
+    try:
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortCut(link_path + ".lnk")
+        shortcut.Targetpath = target
+        shortcut.save()
+    finally:
+        if initialized:
+            pythoncom.CoUninitialize()
+    return "shortcut"

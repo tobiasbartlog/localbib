@@ -24,10 +24,28 @@ def test_make_api_hands_over_only_declared_services():
     full = make_api([p.value for p in Permission])
     assert isinstance(full.library, InMemoryLibrary)
     assert isinstance(full.llm, DummyLlm)
-    assert isinstance(full.files, NullFiles)
-    assert isinstance(full.storage, TempSqliteStorage)
+    # files/storage are reserved (2.2.0): never handed over, like the core.
+    assert full.files is None and full.storage is None
     assert full.settings.core().ui_language == "en"
-    full.storage.close()
+
+
+def test_reserved_permissions_grant_nothing_even_when_a_fake_is_passed():
+    storage = TempSqliteStorage()
+    try:
+        api = make_api(["files", "storage"], files=NullFiles(), storage=storage)
+        assert api.files is None and api.storage is None
+        assert {"files", "storage"} <= {p.value for p in api.permissions}
+    finally:
+        storage.close()
+
+
+def test_reserved_permissions_are_valid_but_not_gated():
+    from plugin_api import GATED_SERVICES, PERMISSIONS
+
+    for perm in (Permission.FILES, Permission.STORAGE):
+        info = PERMISSIONS[perm]
+        assert info.reserved and not info.enforced and info.service is None
+    assert set(GATED_SERVICES) == {"library", "llm"}
 
 
 def test_make_api_ignores_a_passed_service_without_its_permission():
@@ -113,7 +131,8 @@ def test_dummy_llm_embeddings_are_off_by_default_and_deterministic_when_on():
 def test_settings_keep_own_keys_and_gate_the_core_set():
     s = InMemorySettings({"k": 1})
     s.set("j", 2)
-    assert (s.get("k"), s.get("j"), s.get("missing")) == (1, 2, None)
+    # Numbers are stored as str, like the core keeps them on disk (2.2.0).
+    assert (s.get("k"), s.get("j"), s.get("missing")) == ("1", "2", None)
     core = CoreSettings("me@example.org", "key", "de", "/lib")
     assert make_api(["settings.core"], core_settings=core).settings.core() == core
     assert make_api([], core_settings=core).settings.core() is None
@@ -147,3 +166,47 @@ def test_temp_sqlite_storage_cleans_its_own_folder():
     folder = storage.directory
     storage.close()
     assert not folder.exists()
+
+
+def test_in_memory_library_collections_seeded_with_tombstones():
+    lib = InMemoryLibrary(
+        [{"citekey": "a1", "title": "A"}, {"citekey": "b2", "title": "B"}],
+        collections=[
+            {"id": 3, "name": "paper x", "refs": ["b2", "a1", "gone"]},
+            {"id": 5, "name": "Archive", "archived": True},
+            {"id": 9, "name": "Old", "refs": ["a1"], "deleted_at": "2026-01-02 03:04:05"},
+        ],
+    )
+    assert [c["id"] for c in lib.list_collections()] == [5, 9, 3]
+    assert lib.get_collection(5)["archived"] is True
+    old = lib.get_collection(9)
+    assert (old["deleted"], old["deleted_at"], old["item_count"]) == (True, "2026-01-02 03:04:05", 1)
+    # As in the core, a Collection only holds Items of the library.
+    assert lib.get_collection_refs(3) == ["b2", "a1"]
+    assert lib.get_collection(3)["item_count"] == 2
+    bib = lib.export_collection_bibtex(3)
+    assert bib.index("@article{b2,") < bib.index("@article{a1,")
+    assert lib.export_collection_bibtex(5) == "\n"
+    assert (lib.get_collection(42), lib.get_collection_refs(42)) == (None, [])
+
+
+def test_in_memory_library_collection_helpers_fire_core_shaped_events():
+    from plugin_api import COLLECTION_EVENT_ACTIONS
+
+    lib = InMemoryLibrary([{"citekey": "a1"}])
+    events = []
+    lib.on_change(events.append)
+    cid = lib.add_collection("X", refs=["a1"])
+    lib.rename_collection(cid, "Y")
+    lib.set_collection_description(cid, "why")
+    lib.archive_collection(cid)
+    lib.archive_collection(cid, archived=False)
+    lib.set_collection_refs(cid, [])
+    lib.delete_collection(cid)
+    assert [e["action"] for e in events] == [
+        "created", "members_changed", "renamed", "updated", "archived", "restored",
+        "members_changed", "deleted"]
+    assert all(e == {"type": "collection", "action": e["action"], "collection_id": cid} for e in events)
+    assert set(e["action"] for e in events) == set(COLLECTION_EVENT_ACTIONS)
+    with pytest.raises(ValueError):
+        lib.emit_collection("exploded", cid)

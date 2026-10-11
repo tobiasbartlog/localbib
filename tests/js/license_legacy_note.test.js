@@ -25,7 +25,7 @@ describe('Lizenz-Tab bei einem Altbestand aus dem früheren Shop', () => {
                     legacy_note: NOTE,
                 },
             },
-        ], 'license-tab');
+        ], 'about');
 
         const note = await vi.waitFor(() => {
             const el = document.querySelector('[data-testid="license-legacy-note"]');

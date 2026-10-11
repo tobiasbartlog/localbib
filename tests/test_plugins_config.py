@@ -216,4 +216,73 @@ def test_herkunft_survives_normalize():
     entry = doc["plugins"]["x"]
     assert entry["source"] == {"origin": "file", "sha256": "a" * 64}
     assert entry["consent"]["origin"] == "file" and entry["consent"]["sha256"] == "a" * 64
-    assert entry["pending_update"]["origin"] == "index" and entry["pending_update"]["agreed"] == ["llm"]
+    # An unrecognised origin is never taken for the index (fails closed).
+    assert entry["pending_update"]["origin"] == "unknown" and entry["pending_update"]["agreed"] == ["llm"]
+
+
+# ---------------------------------------------------------------------------
+# An unrecognised non-empty Herkunft fails closed (cloud handoff task 5)
+# ---------------------------------------------------------------------------
+
+def test_an_unrecognised_origin_is_never_the_index():
+    assert plugins_config.provenance("bogus")["origin"] == plugins_config.ORIGIN_UNKNOWN
+    assert plugins_config.provenance("Index")["origin"] == plugins_config.ORIGIN_UNKNOWN
+    # No origin at all stays the index, exactly as before.
+    assert plugins_config.provenance("")["origin"] == plugins_config.ORIGIN_INDEX
+
+
+def test_an_unrecognised_installed_source_stays_unknown():
+    doc = plugins_config.normalize({"plugins": {"x": {"source": {"origin": "zip", "sha256": "ab"}}}})
+    entry = doc["plugins"]["x"]
+    assert entry["source"] == {"origin": "unknown", "sha256": ""}
+    assert plugins_config.source_provenance(entry)["origin"] == "unknown"
+
+
+def test_unknown_code_needs_the_dialog_even_without_permissions():
+    unknown = plugins_config.provenance("bogus")
+    assert plugins_config.confirmation_needed(plugins_config.empty_consent(), unknown, [])
+    assert plugins_config.missing_for(plugins_config.empty_consent(), unknown, ["llm"]) == ["llm"]
+
+
+def test_a_legacy_consent_does_not_pass_to_unknown_code():
+    legacy = {"version": "1", "permissions": ["llm"], "origin": "", "sha256": "", "path": ""}
+    unknown = plugins_config.provenance("bogus")
+    assert not plugins_config.consent_binds(legacy, unknown)
+    assert plugins_config.confirmation_needed(legacy, unknown, ["llm"])
+    entry = {"source": {"origin": "unknown", "sha256": ""}, "consent": dict(legacy)}
+    assert plugins_config.bind_unbound_consent(entry)
+    assert entry["consent"]["permissions"] == []
+    assert entry["consent"]["origin"] == "unknown"
+
+
+def test_consent_given_to_unknown_code_binds_to_it_only():
+    entry = plugins_config.empty_entry()
+    entry["consent"] = {**plugins_config.empty_consent(), "version": "1", "permissions": ["llm"]}
+    plugins_config.bind_consent(entry, plugins_config.provenance("bogus"))
+    doc = plugins_config.normalize({"plugins": {"x": entry}})
+    consent = doc["plugins"]["x"]["consent"]
+    assert consent["origin"] == "unknown"
+    assert not plugins_config.confirmation_needed(consent, plugins_config.provenance("bogus"), ["llm"])
+    assert plugins_config.missing_for(consent, plugins_config.provenance("index"), ["llm"]) == ["llm"]
+
+
+def test_a_damaged_consent_origin_grants_nothing_to_the_index():
+    doc = plugins_config.normalize({"plugins": {"x": {
+        "consent": {"version": "1", "permissions": ["llm"], "origin": "garbage"}}}})
+    consent = doc["plugins"]["x"]["consent"]
+    assert not plugins_config.is_unbound(consent)
+    assert plugins_config.missing_for(consent, plugins_config.provenance("index"), ["llm"]) == ["llm"]
+
+
+def test_entries_without_any_source_behave_as_before():
+    """Legacy-migrated entries and dev-path Bundles carry no source: index."""
+    doc = plugins_config.normalize({"plugins": {"x": {
+        "consent": {"version": "1", "permissions": ["llm"]}}}})
+    entry = doc["plugins"]["x"]
+    assert entry["source"] == {"origin": "", "sha256": ""}
+    prov = plugins_config.source_provenance(entry)
+    assert prov["origin"] == "index"
+    assert plugins_config.is_unbound(entry["consent"])
+    assert not plugins_config.confirmation_needed(entry["consent"], prov, ["llm"])
+    dev = plugins_config.provenance("dev", path="/x/plug")
+    assert plugins_config.confirmation_needed(entry["consent"], dev, ["llm"]) is False

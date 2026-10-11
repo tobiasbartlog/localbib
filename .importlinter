@@ -47,7 +47,6 @@ modules =
     routers.version
     routers.banner
     routers.license
-    routers.appearance
     routers.settings
     routers.categories
     routers.export
@@ -55,6 +54,8 @@ modules =
     routers.bibtex_import
     routers.paper_by_doi
     routers.papers
+    routers.annotations
+    routers.collections
     routers.validate
     routers.references
     routers.research_chat
@@ -62,8 +63,11 @@ modules =
     routers.import
     routers.duplicates
     routers.maintenance
+    routers.refresh_review
+    routers.diagnosis
     routers.search
     routers.llm
     routers.migration
     routers.plugins
     routers.marketplace
+    routers.backup

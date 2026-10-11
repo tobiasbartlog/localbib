@@ -114,6 +114,33 @@ def test_stdlib_packages_bring_their_submodules_but_not_their_tests(spec_namespa
     assert "email.tests.x" not in hidden     # ... and its test one is filtered
 
 
+def test_the_vendored_pdf_viewer_ships_with_static(spec_namespace):
+    """#229: the detail view's preview imports PDF.js from static/vendor at
+    runtime; the whole static folder is bundled, the vendored viewer with it."""
+    datas = _analysis(spec_namespace)["datas"]
+    assert ("static", "static") in datas
+    vendored = list((REPO_ROOT / "static" / "vendor").glob("pdfjs-*/pdf.worker.min.mjs"))
+    assert vendored, "no vendored PDF.js under static/vendor"
+
+
+def test_the_exe_has_no_console_window(spec_namespace):
+    """#214, ADR-0023: the .exe lives as a tray icon, not as a console."""
+    assert spec_namespace["exe"].kwargs["console"] is False
+
+
+def test_pystrays_windows_backend_is_a_hidden_import(spec_namespace):
+    """pystray chooses its backend inside a function at import time; without
+    the backend the console-less .exe would start with no icon at all."""
+    hidden = set(_analysis(spec_namespace)["hiddenimports"])
+    assert {"pystray._win32", "pystray._util.win32"} <= hidden
+
+
+def test_pillow_is_not_excluded_any_more(spec_namespace):
+    """The tray icon's image is drawn with Pillow (#214)."""
+    excludes = set(_analysis(spec_namespace)["excludes"])
+    assert not {"PIL", "Pillow", "pystray"} & excludes
+
+
 def test_nothing_is_both_bundled_and_excluded(spec_namespace):
     analysis = _analysis(spec_namespace)
     hidden_tops = {m.split(".")[0] for m in analysis["hiddenimports"]}

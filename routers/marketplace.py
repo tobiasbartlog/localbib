@@ -63,47 +63,33 @@ _MEDIA_TYPES = {
 
 
 def _installed_by_id() -> dict[str, dict]:
-    """id -> what ``services.marketplace`` needs of the installed state, for
-    every Add-on the core finds on disk — Bundles and Dev-Suchpfade alike,
+    """id -> the installed state ``services.marketplace`` builds the card from,
+    for every Add-on the core finds on disk — Bundles and Dev-Suchpfade alike,
     whether currently loaded or not (an inactive or errored Add-on is still
-    "installed" from the Marketplace's point of view)."""
+    "installed" from the Marketplace's point of view).
+
+    The whole ``plugin_loader.describe_one`` row, never a field-by-field copy:
+    a copy silently dropped ``dev_shadow_disabled`` (ADD-1), and every new
+    field of the row would have to be remembered here too."""
     doc = Config.plugins_document()
     found = plugin_loader.catalog(doc)
-    out: dict[str, dict] = {}
-    for addon_id, candidate in found.items():
-        described = plugin_loader.describe_one(addon_id, candidate, doc)
-        out[addon_id] = {
-            "version": described["version"],
-            "source": described["source"],
-            "dev_origin": described["dev_origin"],
-            "state": described["state"],
-            "name": described["name"],
-            "tagline": described["tagline"],
-            "permissions": described["permissions"],
-            "enabled": described["enabled"],
-            "missing_consent": described["missing_consent"],
-            "needs_confirmation": described["needs_confirmation"],
-            "origin": described["origin"],
-            "sha256": described["sha256"],
-            "error": described["error"],
-            "previous_version": described["previous_version"],
-            "rollback_available": described["rollback_available"],
-            "pending_update": described["pending_update"],
-            "pending_removal": described["pending_removal"],
-        }
-    return out
+    return {addon_id: plugin_loader.describe_one(addon_id, candidate, doc) for addon_id, candidate in found.items()}
 
 
 @router.get("/api/marketplace")
-async def get_marketplace():
+async def get_marketplace(refresh: bool = True):
     """The merged Marketplace view: one card per Add-on, index entries first,
     Dev-Suchpfad-only Add-ons appended. Opening the Marketplace always tries
     the network first (``force=True``, #199) — a freshly published Add-on
     must show up now, not after the once-a-day window ``refresh_if_stale``
     uses for the version-check piggyback. Never fails on a dead network — it
     degrades to the disk cache (``offline: true``) or, without one yet, to an
-    empty list (``has_index: false``) so the page always has something to say."""
-    entry, offline = marketplace_client.fetch(force=True)
+    empty list (``has_index: false``) so the page always has something to say.
+
+    ``refresh=false`` serves a cache younger than a day without a request —
+    the Settings frame (#207) lists the installed Add-ons from this same view
+    and must not make every visit to Settings a round-trip to GitHub."""
+    entry, offline = marketplace_client.fetch(force=refresh)
     index = entry["index"] if entry else None
     addons = (index or {}).get("addons") or []
     facts = plugin_loader.core_facts()
@@ -219,14 +205,25 @@ async def _record_install(addon_id: str, version: str, *, trust: str, origin: st
     return {"addon": addon, "consent": consent, "update": update}
 
 
-def _place(staged, manifest) -> None:
-    """Move the Bundle into place. If it replaces the kept predecessor's
-    folder, that folder's Herkunft is forgotten first and persisted, so
-    whatever interrupts the install before ``_record_install`` leaves an
-    unknown predecessor (no rollback target), never stale consent."""
-    doc = Config.plugins_document()
-    if addon_lifecycle.record_placed(doc, manifest.id, manifest.version, None):
-        settings_store.save_plugins_document(doc)
+def _place(staged, manifest, source: dict) -> None:
+    """Move the Bundle (Herkunft ``source``, ``{origin, sha256}``) into place.
+
+    Write-ahead (ADD-7, ``addon_lifecycle.record_placing``): before anything
+    moves, the document records what an interrupted install must leave behind
+    — an unknown predecessor, and for a file its own Herkunft on every folder
+    the core could load — so a failed save in ``_record_install`` never lets
+    the new code run on a consent given for the old. Skipped when the move is
+    refused anyway (the running version's own folder): a refused install
+    relabels nothing."""
+    target = addon_installer.target_of(manifest)
+    loaded = plugin_loader.loaded_addons().get(manifest.id)
+    if loaded is None or Path(loaded[0]).resolve() != target.resolve():
+        doc = Config.plugins_document()
+        current = ((doc.get("plugins") or {}).get(manifest.id) or {}).get("version") or ""
+        if addon_lifecycle.record_placing(doc, manifest.id, manifest.version, source,
+                                          permissions=[p.value for p in manifest.permissions],
+                                          current_on_disk=bool(current) and (target.parent / current).is_dir()):
+            settings_store.save_plugins_document(doc)
     addon_installer.place(staged, manifest)
 
 
@@ -278,7 +275,7 @@ async def _install_events(addon_id: str, version: str, artifact: dict, limit: in
         problem = addon_install.check_identity(manifest.id, manifest.version, addon_id, version)
         if problem is not None:
             raise problem
-        _place(work / "bundle", manifest)
+        _place(work / "bundle", manifest, {"origin": plugins_config.ORIGIN_INDEX, "sha256": ""})
         yield _sse({"type": "progress", "step": "activate"})
         payload = await _record_install(addon_id, manifest.version, trust=trust, origin="index",
                                         permissions=[p.value for p in manifest.permissions])
@@ -303,7 +300,7 @@ async def install_from_file(file: UploadFile = File(...)):
         zip_path = work / "bundle.zip"
         sha256, _size = addon_installer.save_stream(file.file, zip_path, limit=addon_install.MAX_BUNDLE_BYTES)
         manifest = addon_installer.extract(zip_path, work / "bundle")
-        _place(work / "bundle", manifest)
+        _place(work / "bundle", manifest, {"origin": plugins_config.ORIGIN_FILE, "sha256": sha256})
         return await _record_install(manifest.id, manifest.version, trust="third-party",
                                      origin="file", sha256=sha256,
                                      permissions=[p.value for p in manifest.permissions])

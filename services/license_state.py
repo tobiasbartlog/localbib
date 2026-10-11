@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Laenge der Testphase in Tagen (PRD #138). Eine Zahl, ein Ort.
 TRIAL_DAYS = 14
@@ -128,7 +128,7 @@ def derive(
     hier die einzige vertretbare Richtung: ein verlorener Zeitstempel darf
     niemanden aus seiner eigenen Bibliothek aussperren.
     """
-    now = now or datetime.utcnow()
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     legacy = bool(legacy_supporter) and not activated
 
     # Aktiviert oder aus dem Quellcode gestartet: keine Testphase, kein Gate.

@@ -124,14 +124,14 @@ async def bulk_extract_references(payload: Optional[BulkExtractRequest] = Body(N
             yield _sse({"type": "complete", "processed": 0, "total_references": 0, "total_in_library": 0, "results": []})
             return
 
-        yield _sse({"type": "progress", "step": "start", "message": f"{total_papers} Paper zu verarbeiten", "percent": 0, "current_paper": 0, "total_papers": total_papers})
+        yield _sse({"type": "progress", "step": "start", "message": {"code": "refs.step.bulkStart", "params": {"count": total_papers}}, "percent": 0, "current_paper": 0, "total_papers": total_papers})
 
         results = []
         for idx, paper in enumerate(candidates):
-            paper_title = (paper.get("title") or "Unbekannt")[:60]
+            paper_title = (paper.get("title") or "")[:60]
             base_pct = int((idx / total_papers) * 100)
 
-            yield _sse({"type": "progress", "step": "paper_start", "message": f"Paper {idx+1}/{total_papers}: {paper_title}", "percent": base_pct, "current_paper": idx + 1, "total_papers": total_papers, "paper_title": paper_title})
+            yield _sse({"type": "progress", "step": "paper_start", "message": {"code": "refs.step.bulkItem", "params": {"current": idx + 1, "total": total_papers, "title": paper_title}}, "percent": base_pct, "current_paper": idx + 1, "total_papers": total_papers, "paper_title": paper_title})
 
             try:
                 filename = paper.get("filename", "")
@@ -148,7 +148,7 @@ async def bulk_extract_references(payload: Optional[BulkExtractRequest] = Body(N
                     yield _sse({"type": "paper_result", "paper_id": paper["id"], "title": paper_title, "status": "no_text"})
                     continue
 
-                yield _sse({"type": "progress", "step": "find_refs", "message": f"Literaturverzeichnis suchen: {paper_title}", "percent": base_pct + 5, "current_paper": idx + 1, "total_papers": total_papers})
+                yield _sse({"type": "progress", "step": "find_refs", "message": {"code": "refs.step.bulkFindSection", "params": {"title": paper_title}}, "percent": base_pct + 5, "current_paper": idx + 1, "total_papers": total_papers})
 
                 ref_text = _ref_svc.find_reference_section(pages)
                 if not ref_text or len(ref_text.strip()) < 50:
@@ -156,7 +156,7 @@ async def bulk_extract_references(payload: Optional[BulkExtractRequest] = Body(N
                     yield _sse({"type": "paper_result", "paper_id": paper["id"], "title": paper_title, "status": "no_ref_section"})
                     continue
 
-                yield _sse({"type": "progress", "step": "llm", "message": f"KI-Extraktion: {paper_title}", "percent": base_pct + 10, "current_paper": idx + 1, "total_papers": total_papers})
+                yield _sse({"type": "progress", "step": "llm", "message": {"code": "refs.step.bulkLlm", "params": {"title": paper_title}}, "percent": base_pct + 10, "current_paper": idx + 1, "total_papers": total_papers})
 
                 extracted_refs = _ref_svc.llm_extract_references(ref_text)
                 if not extracted_refs:
@@ -164,7 +164,7 @@ async def bulk_extract_references(payload: Optional[BulkExtractRequest] = Body(N
                     yield _sse({"type": "paper_result", "paper_id": paper["id"], "title": paper_title, "status": "no_refs_extracted"})
                     continue
 
-                yield _sse({"type": "progress", "step": "matching", "message": f"DOI-Lookup fuer {len(extracted_refs)} Refs: {paper_title}", "percent": base_pct + 20, "current_paper": idx + 1, "total_papers": total_papers})
+                yield _sse({"type": "progress", "step": "matching", "message": {"code": "refs.step.bulkDoiLookup", "params": {"count": len(extracted_refs), "title": paper_title}}, "percent": base_pct + 20, "current_paper": idx + 1, "total_papers": total_papers})
 
                 # Speichern
                 conn2 = _get_conn()
@@ -266,7 +266,7 @@ async def extract_references(paper_id: int, force: bool = Query(False)):
             return
 
         if existing_count > 0 and force:
-            yield _sse({"type": "progress", "step": "cleanup", "message": "Alte Referenzen werden geloescht...", "percent": 5})
+            yield _sse({"type": "progress", "step": "cleanup", "message": "refs.step.cleanup", "percent": 5})
             c2 = _get_conn()
             try:
                 c2.execute("DELETE FROM paper_references WHERE source_paper_id = ?", (paper_id,))
@@ -275,25 +275,25 @@ async def extract_references(paper_id: int, force: bool = Query(False)):
                 c2.close()
 
         # 1. PDF lesen
-        yield _sse({"type": "progress", "step": "pdf", "message": "PDF wird gelesen...", "percent": 10})
+        yield _sse({"type": "progress", "step": "pdf", "message": "refs.step.readPdf", "percent": 10})
         pages = _ref_svc.extract_all_pdf_pages(filepath)
         if not pages:
-            yield _sse({"type": "error", "message": "Kein Text aus PDF extrahierbar"})
+            yield _sse({"type": "error", "message": "refs.error.noText"})
             return
-        yield _sse({"type": "progress", "step": "pdf", "message": f"{len(pages)} Seiten extrahiert", "percent": 20})
+        yield _sse({"type": "progress", "step": "pdf", "message": {"code": "refs.step.pagesRead", "params": {"count": len(pages)}}, "percent": 20})
 
         # 2. Referenz-Abschnitt finden
-        yield _sse({"type": "progress", "step": "find_refs", "message": "Literaturverzeichnis wird gesucht...", "percent": 25})
+        yield _sse({"type": "progress", "step": "find_refs", "message": "refs.step.findSection", "percent": 25})
         ref_text = _ref_svc.find_reference_section(pages)
         if not ref_text or len(ref_text.strip()) < 50:
-            yield _sse({"type": "error", "message": "Kein Literaturverzeichnis gefunden"})
+            yield _sse({"type": "error", "message": "refs.error.noSection"})
             return
-        yield _sse({"type": "progress", "step": "find_refs", "message": f"Literaturverzeichnis gefunden ({len(ref_text)} Zeichen)", "percent": 30})
+        yield _sse({"type": "progress", "step": "find_refs", "message": {"code": "refs.step.sectionFound", "params": {"count": len(ref_text)}}, "percent": 30})
 
         # 3. LLM-Extraktion — chunk-weise, damit der Fortschritt sichtbar ist.
         #    Chunking liegt im Router (Service bleibt pure, ADR-0006); die
         #    LLM-Phase belegt den Prozentbereich 35..60.
-        yield _sse({"type": "progress", "step": "llm", "message": "KI extrahiert Referenzen... (kann 1-3 Min dauern)", "percent": 35})
+        yield _sse({"type": "progress", "step": "llm", "message": "refs.step.llm", "percent": 35})
         chunks = _ref_svc.split_reference_text(ref_text)
         total_chunks = len(chunks)
         extracted_refs: list[dict] = []
@@ -305,13 +305,13 @@ async def extract_references(paper_id: int, force: bool = Query(False)):
             extracted_refs.extend(chunk_refs)
             pct = 35 + int((ci / total_chunks) * 25)  # 35 -> 60
             yield _sse({"type": "progress", "step": "llm",
-                        "message": f"KI liest Referenzen... Abschnitt {ci}/{total_chunks} ({len(extracted_refs)} gefunden)",
+                        "message": {"code": "refs.step.llmChunk", "params": {"current": ci, "total": total_chunks, "found": len(extracted_refs)}},
                         "percent": pct, "current": ci, "total": total_chunks,
                         "found": len(extracted_refs)})
         if not extracted_refs:
-            yield _sse({"type": "error", "message": "KI konnte keine Referenzen extrahieren"})
+            yield _sse({"type": "error", "message": "refs.error.noneExtracted"})
             return
-        yield _sse({"type": "progress", "step": "llm", "message": f"{len(extracted_refs)} Referenzen extrahiert", "percent": 60})
+        yield _sse({"type": "progress", "step": "llm", "message": {"code": "refs.step.extracted", "params": {"count": len(extracted_refs)}}, "percent": 60})
 
         # 4. DOI-Lookup (parallel) & Library-Matching
         total = len(extracted_refs)
@@ -324,7 +324,7 @@ async def extract_references(paper_id: int, force: bool = Query(False)):
         found_dois: dict[int, str] = {}
         if lookup_indices:
             yield _sse({"type": "progress", "step": "matching",
-                        "message": f"DOI-Suche fuer {len(lookup_indices)} Referenzen...",
+                        "message": {"code": "refs.step.doiSearch", "params": {"count": len(lookup_indices)}},
                         "percent": 60})
             loop = asyncio.get_running_loop()
 
@@ -346,12 +346,12 @@ async def extract_references(paper_id: int, force: bool = Query(False)):
                     short_title = title[:57] + "..." if len(title) > 60 else title
                     pct = 60 + int((done / len(tasks)) * 33)
                     yield _sse({"type": "progress", "step": "matching",
-                                "message": f"DOI-Suche {done}/{len(tasks)}: {short_title}",
+                                "message": {"code": "refs.step.doiSearchItem", "params": {"current": done, "total": len(tasks), "title": short_title}},
                                 "percent": pct, "current": done, "total": len(tasks),
                                 "found": len(found_dois)})
 
         yield _sse({"type": "progress", "step": "matching",
-                    "message": "Referenzen werden mit Bibliothek abgeglichen...", "percent": 95})
+                    "message": "refs.step.matching", "percent": 95})
         conn2 = _get_conn()
         try:
             saved_refs = []

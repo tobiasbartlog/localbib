@@ -146,7 +146,7 @@ cp .env.template .env     # Linux/Mac
 LocalBib deliberately ships **no** LLM provider and **no** API key — you bring
 your own, from a provider of your choice. The first-run onboarding asks for it;
 you can skip that (the app stays usable, only the LLM features stay off) and
-set it up later under **Settings → LLM**. There you keep any number of
+set it up later under **Settings → AI models**. There you keep any number of
 *connections* (a provider account or a local endpoint, key optional) and bind
 the three *roles* — Reasoning, Simple tasks, Embedding — each to a connection
 and a model. Roles are independent: reasoning can run on OpenAI while
@@ -171,7 +171,7 @@ CrossRef/OpenAlex "polite pool" (better rate limits). Leaving it empty means no
 address is sent; no substitute is slipped in.
 
 The interface language lives in `UI_LANGUAGE` (`en` or `de`, default `en`) and
-can also be switched at any time under Settings → Appearance.
+can also be switched at any time under Settings → General.
 
 ### Start the web UI
 
@@ -322,10 +322,10 @@ LOCALBIB_PLUGIN_DEV_PATHS=path/to/my-addon
 ```
 
 Without a Dev-Suchpfad the core starts without that Add-on, silently. With it,
-the Add-on shows up under Settings -> Add-ons; switching it on asks for consent
-to the Berechtigungen its Manifest declares, and its settings (folders, keys)
-are edited there too. Its API lives under `/api/plugins/<id>/`, its data in the
-Add-on's own folder.
+the Add-on shows up in the Marketplace; switching it on asks for consent to the
+Berechtigungen its Manifest declares. Once it runs, its settings (folders, keys)
+are edited on its own page under Settings -> Add-ons. Its API lives under
+`/api/plugins/<id>/`, its data in the Add-on's own folder.
 
 An Add-on's own checks run without the core:
 

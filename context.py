@@ -40,9 +40,9 @@ def safe_pdf_path(filename: str) -> str:
     real_path = os.path.realpath(filepath)
     real_all = os.path.realpath(Config.ALL_DIR)
     if not real_path.startswith(real_all):
-        raise HTTPException(status_code=404, detail="Datei nicht gefunden")
+        raise HTTPException(status_code=404, detail="error.pdf_file_not_found")
     if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="PDF-Datei nicht auf der Festplatte gefunden")
+        raise HTTPException(status_code=404, detail="error.pdf_not_on_disk")
     return filepath
 
 

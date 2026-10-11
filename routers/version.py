@@ -7,6 +7,11 @@ Serves
 * ``POST /api/update/install`` — the one-click update (#148): download the
   release's installer, verify it, launch it silently, and exit so the installer
   can replace the installation and relaunch the app;
+* ``GET /api/system/info`` and ``POST /api/system/open-folder`` (#211) - the
+  installation's facts and opening its three named folders;
+* ``GET``/``PUT /api/system/autostart`` (#214) - "Start with Windows", read
+  from and written to the HKCU Run entry (``autostart.py``); only the Windows
+  .exe offers it, elsewhere ``PUT`` answers 409 ``error.autostart_unavailable``;
 * ``POST /api/app/restart`` — restart the frozen app in place (#193, after an
   Add-on update or removal); ``error.restart_unavailable`` from source.
 
@@ -33,11 +38,17 @@ from pathlib import Path
 
 import requests as http_requests
 
+from typing import Callable, Optional
+
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
 
+import autostart
 import marketplace_client
+from config import Config
+from logging_setup import log_dir_for
 from plugin_api import API_VERSION
 from services import addon_catalog, update_offer
 
@@ -132,7 +143,7 @@ def _current_offer(use_cache: bool = True) -> update_offer.UpdateOffer:
 
 
 @router.get("/api/version-check")
-async def check_version() -> dict:
+def check_version() -> dict:
     """Poll GitHub Releases, compare to APP_VERSION, return update availability.
 
     Cached for 1 hour. Never raises — network failures degrade silently to
@@ -180,6 +191,14 @@ INSTALLER_SILENT_ARGS = ["/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
 EXIT_DELAY_SECONDS = 1.0
 
 
+class _DownloadRefused(Exception):
+    """A download we refuse ourselves; ``code`` is the catalog key."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 def _download_installer(url: str) -> Path:
     """Download ``url`` into a temp file and return its path. Raises on failure."""
     tmp_dir = Path(tempfile.mkdtemp(prefix="localbib-update-"))
@@ -194,10 +213,10 @@ def _download_installer(url: str) -> Path:
                     continue
                 written += len(chunk)
                 if written > MAX_INSTALLER_BYTES:
-                    raise ValueError("Installer ist unerwartet gross")
+                    raise _DownloadRefused("error.installer_too_large")
                 fh.write(chunk)
     if declared and written != declared:
-        raise ValueError("Download unvollstaendig")
+        raise _DownloadRefused("error.installer_incomplete")
     return target
 
 
@@ -225,6 +244,27 @@ def _launch_installer(path: Path) -> None:
     )
 
 
+#: Run right before the process leaves on its own (#214). The .exe's starter
+#: registers the removal of its tray icon here: ``os._exit`` skips every
+#: cleanup, and an icon nobody removes stays in the notification area until
+#: the mouse passes over it.
+_exit_hooks: list[Callable[[], None]] = []
+
+
+def add_exit_hook(hook: Callable[[], None]) -> None:
+    _exit_hooks.append(hook)
+
+
+def run_exit_hooks() -> None:
+    """Each hook once, a failing one never keeps the process alive."""
+    while _exit_hooks:
+        hook = _exit_hooks.pop()
+        try:
+            hook()
+        except Exception:  # noqa: BLE001 - leaving anyway
+            pass
+
+
 def _exit_app() -> None:
     """Leave immediately so the installer can overwrite the installation.
 
@@ -233,6 +273,7 @@ def _exit_app() -> None:
     must not happen here. Nothing in this path holds an open DB transaction —
     the update endpoint writes nothing.
     """
+    run_exit_hooks()
     os._exit(0)
 
 
@@ -242,7 +283,7 @@ async def _shutdown_after_grace() -> None:
 
 
 @router.post("/api/update/install")
-async def install_update() -> JSONResponse:
+def install_update() -> JSONResponse:
     """Download the new installer, launch it silently, and exit.
 
     Failure paths never exit the app and always name the release page, so the
@@ -265,6 +306,8 @@ async def install_update() -> JSONResponse:
 
     try:
         installer = _download_installer(offer.installer_url)
+    except _DownloadRefused as exc:
+        raise HTTPException(status_code=502, detail=exc.code)
     except Exception as exc:  # noqa: BLE001 - every failure reads the same to the user
         raise HTTPException(
             status_code=502,
@@ -292,10 +335,8 @@ async def install_update() -> JSONResponse:
             "status": "installing",
             "version": offer.latest,
             "release_url": offer.release_url,
-            "message": (
-                "Update wird installiert — LocalBib beendet sich jetzt und "
-                "startet danach automatisch neu."
-            ),
+            # A code: the SPA says it in the UI language (SET-B3).
+            "message": "update.installing",
         },
         background=BackgroundTask(_shutdown_after_grace),
     )
@@ -345,3 +386,114 @@ async def restart_app() -> JSONResponse:
         raise HTTPException(status_code=500, detail={
             "code": "error.restart_failed", "params": {"message": str(exc)[:300]}})
     return JSONResponse({"status": "restarting"}, background=BackgroundTask(_shutdown_after_grace))
+
+
+# ---------------------------------------------------------------------------
+# System info + open a named folder (#211)
+# ---------------------------------------------------------------------------
+
+FOLDER_NAMES = ("library", "settings", "logs", "backups")
+
+
+def _settings_dir() -> str:
+    return os.path.dirname(Config.ENV_PATH)
+
+
+def folder_paths() -> dict[str, str]:
+    """Name -> absolute path. The only map ``open-folder`` ever resolves from.
+    ``backups`` is the user's backup folder, empty while none is chosen."""
+    return {
+        "library": Config.BASE_DIR,
+        "settings": _settings_dir(),
+        "logs": log_dir_for(_settings_dir()),
+        "backups": Config.backup_dir(),
+    }
+
+
+def _open_in_file_manager(path: str) -> None:
+    """Open ``path`` with the system default. Patched in tests."""
+    if sys.platform == "win32":
+        os.startfile(path)  # noqa: S606 - fixed, server-resolved folder
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
+
+#: What ``/api/system/info`` answers as ``app``: the .exe's starter asks the
+#: port it wants for this, to tell a running LocalBib from a foreign program.
+APP_ID = "LocalBib"
+
+
+@router.get("/api/system/info")
+async def system_info() -> dict:
+    return {
+        "app": APP_ID,
+        "version": APP_VERSION,
+        "is_frozen": _running_frozen(),
+        "folders": folder_paths(),
+        "autostart_available": _autostart_available(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Start with Windows (#214, ADR-0023). The HKCU Run entry is the truth; this
+# router only reads and writes it through autostart.py, nothing is cached.
+# ---------------------------------------------------------------------------
+
+def _autostart_available() -> bool:
+    """The Windows .exe only. One switch, so tests can flip exactly one."""
+    return autostart.available(_running_frozen(), sys.platform)
+
+
+def _autostart_registry() -> autostart.Registry:
+    """The user's registry. Replaced by a fake in tests."""
+    return autostart.WinRegistry()
+
+
+@router.get("/api/system/autostart")
+async def get_autostart() -> dict:
+    if not _autostart_available():
+        return {"available": False, "enabled": False}
+    try:
+        enabled = autostart.is_enabled(_autostart_registry())
+    except OSError:
+        enabled = False
+    return {"available": True, "enabled": enabled}
+
+
+class AutostartBody(BaseModel):
+    enabled: bool
+
+
+@router.put("/api/system/autostart")
+async def put_autostart(body: AutostartBody) -> dict:
+    if not _autostart_available():
+        raise HTTPException(status_code=409, detail={"code": "error.autostart_unavailable"})
+    try:
+        enabled = autostart.set_enabled(_autostart_registry(), body.enabled, sys.executable)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail={
+            "code": "error.autostart_failed", "params": {"message": str(exc)[:300]}})
+    return {"available": True, "enabled": enabled}
+
+
+class OpenFolderBody(BaseModel):
+    folder: Optional[str] = None
+
+
+@router.post("/api/system/open-folder")
+async def open_folder(body: OpenFolderBody) -> dict:
+    paths = folder_paths()
+    name = body.folder
+    if name not in FOLDER_NAMES:
+        raise HTTPException(status_code=400, detail="error.unknown_folder")
+    path = paths[name]
+    if not path or not os.path.isdir(path):
+        raise HTTPException(status_code=404, detail="error.folder_missing")
+    try:
+        _open_in_file_manager(path)
+    except Exception as exc:  # noqa: BLE001 - say why, the app keeps running
+        raise HTTPException(status_code=500, detail={
+            "code": "error.folder_open_failed", "params": {"message": str(exc)[:300]}})
+    return {"status": "opened", "folder": name}

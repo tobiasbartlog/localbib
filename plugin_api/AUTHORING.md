@@ -87,7 +87,7 @@ below. Required fields: `id`, `name`, `version`, `author`, `license`,
 | `min_core` | Semver floor on the LocalBib core version (checked only in the packaged app, which carries a version; a source checkout has none). |
 | `python` | `"any"` for a pure Bundle, otherwise a CPython build tag. |
 | `permissions` | A subset of the seven Berechtigungen — see below. |
-| `settings` | Fields the core renders generically in your Marketplace settings section: `{key, type (string\|secret\|path\|bool), label (locale key), default}`. `secret` is shown, never returned, once saved — the same discipline as the core's own LLM keys. |
+| `settings` | Fields the core renders generically on your Add-on's page under Settings → Add-ons: `{key, type (string\|secret\|path\|bool), label (locale key), default}`. `secret` is shown, never returned, once saved — the same discipline as the core's own LLM keys. |
 | `frontend` | `{script, stylesheet?, assets?, locales}` — paths relative to the Bundle root, all under `frontend/`. |
 | `nav` | Optional sidebar entry: `{label (locale key), icon (inline SVG), route, view}`. |
 | `slots` | Which of the four Slots this Add-on contributes to (see below). |
@@ -100,13 +100,13 @@ new permission an update declares. The list is closed at seven:
 
 | Permission | Unlocks | Durchgesetzt (enforced) or erklärt (declared only) |
 |---|---|---|
-| `library.read` | `api.library` — read Items, abstracts, full texts | **Enforced**: `None` unless declared |
+| `library.read` | `api.library` — read Items, abstracts, full texts, Collections, change events | **Enforced**: `None` unless declared |
 | `library.write` | `api.library.create_by_doi(...)` — add Items to the library (needs `library.read` too, whose handle carries the method) | **Enforced**: the method raises `PermissionError` unless declared |
 | `llm` | `api.llm` — the user's configured LLM connections (costs them money) | **Enforced** |
 | `settings.core` | `api.settings.core()` — the polite mailto, the OpenAlex key, the UI language, the base folder | **Enforced** |
 | `network` | talking to external services on your own | Declared only — in-process code can always open a socket |
-| `files` | `api.files` — watch your own folders under the library | **Enforced** |
-| `storage` | `api.storage` — your own SQLite database (`api.storage.open_plugin_db(name)`) | **Enforced** |
+| `files` | nothing yet — reserved; `api.files` is always `None` | **Reserved**: declaring it is valid, it grants nothing |
+| `storage` | nothing yet — reserved; `api.storage` is always `None` | **Reserved**: declaring it is valid, it grants nothing |
 
 "Enforced" means the core hands over the matching `PluginApi` attribute (see
 `plugin_api.GATED_SERVICES`) only when you declared the permission; otherwise
@@ -118,7 +118,11 @@ the user, not a sandbox. Enforcement covers the Python contract; your
 frontend runs in the app's page and reaches the stable REST endpoints below
 either way, so declare `library.write` also when only your frontend adds
 Items. Ask for only what you use: `localbib-addon-template`'s
-`template/__init__.py` shows the pattern (`if api.storage is not None: ...`).
+`template/__init__.py` shows the pattern (`if api.library is not None: ...`).
+"Reserved" (`files`, `storage`) means the name is part of the closed list
+and declaring it keeps your Manifest valid, but the core has no service
+behind it yet: the attribute is always `None`. Keep your own data in your
+own files under a folder setting (a `path` setting in your Manifest).
 
 `create_by_doi(doi, *, title="", authors=None, year=None, journal="",
 abstract="")` is the same intake as `POST /api/papers/by-doi`: an Item with
@@ -130,6 +134,52 @@ returns `{doi, created, paper_id, citekey, pdf}` (`pdf` is `fetched` or
 call it from a sync route or a worker thread. In tests,
 `plugin_api.testing.InMemoryLibrary` implements it without the network and
 `make_api` applies the same gate.
+
+## The library: methods
+
+Everything on `api.library` except `create_by_doi` reads and needs only
+`library.read`. Items are addressed by their stored Cite Key.
+
+| Method | Returns |
+|---|---|
+| `get_reference(citekey)` | `{citekey, id, title, authors, year, journal, doi, abstract, has_pdf, volume, issue, pages}` or `None` — `id` is the Item id (core route `/paper/{id}`), `has_pdf` says whether its PDF is in the library, `volume`/`issue`/`pages` are `None` when the Item's metadata does not know them (since 2.3) |
+| `search_references(query, limit=20)` | a list of those dicts (semantic ranking when the user has embeddings, lexical otherwise) |
+| `get_abstract(citekey)` / `get_full_text(citekey)` | a string or `None` — many Items have no extractable text; degrade to the abstract |
+| `export_bibtex()` | the whole library as one `.bib` string |
+| `list_collections()` | every Collection — active, archived **and deleted** — by name (since 2.1) |
+| `get_collection(collection_id)` | one Collection or `None` (since 2.1) |
+| `get_collection_refs(collection_id)` | its Items as Cite Keys, oldest addition first; `[]` for an unknown id (since 2.1) |
+| `export_collection_bibtex(collection_id)` | its Items as one `.bib` string, keyed by the same Cite Keys (since 2.1) |
+| `on_change(callback)` | subscribes to change events; returns the unsubscriber |
+
+A **Collection** is a hand-curated list of Items, shaped
+`{id, name, description, archived, archived_at, deleted, deleted_at,
+created_at, updated_at, item_count}` (timestamps `YYYY-MM-DD HH:MM:SS`,
+UTC). When the user deletes one, the core keeps a *tombstone*: it vanishes
+from every list the user sees, but these methods still return it with
+`deleted: true` and its last membership frozen — so an Add-on that was off at
+the time can still pick up the final state. Guard the Collection methods with
+`getattr(api.library, "list_collections", None)` if you support hosts older
+than contract 2.1.
+
+**Change events** arrive as plain dicts; ignore any `type` you do not know.
+A Collection event is
+
+```python
+{"type": "collection", "action": "created" | "renamed" | "updated" | "archived"
+ | "restored" | "deleted" | "members_changed", "collection_id": 42}
+```
+
+(`updated` = description changed; `members_changed` also fires when a deleted
+Item leaves a Collection). An event says *that* something changed, not what
+it changed to — read the state back. Callbacks run on the core's writing
+thread right after its commit: keep them quick (record, schedule, debounce),
+expect bursts during an import, and unsubscribe in `deactivate()` (the core
+also drops a forgotten subscription when it unloads the Add-on). In tests,
+`InMemoryLibrary(collections=[...])` holds Collections with the same
+semantics, and its `add_collection`, `rename_collection`,
+`set_collection_description`, `archive_collection`, `delete_collection`,
+`set_collection_refs` and `emit_collection` fire the same events.
 
 ## Registration and Slots
 
@@ -166,15 +216,34 @@ working example of a view and an `item-detail-aside` Slot.
 
 The Add-on Contract guarantees these core REST endpoints for a frontend to
 call directly (`window.LocalBib.api(...)`), in the categories fixed by
-ADR-0021 — anything else may change release to release without notice:
+ADR-0021, and these app routes for a view to send the user to
+(`this.$router.push(...)` or `<router-link>`) — anything else may change
+release to release without notice:
 
 | Category | Endpoint |
 |---|---|
 | Item list | `GET /api/papers` |
-| Item by DOI | `POST /api/papers/by-doi`, `POST /api/papers/by-doi/batch`, `POST /api/papers/by-doi/exists` |
+| Item by DOI | `POST /api/papers/by-doi`, `POST /api/papers/by-doi/batch` — creates; an Item with that DOI answers untouched (`created: false`) |
+| DOI existence check | `POST /api/papers/by-doi/exists` — `{dois: [...]}` → `{papers: {<DOI as sent>: <Item id> or null}}`; reads only |
 | BibTeX of an Item | `GET /api/papers/{id}/bibtex` |
 | OA-PDF fetch | `POST /api/papers/{id}/fetch-oa-pdf` |
 | Model list | `GET /api/llm/models` |
+| Item detail (route) | `/paper/{id}` — `id` is the Item id (`get_reference(...)["id"]`) |
+| Collection (route) | `/collection/{id}` |
+| Import with a DOI list (route) | `/import?dois=<doi>&dois=<doi>&collection=<id>` — both parameters optional; pass one `dois` per DOI (a resolver link or `doi:` in front is fine), `collection` preselects the target Collection if it is an active one |
+
+The import route creates nothing by itself: the page shows the DOIs, previews
+through the DOI existence check what is new and what the library already
+holds, and creates only when the user confirms. Sending the user there is
+how an Add-on hands over literature it found missing without adding Items
+itself — it needs no `library.write` for that.
+
+Pass each DOI as its own `dois` parameter: real DOIs contain commas and
+semicolons (Wiley's `…3.0.CO;2-L`), and the page splits one parameter at a
+comma or semicolon only where a new DOI starts. Only an active Collection is
+preselected; an archived, deleted or unknown `collection` falls back to "No
+collection", and the page tells the user so. A link without `collection`
+selects "No collection", even if the page was open with another one.
 
 One of the maintainer's own official Add-ons, predating this contract as the
 migration source for what used to be core-only features, also still relies
@@ -225,9 +294,11 @@ The core enforces these at load time (a violation fails activation, and
 - Locale keys: prefixed `<id>.` in every shipped language.
 - CSS classes: prefixed `<id>-` (a `localbib-addon check` warning, not an
   error — static analysis of a stylesheet cannot always tell).
-- Settings and storage: your `plugin.json`'s `settings` keys and
-  `api.storage.open_plugin_db(name)` databases live in your own namespace
-  automatically; you never see another Add-on's.
+- Settings: your `plugin.json`'s `settings` keys live in your own namespace
+  automatically; you never see another Add-on's. `api.settings.set(key,
+  value)` stores `str`, `bool` and `None` as they are, turns `int`/`float`
+  into `str`, and raises `TypeError` for anything else — the core and the
+  `plugin_api.testing` fake alike (`plugin_api.setting_value`).
 
 ## Dev-Suchpfad (development path)
 
@@ -268,8 +339,10 @@ Bundle loads.
 ## Testing without the core
 
 `plugin_api.testing` ships fakes for every gated service
-(`InMemoryLibrary`, `DummyLlm`, `InMemorySettings`, `NullFiles`,
-`TempSqliteStorage`) plus `make_api(permissions, ...)`, which assembles a
-`PluginApi` exactly the way the core does — a service whose permission is not
-declared is `None`, even if you pass one. See
+(`InMemoryLibrary`, `DummyLlm`, `InMemorySettings`) plus
+`make_api(permissions, ...)`, which assembles a `PluginApi` exactly the way
+the core does — a service whose permission is not declared is `None`, even if
+you pass one, and the reserved `files`/`storage` are always `None`.
+(`NullFiles` and `TempSqliteStorage` stay importable for your own unit tests
+of code that will use those services once they exist.) See
 `localbib-addon-template/tests/test_template_addon.py` for the pattern.

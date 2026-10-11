@@ -112,11 +112,15 @@ def format_authors(author_field: str) -> str:
     return "; ".join(names)
 
 
+# A DOI as people write it: a resolver link in front (any doi.org host, with
+# or without scheme, any case) or the `doi:` scheme, a sentence's full stop
+# behind. The SPA's DOI list (#227) mirrors this rule; the shared vectors in
+# tests/fixtures/doi_vectors.json pin both sides.
+_DOI_PREFIX_RE = re.compile(r"^(?:doi:\s*|(?:https?://)?(?:[a-z0-9-]+\.)*doi\.org/)", re.IGNORECASE)
+
+
 def normalize_doi(doi: str) -> str:
-    doi = (doi or "").strip()
-    if doi.startswith("http"):
-        doi = doi.split("doi.org/")[-1]
-    return doi.rstrip(".")
+    return _DOI_PREFIX_RE.sub("", (doi or "").strip()).rstrip(".")
 
 
 def _clean(value) -> str:

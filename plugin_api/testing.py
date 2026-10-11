@@ -24,10 +24,19 @@ import shutil
 import sqlite3
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence, Union
 
-from plugin_api import API_VERSION, CoreSettings, NavItem, Permission
+from plugin_api import (
+    API_VERSION,
+    COLLECTION_EVENT,
+    COLLECTION_EVENT_ACTIONS,
+    CoreSettings,
+    NavItem,
+    Permission,
+    setting_value,
+)
 from plugin_api.manifest import parse_permissions
 
 __all__ = [
@@ -58,6 +67,16 @@ class InMemoryLibrary:
     enrichment), each call recorded in ``created``. ``write_allowed`` mirrors
     ``library.write``: :func:`make_api` sets it from the declared permissions,
     and while it is False ``create_by_doi`` raises ``PermissionError``.
+
+    ``collections`` seeds Collections the way the core holds them: each dict
+    takes ``name`` and optionally ``id``, ``description``, ``refs`` (Cite
+    Keys), ``archived`` / ``archived_at``, ``deleted`` / ``deleted_at``,
+    ``created_at``, ``updated_at``. As in the core, a Collection only ever
+    holds Items of the library: a ref without a reference is dropped. The
+    test helpers :meth:`add_collection`, :meth:`rename_collection`,
+    :meth:`set_collection_description`, :meth:`archive_collection`,
+    :meth:`delete_collection` and :meth:`set_collection_refs` change them and
+    fire the same ``on_change`` events the core fires.
     """
 
     def __init__(
@@ -65,25 +84,42 @@ class InMemoryLibrary:
         references: Iterable[dict] = (),
         projects: Iterable[dict] = (),
         *,
+        collections: Iterable[dict] = (),
         write_allowed: bool = True,
         source: str = "addon",
     ) -> None:
         self._refs: dict[str, dict] = {r["citekey"]: dict(r) for r in references}
         self._projects = [dict(p) for p in projects]
+        self._collections: dict[int, dict] = {}
+        self._collection_ids = itertools.count(1)
+        for seed in collections:
+            self._store_collection(seed)
         self._listeners: list[Callable[[dict], None]] = []
         self.write_allowed = write_allowed
         self.source = source
         self.created: list[dict] = []
         self._ids = itertools.count(1)
 
+    def _reference_wire(self, ref: dict) -> dict:
+        """The core's answer shape (contract 2.3): a seeded reference keeps
+        what it has, missing keys get defaults — ``id`` stable per Cite Key,
+        ``has_pdf`` False, ``volume``/``issue``/``pages`` None."""
+        out = dict(ref)
+        if out.get("id") is None:
+            out["id"] = list(self._refs).index(ref["citekey"]) + 1
+        out.setdefault("has_pdf", False)
+        for key in ("volume", "issue", "pages"):
+            out.setdefault(key, None)
+        return out
+
     def get_reference(self, citekey: str) -> Optional[dict]:
         ref = self._refs.get(citekey)
-        return dict(ref) if ref is not None else None
+        return self._reference_wire(ref) if ref is not None else None
 
     def search_references(self, query: str, limit: int = 20) -> list[dict]:
         q = query.lower()
         hits = [
-            dict(r) for r in self._refs.values()
+            self._reference_wire(r) for r in self._refs.values()
             if q in " ".join(str(r.get(k, "")) for k in ("citekey", "title", "abstract")).lower()
         ]
         return hits[:limit]
@@ -95,13 +131,32 @@ class InMemoryLibrary:
         return self._refs.get(citekey, {}).get("full_text")
 
     def export_bibtex(self) -> str:
-        entries = []
-        for key, ref in self._refs.items():
-            fields = [f"  title = {{{ref.get('title', '')}}}"]
-            if ref.get("year"):
-                fields.append(f"  year = {{{ref['year']}}}")
-            entries.append("@article{" + key + ",\n" + ",\n".join(fields) + "\n}")
+        entries = [self._bib_entry(key, ref) for key, ref in self._refs.items()]
         return "\n\n".join(entries) + ("\n" if entries else "")
+
+    @staticmethod
+    def _bib_entry(key: str, ref: dict) -> str:
+        fields = [f"  title = {{{ref.get('title', '')}}}"]
+        if ref.get("year"):
+            fields.append(f"  year = {{{ref['year']}}}")
+        return "@article{" + key + ",\n" + ",\n".join(fields) + "\n}"
+
+    # --- Collections (contract 2.1) ----------------------------------------
+    def list_collections(self) -> list[dict]:
+        ordered = sorted(self._collections.values(), key=lambda c: (c["name"].casefold(), c["id"]))
+        return [self._collection_wire(c) for c in ordered]
+
+    def get_collection(self, collection_id: int) -> Optional[dict]:
+        found = self._collections.get(collection_id)
+        return self._collection_wire(found) if found else None
+
+    def get_collection_refs(self, collection_id: int) -> list[str]:
+        return list(self._live_refs(collection_id))
+
+    def export_collection_bibtex(self, collection_id: int) -> str:
+        # Like the core: one entry per Item, a lone newline when there is none.
+        keys = self._live_refs(collection_id)
+        return "\n\n".join(self._bib_entry(k, self._refs[k]) for k in keys) + "\n"
 
     def get_core_projects(self) -> list[dict]:
         return [dict(p) for p in self._projects]
@@ -150,6 +205,88 @@ class InMemoryLibrary:
         self._refs[reference["citekey"]] = dict(reference)
         self.emit({"type": "changed", "citekey": reference["citekey"]})
 
+    def add_collection(self, name: str, *, refs: Iterable[str] = (), description: str = "") -> int:
+        """Create a Collection (``created``, then ``members_changed`` when it
+        starts with Items); returns its id."""
+        stored = self._store_collection({"name": name, "description": description, "refs": list(refs)})
+        self.emit_collection("created", stored["id"])
+        if self._live_refs(stored["id"]):
+            self.emit_collection("members_changed", stored["id"])
+        return stored["id"]
+
+    def rename_collection(self, collection_id: int, name: str) -> None:
+        self._change(collection_id, "renamed", name=name)
+
+    def set_collection_description(self, collection_id: int, description: str) -> None:
+        self._change(collection_id, "updated", description=description)
+
+    def archive_collection(self, collection_id: int, archived: bool = True) -> None:
+        """Archive (``archived``) or restore (``restored``) a Collection."""
+        if archived:
+            self._change(collection_id, "archived", archived_at=_now())
+        else:
+            self._change(collection_id, "restored", archived_at=None)
+
+    def delete_collection(self, collection_id: int) -> None:
+        """Tombstone it: still readable here, membership frozen (``deleted``)."""
+        self._change(collection_id, "deleted", deleted_at=_now())
+
+    def set_collection_refs(self, collection_id: int, refs: Iterable[str]) -> None:
+        """Replace the membership (``members_changed``)."""
+        self._change(collection_id, "members_changed", refs=list(dict.fromkeys(refs)))
+
+    def emit_collection(self, action: str, collection_id: int) -> None:
+        """Fire one Collection event exactly as the core shapes it."""
+        if action not in COLLECTION_EVENT_ACTIONS:
+            raise ValueError(f"unknown collection action: {action!r}")
+        self.emit({"type": COLLECTION_EVENT, "action": action, "collection_id": collection_id})
+
+    def _store_collection(self, seed: dict) -> dict:
+        cid = seed.get("id")
+        if cid is None:
+            cid = next(self._collection_ids)
+            while cid in self._collections:
+                cid = next(self._collection_ids)
+        now = _now()
+        archived_at = seed.get("archived_at") or (now if seed.get("archived") else None)
+        deleted_at = seed.get("deleted_at") or (now if seed.get("deleted") else None)
+        stored = {
+            "id": int(cid),
+            "name": seed["name"],
+            "description": seed.get("description") or "",
+            "archived_at": archived_at,
+            "deleted_at": deleted_at,
+            "created_at": seed.get("created_at") or now,
+            "updated_at": seed.get("updated_at") or now,
+            "refs": list(dict.fromkeys(seed.get("refs") or [])),
+        }
+        self._collections[stored["id"]] = stored
+        return stored
+
+    def _change(self, collection_id: int, action: str, **values: Any) -> None:
+        stored = self._collections[collection_id]
+        stored.update(values)
+        stored["updated_at"] = _now()
+        self.emit_collection(action, collection_id)
+
+    def _live_refs(self, collection_id: int) -> list[str]:
+        stored = self._collections.get(collection_id)
+        return [k for k in stored["refs"] if k in self._refs] if stored else []
+
+    def _collection_wire(self, stored: dict) -> dict:
+        return {
+            "id": stored["id"],
+            "name": stored["name"],
+            "description": stored["description"],
+            "archived": stored["archived_at"] is not None,
+            "archived_at": stored["archived_at"],
+            "deleted": stored["deleted_at"] is not None,
+            "deleted_at": stored["deleted_at"],
+            "created_at": stored["created_at"],
+            "updated_at": stored["updated_at"],
+            "item_count": len(self._live_refs(stored["id"])),
+        }
+
     def emit(self, event: dict) -> None:
         for callback in list(self._listeners):
             callback(event)
@@ -157,6 +294,11 @@ class InMemoryLibrary:
     @property
     def listener_count(self) -> int:
         return len(self._listeners)
+
+
+def _now() -> str:
+    """A timestamp in the core's form (SQLite ``CURRENT_TIMESTAMP``, UTC)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # =============================================================================
@@ -230,14 +372,17 @@ class InMemorySettings:
     """
 
     def __init__(self, values: Optional[dict] = None, core_settings: Optional[CoreSettings] = None) -> None:
-        self.values: dict[str, Any] = dict(values or {})
+        # Seeds follow the same value rule as ``set`` (and the core's load).
+        self.values: dict[str, Any] = {k: setting_value(v) for k, v in (values or {}).items()}
         self._core = core_settings
 
     def get(self, key: str) -> Optional[Any]:
         return self.values.get(key)
 
     def set(self, key: str, value: Any) -> None:
-        self.values[key] = value
+        # The core's rule (ADD-4): str/bool/None as is, int/float as str,
+        # anything else TypeError.
+        self.values[key] = setting_value(value)
 
     def core(self) -> Optional[CoreSettings]:
         return self._core
@@ -367,8 +512,9 @@ def make_api(
 
     Services not unlocked by ``permissions`` are ``None`` even when passed —
     the same rule the core applies. A declared service you do not pass gets a
-    default fake (empty library, a ``DummyLlm`` answering ``""``, ``NullFiles``,
-    a ``TempSqliteStorage``). ``settings`` seeds the plugin's own keys;
+    default fake (empty library, a ``DummyLlm`` answering ``""``). ``files``
+    and ``storage`` are reserved Berechtigungen that grant nothing (2.2.0):
+    both attributes are always ``None``, like in the core, whatever you pass. ``settings`` seeds the plugin's own keys;
     ``core_settings`` (default :data:`DEFAULT_CORE_SETTINGS`) is visible
     through ``settings.core()`` only with ``settings.core`` declared. A
     library with a ``write_allowed`` attribute (``InMemoryLibrary``) gets it
@@ -392,8 +538,9 @@ def make_api(
         routes=registry,
         library=lib,
         llm=gate(Permission.LLM, llm, DummyLlm),
-        files=gate(Permission.FILES, files, NullFiles),
-        storage=gate(Permission.STORAGE, storage, TempSqliteStorage),
+        # Reserved: the core hands nothing over for these, so neither do we.
+        files=None,
+        storage=None,
         settings=InMemorySettings(settings, core),
         permissions=perms,
     )

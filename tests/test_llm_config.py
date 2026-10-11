@@ -17,7 +17,9 @@ import json
 import os
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
+import respx
 from fastapi.testclient import TestClient
 
 import llm_config
@@ -384,52 +386,58 @@ class TestConfigEndpoint:
 
 
 class TestModelsEndpoint:
-    def _ok(self, *ids):
-        resp = MagicMock(status_code=200)
-        resp.json.return_value = {"data": [{"id": i} for i in ids]}
-        return resp
+    """The model list goes through ``llm_client.fetch_model_list`` (httpx) —
+    the one path the Startup check and the Diagnosis share (#209) — so the
+    provider is faked with respx."""
 
-    def test_saved_connection_by_id_needs_no_key_in_the_request(self, stored, monkeypatch):
-        captured = {}
+    @staticmethod
+    def _ok(*ids):
+        return httpx.Response(200, json={"data": [{"id": i} for i in ids]})
 
-        def fake_get(url, **kw):
-            captured["url"], captured["headers"] = url, kw.get("headers")
-            return self._ok("gpt-4o", "gpt-4o-mini")
-
-        monkeypatch.setattr(llm_router.http_requests, "get", fake_get)
+    @respx.mock
+    def test_saved_connection_by_id_needs_no_key_in_the_request(self, stored):
+        route = respx.get("https://api.openai.com/v1/models").mock(
+            return_value=self._ok("gpt-4o", "gpt-4o-mini"))
         with TestClient(webapp.app) as c:
-            # The startup hook probes every bound connection; look only at
-            # the request this endpoint makes.
             llm_router._models_cache.clear()
-            captured.clear()
             data = c.post("/api/llm/models", json={"connection_id": "oai"}).json()
         assert data == {"models": ["gpt-4o", "gpt-4o-mini"], "error": None, "current": ""}
-        assert captured["url"] == "https://api.openai.com/v1/models"
-        assert captured["headers"]["Authorization"] == "Bearer sk-oai-1234"
+        assert route.call_count == 1
+        assert route.calls.last.request.headers["Authorization"] == "Bearer sk-oai-1234"
 
-    def test_unsaved_draft_is_probed_with_its_own_key(self, llm_env, monkeypatch):
-        captured = {}
-
-        def fake_get(url, **kw):
-            captured["url"], captured["headers"] = url, kw.get("headers")
-            return self._ok("llama3")
-
-        monkeypatch.setattr(llm_router.http_requests, "get", fake_get)
+    @respx.mock
+    def test_unsaved_draft_is_probed_with_its_own_key(self, llm_env):
+        route = respx.get("http://localhost:11434/v1/models").mock(return_value=self._ok("llama3"))
         with TestClient(webapp.app) as c:
             data = c.post("/api/llm/models", json={
                 "provider": "custom", "base_url": "http://localhost:11434/v1/", "api_key": "",
             }).json()
         assert data["models"] == ["llama3"]
-        assert captured["url"] == "http://localhost:11434/v1/models"
-        assert "Authorization" not in captured["headers"]
+        assert "Authorization" not in route.calls.last.request.headers
 
+    @respx.mock
+    def test_same_endpoint_with_another_key_is_probed_again(self, llm_env):
+        """The cache must not turn a mistyped key into a passing test (SET-B1)."""
+        def answer(request):
+            if request.headers.get("Authorization") == "Bearer good-key":
+                return self._ok("gpt-4o")
+            return httpx.Response(401, json={"error": "bad key"})
+
+        route = respx.get("https://api.openai.com/v1/models").mock(side_effect=answer)
+        with TestClient(webapp.app) as c:
+            good = c.post("/api/llm/models", json={"provider": "openai", "api_key": "good-key"}).json()
+            bad = c.post("/api/llm/models", json={"provider": "openai", "api_key": "wrong-key"}).json()
+            again = c.post("/api/llm/models", json={"provider": "openai", "api_key": "good-key"}).json()
+        assert good["models"] == ["gpt-4o"] and good["error"] is None
+        assert bad["models"] == []
+        assert bad["error"] == {"code": "error.llm.models.http", "params": {"status": 401}}
+        assert again["models"] == ["gpt-4o"]
+        assert route.call_count == 2  # good (network), bad (network), again (cached)
+
+    @respx.mock
     def test_failures_are_error_codes_not_500s(self, llm_env, monkeypatch):
-        import requests
-
-        def boom(*a, **k):
-            raise requests.exceptions.SSLError("CERTIFICATE_VERIFY_FAILED")
-
-        monkeypatch.setattr(llm_router.http_requests, "get", boom)
+        respx.get("https://api.openai.com/v1/models").mock(
+            side_effect=httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"))
         monkeypatch.setattr(llm_router.ca_trust, "configured_extra_ca", lambda: "C:/haus.pem")
         with TestClient(webapp.app) as c:
             data = c.post("/api/llm/models", json={"provider": "openai", "api_key": "k"}).json()
@@ -441,9 +449,20 @@ class TestModelsEndpoint:
             # Unknown saved id -> 404 with a code.
             assert c.post("/api/llm/models", json={"connection_id": "ghost"}).status_code == 404
 
-    def test_http_error_reports_status(self, llm_env, monkeypatch):
-        monkeypatch.setattr(llm_router.http_requests, "get",
-                            lambda *a, **k: MagicMock(status_code=401, text="unauthorized"))
+    @respx.mock
+    def test_timeout_and_connection_errors_have_their_own_codes(self, llm_env):
+        respx.get("https://api.openai.com/v1/models").mock(side_effect=httpx.ReadTimeout("slow"))
+        respx.get("http://localhost:11434/v1/models").mock(side_effect=httpx.ConnectError("refused"))
+        with TestClient(webapp.app) as c:
+            slow = c.post("/api/llm/models", json={"provider": "openai", "api_key": "k"}).json()
+            down = c.post("/api/llm/models", json={
+                "provider": "custom", "base_url": "http://localhost:11434/v1"}).json()
+        assert slow["error"]["code"] == "error.llm.models.timeout"
+        assert down["error"]["code"] == "error.llm.models.connection"
+
+    @respx.mock
+    def test_http_error_reports_status(self, llm_env):
+        respx.get("https://api.openai.com/v1/models").mock(return_value=httpx.Response(401, text="unauthorized"))
         with TestClient(webapp.app) as c:
             data = c.post("/api/llm/models", json={"provider": "openai", "api_key": "k"}).json()
         assert data["error"] == {"code": "error.llm.models.http", "params": {"status": 401}}

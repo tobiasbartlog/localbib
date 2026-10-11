@@ -6,7 +6,7 @@
 //
 // The SPA self-mounts on import and vitest isolates module graphs per file, so
 // both papers are visited through one boot by navigating the router.
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { installFetchMock, defaultRoutes, flush, findByText } from './helpers.js';
 
 const WITH_PDF = {
@@ -60,10 +60,16 @@ describe('paper detail layout', () => {
         expect(panel.parentElement).toBe(assembly);
         expect(content.contains(panel)).toBe(false);
 
-        // Viewer, and the filename plus "Open PDF" live in the panel header.
+        // Viewer (PDF.js through its adapter, #229), and the filename plus
+        // "Open PDF" live in the panel header.
         const frame = q('pdf-frame');
         expect(frame).toBeTruthy();
-        expect(frame.getAttribute('src')).toContain('/api/papers/71/pdf');
+        expect(frame.getAttribute('data-src')).toContain('/api/papers/71/pdf');
+        await vi.waitFor(() => {
+            if (!window.LB_PDF_VIEWER.log.opened.some((o) => o.url.startsWith('/api/papers/71/pdf'))) {
+                throw new Error('preview not opened');
+            }
+        });
         expect(panel.textContent).toContain('ritter-2026.pdf');
 
         const openBtn = findByText('button', 'Open PDF');

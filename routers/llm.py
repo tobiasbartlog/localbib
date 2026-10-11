@@ -6,11 +6,14 @@ Serves:
   GET  /api/llm/status          per-role readiness, for the SPA outside the settings
   POST /api/llm/models          a connection's model list (role, saved id or draft)
   POST /api/llm/suggest-models  reasoning + fast pick from one connection's list
+  GET  /api/llm/startup-check   the last Startup check (#209) — status per role
+  POST /api/llm/startup-check   check again; replaces the result
 
 Thin orchestration (ADR-0006): ``llm_config`` owns the document rules,
-``settings_store`` the persistence + reload chain; this router only parses,
-calls, persists and shapes the response. Errors are **codes** (ADR-0018) —
-the SPA translates them.
+``settings_store`` the persistence + reload chain, ``services.llm_check`` the
+meaning of a model-list answer; this router only parses, calls, persists and
+shapes the response. Errors and statuses are **codes** (ADR-0018) — the SPA
+translates them.
 
 Keys never leave the server: GET returns ``has_key`` + ``key_hint``, and a
 PUT sends ``api_key: null`` for "unchanged". The one exception is the
@@ -21,19 +24,25 @@ loadable before the connection is saved (one Save button for the whole tab).
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import logging
+import threading
+from datetime import datetime, timezone
 from typing import Optional
 
-import requests as http_requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 import ca_trust
+import llm_client
 import llm_config
 import services.model_recommender as _recommender
 import settings_store
 from config import Config
 from llm_client import llm_for
+from services import llm_check
 
 router = APIRouter()
 
@@ -55,10 +64,10 @@ class ModelsRequest(BaseModel):
     api_key: Optional[str] = None
 
 
-# base_url -> model ids. Loading the list is also the connection test, so it
-# is fetched live per probe; the cache only spares the settings page a second
-# round-trip per role dropdown. Cleared on every save.
-_models_cache: dict[str, list[str]] = {}
+# (base_url, sha256(api_key)) -> model ids. Loading the list is also the
+# connection test, so it is fetched live per probe; the cache only spares the
+# settings page a second round-trip per role dropdown. Cleared on every save.
+_models_cache: dict[tuple[str, str], list[str]] = {}
 
 
 def _config_payload() -> dict:
@@ -102,46 +111,46 @@ async def put_llm_config(data: LlmConfigUpdate):
 # Model list = connection test
 # ---------------------------------------------------------------------------
 
-def _fetch_error(exc: Exception) -> dict:
+def _fetch_error(answer: llm_check.ModelList) -> dict:
     """An error *code* the SPA can render with advice. Certificate failures
     get their own: they come from the configured house bundle almost every
     time, and without that hint the cause cannot be guessed from the UI."""
-    text = str(exc)
-    if "CERTIFICATE_VERIFY_FAILED" in text or isinstance(exc, http_requests.exceptions.SSLError):
+    if answer.error == "certificate":
         extra = ca_trust.configured_extra_ca()
         if extra:
             return {"code": "error.llm.models.certBundle", "params": {"bundle": extra}}
         return {"code": "error.llm.models.certProxy", "params": {}}
-    if isinstance(exc, http_requests.exceptions.Timeout):
+    if answer.error == "timeout":
         return {"code": "error.llm.models.timeout", "params": {}}
-    if isinstance(exc, http_requests.exceptions.ConnectionError):
+    if answer.error == "connection":
         return {"code": "error.llm.models.connection", "params": {}}
-    return {"code": "error.llm.models.failed", "params": {"message": text[:200]}}
+    return {"code": "error.llm.models.failed", "params": {"message": answer.message[:200]}}
 
 
 def fetch_models(base_url: str, api_key: str) -> tuple[list[str], Optional[dict]]:
     """``(models, error)`` for one endpoint. Never raises: a failed probe is a
-    result the UI shows next to the connection, not a 500."""
+    result the UI shows next to the connection, not a 500. The request itself
+    is ``llm_client.fetch_model_list`` — the one model-list path (#209)."""
     base = (base_url or "").strip().rstrip("/")
     if not base:
         return [], {"code": "error.llm.models.noEndpoint", "params": {}}
-    if base in _models_cache:
-        return list(_models_cache[base]), None
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    try:
-        resp = http_requests.get(
-            f"{base}/models", headers=headers, timeout=10, verify=ca_trust.ca_bundle(),
-        )
-    except Exception as exc:
-        logging.warning("/api/llm/models %s: %s", base, exc)
-        return [], _fetch_error(exc)
-    if resp.status_code != 200:
-        logging.warning("/api/llm/models %s: HTTP %s %s", base, resp.status_code, resp.text[:200])
-        return [], {"code": "error.llm.models.http", "params": {"status": resp.status_code}}
-    models = [m["id"] for m in resp.json().get("data", []) if m.get("id")]
-    _models_cache[base] = list(models)
+    # The key is part of the cache key: a different (e.g. mistyped) key against
+    # the same endpoint must hit the network again and surface its 401.
+    cache_key = (base, hashlib.sha256((api_key or "").encode("utf-8")).hexdigest())
+    if cache_key in _models_cache:
+        return list(_models_cache[cache_key]), None
+    answer = llm_client.fetch_model_list(base, api_key, timeout=llm_client.MODEL_LIST_TIMEOUT)
+    if answer.http_status is None:
+        logging.warning("/api/llm/models %s: %s", base, answer.message)
+        return [], _fetch_error(answer)
+    if answer.http_status != 200:
+        logging.warning("/api/llm/models %s: HTTP %s %s", base, answer.http_status, answer.message)
+        return [], {"code": "error.llm.models.http", "params": {"status": answer.http_status}}
+    if answer.models is None:
+        logging.warning("/api/llm/models %s: unreadable answer %s", base, answer.message)
+        return [], _fetch_error(answer)
+    models = list(answer.models)
+    _models_cache[cache_key] = list(models)
     return models, None
 
 
@@ -177,14 +186,14 @@ def _probe_target(req: ModelsRequest) -> tuple[str, str, str]:
 
 
 @router.post("/api/llm/models")
-async def post_llm_models(req: ModelsRequest):
+def post_llm_models(req: ModelsRequest):
     base, key, current = _probe_target(req)
     models, error = fetch_models(base, key)
     return {"models": models, "error": error, "current": current}
 
 
 @router.post("/api/llm/suggest-models")
-async def suggest_models(req: ModelsRequest):
+def suggest_models(req: ModelsRequest):
     """Recommend a reasoning + a fast model from ONE connection's list.
 
     Asks the reasoning role's model to pick the two best (source="llm"); on
@@ -213,3 +222,87 @@ async def suggest_models(req: ModelsRequest):
             logging.warning("suggest-models: LLM-Call fehlgeschlagen (%s), nutze Heuristik", exc)
 
     return {"suggestion": _recommender.heuristic_suggest(models)}
+
+
+# ---------------------------------------------------------------------------
+# Startup check (#209)
+# ---------------------------------------------------------------------------
+# Every start asks each bound role's connection for its model list, in the
+# background — the start does not wait (webapp's startup hook calls
+# start_startup_check). The result waits here for the SPA: the popup after
+# the boot, the hint at the top of AI models. "Check again" (POST) replaces
+# it. A generation counter makes the newest run win: an older run that ends
+# later never overwrites a newer result.
+
+#: Run the check at startup. The test suite switches it off (conftest), so no
+#: test reaches a network while the app boots; a test of the boot itself
+#: switches it back on.
+CHECK_ON_STARTUP = True
+
+_check_lock = threading.Lock()
+_check_state: dict = {"generation": 0, "running": False, "checked_at": None, "roles": {}}
+
+
+def _check_payload() -> dict:
+    with _check_lock:
+        return {
+            "checked_at": _check_state["checked_at"],
+            "running": _check_state["running"],
+            "roles": copy.deepcopy(_check_state["roles"]),
+            # What the start itself had to correct (e.g. an ignored base
+            # folder): codes, shown by the same popup.
+            "notices": copy.deepcopy(Config.STARTUP_NOTICES),
+        }
+
+
+def _begin_check() -> int:
+    with _check_lock:
+        _check_state["generation"] += 1
+        _check_state["running"] = True
+        return _check_state["generation"]
+
+
+def _run_check(generation: int) -> None:
+    """One run; stores its result unless a newer run has started meanwhile."""
+    try:
+        roles = llm_client.check_roles()
+    except Exception as exc:  # noqa: BLE001 - the check must never take the app down
+        logging.warning("Startprüfung der KI-Modelle fehlgeschlagen: %s", exc)
+        roles = None
+    with _check_lock:
+        if generation != _check_state["generation"]:
+            return
+        _check_state["running"] = False
+        if roles is None:
+            return
+        _check_state["roles"] = roles
+        _check_state["checked_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for tier in llm_check.problem_tiers(roles):
+        r = roles[tier]
+        logging.warning("Startprüfung: Rolle %s (%s, Modell %s): %s (%s)",
+                        tier, r["connection_label"], r["model"], r["status"], r["detail_code"])
+
+
+def start_startup_check() -> Optional[threading.Thread]:
+    """Start the check in a background thread and return at once."""
+    if not CHECK_ON_STARTUP:
+        return None
+    generation = _begin_check()
+    thread = threading.Thread(target=_run_check, args=(generation,),
+                              name="llm-startup-check", daemon=True)
+    thread.start()
+    return thread
+
+
+@router.get("/api/llm/startup-check")
+async def get_startup_check():
+    """``{checked_at, running, roles: {tier: {status, connection_label, model,
+    detail_code, ...}}}``; ``checked_at`` is ``None`` until a run finished."""
+    return _check_payload()
+
+
+@router.post("/api/llm/startup-check")
+async def post_startup_check():
+    generation = _begin_check()
+    await run_in_threadpool(_run_check, generation)
+    return _check_payload()

@@ -96,6 +96,20 @@ def test_partial_chain_no_longer_decides(monkeypatch, tmp_path):
 # Portabilitaet und Fehlertoleranz
 # ---------------------------------------------------------------------------
 
+def test_httpx_verify_is_a_context_or_true_never_a_path(monkeypatch, tmp_path):
+    """httpx deprecates ``verify=<str>``: hand it a ready SSLContext (or True)."""
+    assert ca_trust.httpx_verify() is True
+    real = tmp_path / "real.pem"
+    first = open(certifi.where(), "rb").read().split(b"-----END CERTIFICATE-----")[0]
+    real.write_bytes(first + b"-----END CERTIFICATE-----\n")
+    monkeypatch.setenv(ca_trust.EXTRA_CA_ENV, str(real))
+
+    verify = ca_trust.httpx_verify()
+
+    assert isinstance(verify, ssl.SSLContext)
+    assert verify.cert_store_stats()["x509_ca"] > 50
+
+
 def test_no_extra_configured_means_certifi_default(monkeypatch):
     assert ca_trust.ca_bundle() is None
     assert ca_trust.install() is None

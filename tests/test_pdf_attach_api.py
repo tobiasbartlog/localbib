@@ -240,7 +240,9 @@ def test_attach_pdf_conflict_when_hash_belongs_to_other_paper(
     dup = client.post(f"/api/papers/{second}/attach-pdf",
                       files={"file": ("b.pdf", PDF_BYTES, "application/pdf")})
     assert dup.status_code == 409
-    assert str(first) in dup.json()["detail"]
+    detail = dup.json()["detail"]
+    assert detail["code"] == "error.pdf_belongs_to_item"
+    assert detail["params"]["id"] == first
 
 
 def test_attach_pdf_rejects_non_pdf(client, db):

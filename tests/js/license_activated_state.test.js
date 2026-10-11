@@ -11,7 +11,7 @@ describe('Lizenz-Tab bei aktivierter Installation', () => {
                 url: '/api/license/status',
                 reply: { activated: true, key: '••••C570', activated_at: '2026-08-01T09:00:00', checkout_url: '' },
             },
-        ], 'license-tab');
+        ], 'about');
 
         await vi.waitFor(() => {
             if (!document.querySelector('[data-testid="license-activated"]')) {

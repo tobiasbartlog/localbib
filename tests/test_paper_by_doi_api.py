@@ -12,11 +12,16 @@ import httpx
 import pytest
 import respx
 
-import metadata_validation
+import cite_key_generator
 import paper_ingest
 from openalex_client import BASE_URL
 
 PDF_BYTES = b"%PDF-1.4 fake open-access pdf"
+
+
+def _crossref(record=None):
+    """CrossRef answers ``record`` (``None``: nothing known) for every DOI."""
+    return patch.object(paper_ingest, "fetch_crossref_metadata", return_value=record)
 
 
 def _row(db, paper_id):
@@ -119,8 +124,7 @@ def test_exists_batch_maps_each_doi_to_id_or_null(client, db):
 def test_enrichment_fills_empty_fields_from_crossref_and_openalex(client, db):
     respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={
         "results": [_work("10.5555/enrich", authors=["Neu, Nina"], year=2022)]}))
-    with patch.object(metadata_validation, "fetch_crossref_abstract",
-                      return_value="Ein Abstract aus CrossRef."):
+    with _crossref({"abstract": "Ein Abstract aus CrossRef."}):
         resp = client.post("/api/papers/by-doi", json={"doi": "10.5555/enrich", "title": "Nackt"})
     assert resp.status_code == 200, resp.text
     row = _row(db, resp.json()["paper_id"])
@@ -131,11 +135,180 @@ def test_enrichment_fills_empty_fields_from_crossref_and_openalex(client, db):
 
 @pytest.mark.real_enrichment
 @respx.mock
+def test_enrichment_titles_a_bare_doi_but_keeps_a_given_title(client, db):
+    """A DOI list (#227) sends DOIs only: the OpenAlex batch the intake already
+    fetches names the Item, so it does not land as "Untitled". A title the
+    caller knew stays — enrichment fills empty fields only."""
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": [
+        _work("10.5555/bare", title="Titled by OpenAlex"),
+        _work("10.5555/named", title="Another OpenAlex title"),
+    ]}))
+    with _crossref(None):
+        resp = client.post("/api/papers/by-doi/batch", json={"items": [
+            {"doi": "10.5555/bare"}, {"doi": "10.5555/named", "title": "Mine"}]})
+    assert resp.status_code == 200, resp.text
+    bare, named = resp.json()["results"]
+    assert _row(db, bare["paper_id"])["title"] == "Titled by OpenAlex"
+    assert _row(db, named["paper_id"])["title"] == "Mine"
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+def test_crossref_fills_what_openalex_does_not_know(client, db):
+    """A DataCite/Zenodo DOI, or OpenAlex down: the CrossRef record the intake
+    fetches anyway names the Item — title, authors, year and venue."""
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": []}))
+    with _crossref({"title": "From CrossRef", "authors": "Okafor, Ada, Lund, Per", "year": 2019,
+                    "journal": "J. Test", "abstract": "Ein Abstract."}):
+        resp = client.post("/api/papers/by-doi/batch", json={"items": [{"doi": "10.5555/cr-only"}]})
+    assert resp.status_code == 200, resp.text
+    [result] = resp.json()["results"]
+    row = _row(db, result["paper_id"])
+    assert (row["title"], row["authors"], row["year"], row["journal"], row["abstract"]) == (
+        "From CrossRef", "Okafor, Ada, Lund, Per", 2019, "J. Test", "Ein Abstract.")
+    # The key the intake had to build from nothing is built again from that.
+    assert result["citekey"] == row["cite_key"] == "Okafor2019"
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+def test_given_values_and_their_cite_key_are_never_overwritten(client, db):
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": [
+        _work("10.5555/given", title="OA title", authors=["Other Person"], year=2020)]}))
+    with _crossref({"title": "CR title", "authors": "Else, Someone", "year": 2021, "journal": "CR J."}):
+        resp = client.post("/api/papers/by-doi", json={
+            "doi": "10.5555/given", "title": "Mine", "authors": ["Doe, Jane"], "year": 2001, "journal": "Given J."})
+    row = _row(db, resp.json()["paper_id"])
+    assert (row["title"], row["authors"], row["year"], row["journal"]) == ("Mine", "Doe, Jane", 2001, "Given J.")
+    assert row["cite_key"] == resp.json()["citekey"] == "Doe2001"
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+def test_a_placeholder_key_is_generated_again_like_any_new_item(client, db):
+    """Authors and year empty at creation give the placeholder UnknownXXXX;
+    once enrichment found them, the key is what the app's generator makes of
+    the stored authors and year for any new Item — nothing of its own."""
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": [
+        _work("10.5555/k1", authors=["Thi Nguyen", "Raj Patel"], year=2024),
+        _work("10.5555/k2", authors=["Thi Nguyen", "Raj Patel"], year=2024),
+    ]}))
+    with _crossref(None):
+        resp = client.post("/api/papers/by-doi/batch", json={"items": [
+            {"doi": "10.5555/k1"}, {"doi": "10.5555/k2"}]})
+    first, second = resp.json()["results"]
+    row = _row(db, first["paper_id"])
+    assert row["authors"] == "Thi Nguyen; Raj Patel"
+    expected = cite_key_generator.generate(row["authors"], 2024, set())
+    assert first["citekey"] == row["cite_key"] == expected
+    assert second["citekey"] == _row(db, second["paper_id"])["cite_key"] == expected + "a"
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+def test_a_key_built_from_given_authors_stays_even_without_a_year(client, db):
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": [
+        _work("10.5555/given-author", authors=["Other Person"], year=2020)]}))
+    with _crossref(None):
+        body = client.post("/api/papers/by-doi", json={
+            "doi": "10.5555/given-author", "authors": ["John Doe"]}).json()
+    assert body["citekey"] == _row(db, body["paper_id"])["cite_key"] == "JohnDoeXXXX"
+    assert _row(db, body["paper_id"])["year"] == 2020  # enriched, the key is not
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+def test_a_placeholder_stays_when_enrichment_finds_nothing(client, db):
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": []}))
+    with _crossref(None):
+        body = client.post("/api/papers/by-doi", json={"doi": "10.5555/nothing"}).json()
+    assert body["citekey"] == _row(db, body["paper_id"])["cite_key"] == "UnknownXXXX"
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+def test_every_result_of_one_item_carries_its_final_key(client, db):
+    """The same DOI twice in one batch: the second entry finds the first one's
+    Item and must not report the placeholder it found."""
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": [
+        _work("10.1000/abc", authors=["Ada Lovelace"], year=1843)]}))
+    with _crossref(None):
+        body = client.post("/api/papers/by-doi/batch", json={"items": [
+            {"doi": "10.1000/abc"}, {"doi": "https://doi.org/10.1000/ABC"}]}).json()
+    first, second = body["results"]
+    assert first["created"] is True and second["created"] is False
+    assert first["paper_id"] == second["paper_id"]
+    final = _row(db, first["paper_id"])["cite_key"]
+    assert final != "UnknownXXXX"
+    assert first["citekey"] == second["citekey"] == final
+
+
+class _CrossRefReply:
+    status_code = 200
+
+    def __init__(self, authors):
+        self._authors = authors
+
+    def json(self):
+        return {"message": {"title": ["Consortium work"], "author": self._authors,
+                            "published-print": {"date-parts": [[2020]]}}}
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+@pytest.mark.parametrize("authors, stored", [
+    ([{"name": "The ABC Consortium", "sequence": "first"}, {"family": "Doe", "given": "Jane"}],
+     "The ABC Consortium, Doe, Jane"),
+    ([], ""),
+    ([{"sequence": "first"}], ""),
+])
+def test_crossref_authors_count_organizations_and_never_write_a_bare_separator(
+        client, db, monkeypatch, authors, stored):
+    """The core's one CrossRef author format: an organization (``name``) is
+    an author; an author list with no name in it writes nothing — no lone
+    comma."""
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": []}))
+    monkeypatch.setattr("crossref.requests.get", lambda *a, **k: _CrossRefReply(authors))
+    body = client.post("/api/papers/by-doi", json={"doi": "10.5555/consortium"}).json()
+    row = _row(db, body["paper_id"])
+    assert row["title"] == "Consortium work"
+    assert row["authors"] == stored
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+def test_an_author_string_of_separators_is_not_written(client, db):
+    respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": []}))
+    with _crossref({"title": "T", "authors": " , ;"}):
+        body = client.post("/api/papers/by-doi", json={"doi": "10.5555/separators"}).json()
+    assert _row(db, body["paper_id"])["authors"] == ""
+
+
+@pytest.mark.real_enrichment
+@respx.mock
+def test_the_key_of_an_item_that_was_already_there_stays(client, db):
+    """Only an Item this intake just created is re-keyed: asking for a known
+    DOI again — now that OpenAlex knows more — touches nothing."""
+    route = respx.get(f"{BASE_URL}/works")
+    route.mock(return_value=httpx.Response(200, json={"results": []}))
+    with _crossref(None):
+        first = client.post("/api/papers/by-doi", json={"doi": "10.5555/known"}).json()
+    assert first["citekey"] == "UnknownXXXX"
+    route.mock(return_value=httpx.Response(200, json={"results": [
+        _work("10.5555/known", authors=["Ada Lovelace"], year=1843)]}))
+    with _crossref(None):
+        again = client.post("/api/papers/by-doi", json={"doi": "10.5555/known"}).json()
+    assert again["created"] is False
+    assert again["citekey"] == _row(db, first["paper_id"])["cite_key"] == "UnknownXXXX"
+
+
+@pytest.mark.real_enrichment
+@respx.mock
 def test_failed_oa_attempt_keeps_the_paper_and_reports_pdf_none(client, db):
     respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={
         "results": [_work("10.5555/oafail", pdf_url="https://repo.example.org/gone.pdf")]}))
     respx.get("https://repo.example.org/gone.pdf").mock(return_value=httpx.Response(500))
-    with patch.object(metadata_validation, "fetch_crossref_abstract", return_value=""):
+    with _crossref(None):
         resp = client.post("/api/papers/by-doi", json={"doi": "10.5555/oafail", "title": "Fail"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -151,7 +324,7 @@ def test_oa_pdf_is_fetched_and_attached(client, db):
         "results": [_work("10.5555/oaok", pdf_url="https://repo.example.org/ok.pdf")]}))
     respx.get("https://repo.example.org/ok.pdf").mock(return_value=httpx.Response(
         200, content=PDF_BYTES, headers={"content-type": "application/pdf"}))
-    with patch.object(metadata_validation, "fetch_crossref_abstract", return_value=""), \
+    with _crossref(None), \
          patch.object(paper_ingest, "categorize_with_llm", return_value=[]), \
          patch.object(paper_ingest, "extract_text_from_pdf", return_value="Volltext"):
         resp = client.post("/api/papers/by-doi", json={"doi": "10.5555/oaok", "title": "OK"})

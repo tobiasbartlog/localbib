@@ -449,3 +449,17 @@ def test_installer_is_launched_silently_with_a_relaunch() -> None:
     ).read_text(encoding="utf-8")
     # Without the relaunch entry the user's window would simply vanish.
     assert "skipifnotsilent" in iss
+
+
+def test_the_success_answer_and_a_refused_download_are_codes(monkeypatch, fake_installer) -> None:
+    """SET-B3: no German sentence on the update path; the SPA translates."""
+    resp, _calls = _install(monkeypatch, download=lambda url: fake_installer)
+    assert resp.json()["message"] == "update.installing"
+
+    def too_large(_url):
+        raise version_router._DownloadRefused("error.installer_too_large")
+
+    resp, calls = _install(monkeypatch, download=too_large)
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "error.installer_too_large"
+    assert calls["exited"] == 0

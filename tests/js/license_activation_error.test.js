@@ -19,7 +19,7 @@ describe('Lizenz-Aktivierung (Fehlerfall)', () => {
                 url: '/api/license/activate',
                 reply: { activated: false, error: LIMIT_ERROR },
             },
-        ], 'license-tab');
+        ], 'about');
 
         typeInto(document.querySelector('[data-testid="license-key-input"]'), 'LB--USED-UP');
         await flush();

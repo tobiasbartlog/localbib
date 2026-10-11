@@ -20,5 +20,8 @@ export default defineConfig({
         environment: 'jsdom',
         include: ['tests/js/**/*.test.js'],
         setupFiles: ['tests/js/setup.js'],
+        // The analysis smokes draw a real d3 net and run 2-5 s each; the
+        // 5 s default made them flake on a loaded runner.
+        testTimeout: 20000,
     },
 });

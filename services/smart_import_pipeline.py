@@ -113,10 +113,10 @@ def run_pipeline(
     calling this generator, then the persistence AFTER it.
     """
     # -- Text extrahieren --
-    yield _sse({"type": "progress", "step": "text", "message": "Extrahiere Text aus PDF...", "percent": 10})
+    yield _sse({"type": "progress", "step": "text", "message": "import.step.text", "percent": 10})
     text = extract_text_from_pdf(target_path, Config.MAX_OCR_PAGES)
     text_len = len(text.strip())
-    yield _sse({"type": "progress", "step": "text", "message": f"{text_len} Zeichen extrahiert", "percent": 15})
+    yield _sse({"type": "progress", "step": "text", "message": {"code": "import.step.textExtracted", "params": {"count": text_len}}, "percent": 15})
 
     metadata = {
         "title": "", "authors": "", "year": None, "doi": "", "isbn": "",
@@ -126,13 +126,13 @@ def run_pipeline(
     # -- DOI suchen & CrossRef --
     crossref_plausible = False
     if do_doi:
-        yield _sse({"type": "progress", "step": "doi", "message": "Suche DOI...", "percent": 20})
+        yield _sse({"type": "progress", "step": "doi", "message": "import.step.doiSearch", "percent": 20})
         doi = discover_doi(text, "", "")
         if doi:
             metadata["doi"] = doi
-            yield _sse({"type": "progress", "step": "doi", "message": f"DOI gefunden: {doi}", "percent": 25})
+            yield _sse({"type": "progress", "step": "doi", "message": {"code": "import.step.doiFound", "params": {"doi": doi}}, "percent": 25})
 
-            yield _sse({"type": "progress", "step": "crossref", "message": "Hole CrossRef-Metadaten...", "percent": 30})
+            yield _sse({"type": "progress", "step": "crossref", "message": "import.step.crossref", "percent": 30})
             crossref_data = fetch_crossref_metadata(doi)
             if crossref_data:
                 # Plausibilitaetspruefung: Stimmt der CrossRef-Titel mit dem PDF-Anfang ueberein?
@@ -148,17 +148,19 @@ def run_pipeline(
                 if crossref_plausible:
                     metadata.update(crossref_data)
                     yield _sse({"type": "progress", "step": "crossref",
-                                "message": f"Metadaten: {metadata['title'][:70]}...",
+                                "message": {"code": "import.step.crossrefTitle",
+                                            "params": {"title": metadata['title'][:70]}},
                                 "percent": 35})
                 else:
                     yield _sse({"type": "progress", "step": "crossref",
-                                "message": f"CrossRef-Titel passt nicht zum PDF ('{crossref_data.get('title','')[:50]}...') - ignoriert",
+                                "message": {"code": "import.step.crossrefMismatch",
+                                            "params": {"title": crossref_data.get('title', '')[:50]}},
                                 "percent": 35})
                     metadata["doi"] = ""  # Verwerfe falsche DOI
             else:
-                yield _sse({"type": "progress", "step": "crossref", "message": "CrossRef lieferte keine Daten", "percent": 35})
+                yield _sse({"type": "progress", "step": "crossref", "message": "import.step.crossrefEmpty", "percent": 35})
         else:
-            yield _sse({"type": "progress", "step": "doi", "message": "Keine DOI gefunden", "percent": 35})
+            yield _sse({"type": "progress", "step": "doi", "message": "import.step.doiNotFound", "percent": 35})
 
     # Fallbacks
     if not metadata["isbn"]:
@@ -178,7 +180,7 @@ def run_pipeline(
     # -- LLM Metadaten-Validierung --
     llm_failures: list[dict] = []
     if do_validate and Config.llm_ready("fast"):
-        yield _sse({"type": "progress", "step": "validate", "message": "KI validiert Metadaten...", "percent": 40})
+        yield _sse({"type": "progress", "step": "validate", "message": "import.step.validate", "percent": 40})
         _llm = llm_for("metadata_extract")
         llm_data = llm_extract_metadata(
             _llm, text[:4000], metadata["title"], metadata["authors"],
@@ -197,7 +199,8 @@ def run_pipeline(
             if llm_data.get("isbn") and not metadata["isbn"]:
                 metadata["isbn"] = llm_data["isbn"]
             yield _sse({"type": "progress", "step": "validate",
-                        "message": f"KI: Titel = {metadata['title'][:60]}...", "percent": 50})
+                        "message": {"code": "import.step.validateTitle",
+                                    "params": {"title": metadata['title'][:60]}}, "percent": 50})
         elif getattr(_llm, "last_error", None) is not None:
             # complete_json() swallowed a transport/HTTP failure (429 from a
             # rate-limited free-tier model, wrong key, unreachable host) --
@@ -207,9 +210,9 @@ def run_pipeline(
             yield _sse({"type": "progress", "step": "validate",
                         "message": llm_failure_message(failure), "percent": 50})
         else:
-            yield _sse({"type": "progress", "step": "validate", "message": "KI-Validierung ohne Ergebnis", "percent": 50})
+            yield _sse({"type": "progress", "step": "validate", "message": "import.step.validateEmpty", "percent": 50})
     else:
-        yield _sse({"type": "progress", "step": "validate", "message": "KI-Validierung uebersprungen", "percent": 50})
+        yield _sse({"type": "progress", "step": "validate", "message": "import.step.validateSkipped", "percent": 50})
 
     return ImportResult(
         text=text,

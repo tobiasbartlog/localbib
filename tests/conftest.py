@@ -45,7 +45,23 @@ from fastapi.testclient import TestClient
 
 import webapp
 import paper_ingest
+import routers.backup as _backup_router
+import routers.llm as _llm_router
 from literature_manager import Config
+
+# The Startup check of the AI models (#209) would ask the conftest connection
+# (http://llm.test/v1) for its model list whenever a test boots the app's
+# lifespan. Off for the suite; tests/test_llm_startup_check.py switches it on
+# under respx.
+_llm_router.CHECK_ON_STARTUP = False
+# Likewise the automatic backup schedule: no background thread per booted app.
+# tests/test_backup_router.py drives it one look at a time (``auto_tick``).
+_backup_router.AUTO_ON_STARTUP = False
+# A developer's .env (webapp loads it at import) may name a backup folder and
+# a schedule; the suite starts with neither.
+for _key in ("BACKUP_DIR", "AUTO_BACKUP", "AUTO_BACKUP_PDFS"):
+    os.environ.pop(_key, None)
+Config.reload_from_env()
 
 
 def pytest_configure(config):
@@ -128,6 +144,8 @@ def db():
     try:
         # Order matters because of FKs with CASCADE
         for table in [
+            "collection_items",
+            "collections",
             "paper_references",
             "paper_categories",
             "chunk_embeddings",

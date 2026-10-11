@@ -28,7 +28,8 @@ removed. A folder the document does not know is left alone. Herkunft belongs
 to a version folder, not to the id: the predecessor keeps its own
 (``previous_source``), a file that replaces the kept folder replaces it
 (``record_placed``), and a rollback runs with the predecessor's — unknown means
-no rollback.
+no rollback. An install records ahead of the move what a crash in between
+must leave behind (``record_placing``).
 
 **Removing.** ``pending_removals`` lists Add-ons whose Bundle is deleted on the
 next start (Windows does not release loaded files before). Only the Bundle
@@ -125,6 +126,51 @@ def record_placed(doc: dict, addon_id: str, version: str, source: Optional[Mappi
         entry["previous_source"] = _folder_source(
             plugins_config.provenance(str(source.get("origin") or ""), str(source.get("sha256") or "")))
     return True
+
+
+def record_placing(doc: dict, addon_id: str, version: str, source: Mapping, *,
+                   permissions: Iterable[str] = (), current_on_disk: bool = True) -> bool:
+    """The write-ahead before an install moves code of Herkunft ``source``
+    into the folder of ``version`` (ADD-7). Whatever interrupts the install
+    after the move — a failed save of the document, say — must leave every
+    folder the core could load labelled so that the code in it never runs under
+    a consent given for other code:
+
+    * the kept predecessor's folder becomes unknown, no rollback target, until
+      the install records the real Herkunft (:func:`record_placed`);
+    * for a **file**, the folder the core would load — the installed version's,
+      or the new one when the document names none on disk
+      (``current_on_disk``) — and a pending update of that version take the
+      file's own Herkunft (its checksum, its Berechtigungen ``permissions``),
+      and a legacy consent is bound first to what it was given for. Should
+      the move fail instead, the old code carries the file's label: it then
+      asks once more, never runs on a consent it lacks.
+
+    An **index** install needs no more: index code is never less trusted than
+    what it replaces, and labelling an index Herkunft ahead of the move would
+    let the old code pass for index code if the move failed.
+
+    Returns whether the document changed; the caller persists it before it
+    moves anything."""
+    changed = record_placed(doc, addon_id, version, None)
+    prov = plugins_config.provenance(str(source.get("origin") or ""), str(source.get("sha256") or ""))
+    if prov["origin"] != plugins_config.ORIGIN_FILE or not version:
+        return changed
+    label = _folder_source(prov)
+    changed = addon_id not in (doc.get("plugins") or {}) or changed
+    entry = _entry(doc, addon_id)
+    # A legacy consent binds to any code: pin it to the Bundle it was given for.
+    changed = plugins_config.bind_unbound_consent(entry) or changed
+    current = entry.get("version") or ""
+    if (version == current or not current or not current_on_disk) and entry.get("source") != label:
+        entry["source"] = label
+        changed = True
+    pending = entry.get("pending_update")
+    if pending and pending.get("version") == version and pending_provenance(entry) != prov:
+        pending.update(origin=label["origin"], sha256=label["sha256"], agreed=None,
+                       permissions=sorted(set(permissions)))
+        changed = True
+    return changed
 
 
 def switch_version(doc: dict, addon_id: str, version: str, permissions: Iterable[str], *, running: bool,
@@ -307,6 +353,7 @@ __all__ = [
     "previous_provenance",
     "prune_plan",
     "record_placed",
+    "record_placing",
     "rollback_target",
     "switch_version",
 ]

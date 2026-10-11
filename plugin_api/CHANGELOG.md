@@ -4,10 +4,66 @@ The package version follows semver; its major number is the Add-on Contract
 version (`plugin_api.API_VERSION`). A core accepts exactly one contract
 version; an Add-on built against another one is shown as incompatible.
 
-## Unreleased
+## 2.3.0 — Reference details for literature checks
 
-Added (no contract change, `API_VERSION` stays `2`):
+Added (additive, `API_VERSION` stays `2`):
 
+- `LibraryApi.get_reference` (and every dict `search_references` returns)
+  carries `has_pdf` (bool — the Item's PDF is in the library), `volume`,
+  `issue` and `pages` (str or `None`; the core fills them from what the Item's
+  stored metadata knows, e.g. a BibTeX import). `id` (the Item id, for the
+  core's Item route `/paper/{id}`) is now documented as part of the answer.
+  Add-ons that read only the old keys are unaffected.
+- `plugin_api.testing.InMemoryLibrary` answers the same shape: missing keys
+  of a seeded reference are filled with defaults (`id` stable per Cite Key,
+  `has_pdf` False, the rest `None`).
+
+## 2.2.0 — Reserved permissions, one settings value rule
+
+Changed (`API_VERSION` stays `2`):
+
+- `files` and `storage` are **reserved** Berechtigungen: declaring them stays
+  valid (existing Manifests keep loading), but they grant nothing. The core
+  never had a host service behind them, so `api.files` and `api.storage`
+  were always `None` in the core; the docs called them "Enforced" and the
+  fakes handed over `NullFiles` / `TempSqliteStorage`. Now the docs, the
+  consent dialog and `plugin_api.testing.make_api` agree with the core: both
+  attributes are always `None`, whatever is declared or passed.
+- `PermissionInfo` gains `reserved: bool = False` (additive); `files` and
+  `storage` are `enforced=False, service=None, reserved=True` and no longer
+  appear in `GATED_SERVICES`. The Marketplace's permission rows carry
+  `reserved`, shown as "Reserved — grants nothing yet".
+- `NullFiles` and `TempSqliteStorage` stay importable for an Add-on's own
+  unit tests.
+- `SettingsApi.set` has one value rule, in the core and in
+  `plugin_api.testing.InMemorySettings` alike (new `plugin_api.setting_value`):
+  `str`, `bool` and `None` are stored as they are; `int` and `float` become
+  their `str` (what the core always kept on disk; the fake used to keep the
+  number); anything else (list, dict, bytes, ...) raises `TypeError` and
+  stores nothing (the core used to accept it and lose it as `None` on the
+  next load). Store structured data as a JSON string of your own.
+
+## 2.1.0 — Collections
+
+Added (additive, `API_VERSION` stays `2`):
+
+- `LibraryApi` reads Collections under `library.read` — no new permission:
+  `list_collections()` (active, archived and tombstoned, with `deleted` /
+  `deleted_at`), `get_collection(id)`, `get_collection_refs(id)` (the Items
+  as stored Cite Keys, oldest addition first) and
+  `export_collection_bibtex(id)`. A Collection is `{id, name, description,
+  archived, archived_at, deleted, deleted_at, created_at, updated_at,
+  item_count}`. Guard with `getattr(library, "list_collections", None)` for
+  hosts before 2.1.
+- `on_change` now delivers Collection events
+  `{"type": "collection", "action": ..., "collection_id": int}` with the
+  actions in the new `COLLECTION_EVENT_ACTIONS` (`created`, `renamed`,
+  `updated`, `archived`, `restored`, `deleted`, `members_changed`). Before
+  2.1 the core's `on_change` never fired.
+- `plugin_api.testing.InMemoryLibrary` takes `collections=[...]` and gains
+  `add_collection`, `rename_collection`, `set_collection_description`,
+  `archive_collection`, `delete_collection`, `set_collection_refs` and
+  `emit_collection`, which fire the same events as the core.
 - `localbib-addon build` precompiles bytecode when the Manifest names a
   CPython build tag (`"python": "cp313-win_amd64"`): every `.py` in the Zip,
   the Add-on's own package and `vendor/`, gets an unchecked-hash `.pyc`

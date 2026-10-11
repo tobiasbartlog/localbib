@@ -52,7 +52,10 @@ def test_activate_registers_nav_item_and_uses_declared_services(plugin, tmp_path
     assert [n.route for n in api.ui.nav_items] == ["/hello"]
     assert plugin.greeting("doe2024") == "Warm hello, Deep Things!"
     assert llm.requests[0]["tier"] == "fast"
-    assert plugin.history() == ["Warm hello, Deep Things!"]
+    # ``storage`` is declared but reserved (2.2.0): api.storage is None, so
+    # the Add-on keeps no history and degrades instead of failing.
+    assert api.storage is None
+    assert plugin.history() == []
     asyncio.run(plugin.deactivate())
     storage.close()
 

@@ -16,6 +16,12 @@ hiddenimports += [
     # Eintrag crasht die Exe beim Start (ModuleNotFoundError: routers.import).
     # Gefunden im H7-Packaging-Spike (#112).
     "routers.import",
+    # Tray icon instead of a console (#214, ADR-0023): pystray picks its
+    # Windows backend at import time from a function-local import that the
+    # analysis cannot be relied on to follow. Without it the .exe starts,
+    # finds no backend and has neither a console nor an icon - invisible.
+    "pystray._win32",
+    "pystray._util.win32",
 ]
 # Add-ons sind nicht Teil des Binaries (ADR-0021): Sie kommen als installierte
 # Bundles oder ueber einen Dev-Suchpfad (LOCALBIB_PLUGIN_DEV_PATHS) und werden
@@ -100,9 +106,11 @@ a = Analysis(
     runtime_hooks=[],
     # Nicht genutzte (transitiv eingeschleppte) Schwergewichte ausschließen.
     # Der Code importiert keine davon (grep-verifiziert) → spart ~100 MB.
+    # PIL/Pillow stehen hier nicht mehr: das Symbol im Infobereich (pystray)
+    # zeichnet sein Bild damit (#214).
     excludes=[
         "tkinter", "pytest", "respx", "matplotlib", "pytest_cov",
-        "pandas", "numpy", "openpyxl", "PIL", "Pillow",
+        "pandas", "numpy", "openpyxl",
     ],
     noarchive=False,
     optimize=0,
@@ -119,7 +127,10 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    # Kein Konsolenfenster (#214, ADR-0023): die .exe lebt als Symbol im
+    # Infobereich (starter.py); stdout/stderr gehen in die Log-Datei
+    # (logging_setup.redirect_missing_std_streams, ganz oben in webapp.py).
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

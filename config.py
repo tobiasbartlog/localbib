@@ -186,6 +186,21 @@ class Config:
         cls.WATCH_INTERVAL = _env_int("WATCH_INTERVAL", 5, minimum=1)
         cls.MAX_OCR_PAGES = _env_int("MAX_OCR_PAGES", 5, minimum=1)
         cls.UNLOCK_PDFS = os.getenv("UNLOCK_PDFS", "true").lower() == "true"
+        # Wie Eintraege in den Kategorie-Ordnern liegen (#213). Ohne (gueltigen)
+        # Eintrag gilt das Verhalten von vor der Einstellung: unter Windows harte
+        # Links mit Verknuepfung als Rueckfall, sonst symbolische Links. Dieser
+        # Default steht nur hier; GET /api/settings zeigt ihn als wirksamen Wert.
+        _link = os.getenv("LINK_MODE", "").strip().lower()
+        cls.LINK_MODE = _link if _link in cls.LINK_MODES else (
+            "hardlink" if sys.platform == "win32" else "symlink")
+        # Backups (backup.py). Kein Ordner, kein Automatik-Intervall, kein
+        # Umfang per Default: wohin gesichert wird und ob die PDFs mitkommen,
+        # entscheidet der Nutzer ausdruecklich — None heisst "nie gefragt".
+        cls.BACKUP_DIR = os.getenv("BACKUP_DIR", "").strip()
+        _auto = os.getenv("AUTO_BACKUP", "").strip().lower()
+        cls.AUTO_BACKUP = _auto if _auto in cls.AUTO_BACKUP_INTERVALS else "off"
+        _scope = os.getenv("AUTO_BACKUP_PDFS", "").strip().lower()
+        cls.AUTO_BACKUP_PDFS = {"true": True, "false": False}.get(_scope)
         # Polar: mitgelieferte Defaults (oeffentliche Kennungen), per Env
         # ueberschreibbar - POLAR_API_BASE zeigt beim Testen auf die Sandbox.
         # "or Default": ein leerer Eintrag in der .env (z. B. aus der Vorlage
@@ -346,6 +361,32 @@ class Config:
     # PDF-Schutz (von reload_from_env gesetzt)
     UNLOCK_PDFS = True
 
+    # Kategorie-Ordner (#213): "symlink" (Verknuepfung: .lnk unter Windows,
+    # symbolischer Link sonst), "hardlink" oder "copy". LINK_MODE ist der
+    # wirksame Wert, von reload_from_env gesetzt.
+    LINK_MODES = ("symlink", "hardlink", "copy")
+    LINK_MODE = ""
+
+    # Backups (von reload_from_env gesetzt). Die Intervalle spiegeln
+    # backup.INTERVALS; config.py bleibt ohne Projekt-Import.
+    AUTO_BACKUP_INTERVALS = ("off", "daily", "weekly", "monthly")
+    BACKUP_DIR = ""
+    AUTO_BACKUP = "off"
+    AUTO_BACKUP_PDFS = None
+
+    @classmethod
+    def backup_dir(cls) -> str:
+        """Der Backup-Ordner mit ``~``/``%VARS%`` aufgeloest; leer = keiner."""
+        return os.path.expanduser(os.path.expandvars(cls.BACKUP_DIR)) if cls.BACKUP_DIR else ""
+
+    @classmethod
+    def auto_backup(cls) -> str:
+        """Das wirksame Automatik-Intervall: ``off``, solange Ordner oder
+        Umfang fehlen — eine Automatik ohne beides kann nicht laufen."""
+        if not cls.BACKUP_DIR or cls.AUTO_BACKUP_PDFS is None:
+            return "off"
+        return cls.AUTO_BACKUP
+
     @classmethod
     def _detect_tesseract(cls):
         """Versucht Tesseract automatisch zu finden."""
@@ -379,6 +420,34 @@ class Config:
             if os.path.isdir(tessdata):
                 return tessdata
         return None
+
+    #: Things the start had to correct and the user must hear about, as
+    #: ``{"code", "params"}``; the Startup check hands them to the SPA.
+    STARTUP_NOTICES: list = []
+
+    @staticmethod
+    def resolve_base_dir(raw: str) -> tuple:
+        """``(path, notice)`` for the configured base folder.
+
+        Empty means the default ``~/Literatur``. A value with a control
+        character (older versions wrote a quoted folder raw, so ``\\t`` came
+        back as a TAB) or one that is not absolute after expansion falls back
+        to the default too; ``notice`` then says which value was ignored and
+        why, else it is ``None``."""
+        default = os.path.expanduser(os.path.join("~", "Literatur"))
+        value = (raw or "").strip()
+        if not value:
+            return default, None
+        if any(ord(c) < 0x20 for c in value):
+            reason = "control"
+        else:
+            expanded = os.path.expanduser(os.path.expandvars(value))
+            if os.path.isabs(expanded):
+                return expanded, None
+            reason = "relative"
+        shown = "".join(c if ord(c) >= 0x20 else "\\x%02x" % ord(c) for c in value)
+        return default, {"code": "baseDirIgnored",
+                         "params": {"value": shown, "reason": reason, "used": default}}
 
     @classmethod
     def init_paths(cls, base_dir: str):
