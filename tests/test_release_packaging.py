@@ -230,7 +230,9 @@ def test_the_tray_dependencies_are_core_requirements(package: str) -> None:
         return out
 
     assert package.lower() in names(REPO_ROOT / "requirements.txt")
-    assert package.lower() not in names(REPO_ROOT / "requirements-plugins.txt")
+    plugin_requirements = REPO_ROOT / "requirements-plugins.txt"
+    if plugin_requirements.exists():   # the public export ships no plugin file
+        assert package.lower() not in names(plugin_requirements)
 
 
 # ---------------------------------------------------------------------------
