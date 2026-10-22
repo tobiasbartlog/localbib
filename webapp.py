@@ -135,14 +135,21 @@ class SpaStaticFiles(StaticFiles):
     ``.mjs`` at all, as Python 3.11 in the frozen build does not - would serve
     the vendored PDF.js (#229) with a type the browser refuses for a module
     ``import()`` and a module worker. The suffix decides here, not the machine.
+
+    ES modules are served ``no-cache``: their relative imports cannot carry
+    the ``?v=`` stamp, so after an update the browser must revalidate them
+    (a 304 via ETag) instead of pairing a fresh app.js with a stale module.
     """
 
     JS_SUFFIXES = (".js", ".mjs")
 
     def file_response(self, full_path, stat_result, scope, status_code=200):
         response = super().file_response(full_path, stat_result, scope, status_code)
-        if str(full_path).lower().endswith(self.JS_SUFFIXES) and "content-type" in response.headers:
+        path = str(full_path).lower()
+        if path.endswith(self.JS_SUFFIXES) and "content-type" in response.headers:
             response.headers["content-type"] = "text/javascript; charset=utf-8"
+        if path.endswith(".mjs"):
+            response.headers["cache-control"] = "no-cache"
         return response
 
 

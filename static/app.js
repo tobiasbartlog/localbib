@@ -4878,6 +4878,268 @@ function annotationTint(hex, dark) {
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+// =============================================================================
+// Markdown editor (ADR-0026)
+// -----------------------------------------------------------------------------
+// The WYSIWYG editor (Milkdown) is a vendored ESM bundle behind one seam, like
+// PDF.js: `window.LB_MD_EDITOR ?? import(editor.mjs)`, loaded on the first
+// editor and never before. Tests put a textarea fake into LB_MD_EDITOR.
+// `MarkdownEditor` is the Vue face of it (v-model), for the core and — as
+// `LocalBib.components.MarkdownEditor` — for Add-ons. It never writes back
+// a text the user did not edit.
+// =============================================================================
+
+const MD_EDITOR_MODULE = '/static/markdown/editor.mjs';
+const MD_EDITOR_CSS = '/static/vendor/milkdown-7.22.3/crepe.css';
+let _mdEditor = null;
+
+function loadMarkdownEditor() {
+    if (window.LB_MD_EDITOR) return Promise.resolve(window.LB_MD_EDITOR);
+    if (!_mdEditor) {
+        _mdEditor = (async () => {
+            if (!document.querySelector('link[data-lb-md]')) {
+                const link = document.createElement('link');
+                link.rel = 'stylesheet';
+                link.href = MD_EDITOR_CSS;
+                link.setAttribute('data-lb-md', '');
+                // Before our own sheet, so the .lb-md-* rules win.
+                const ours = document.querySelector('link[href*="/static/style.css"]');
+                document.head.insertBefore(link, ours || null);
+            }
+            return import(/* @vite-ignore */ MD_EDITOR_MODULE);
+        })();
+        _mdEditor.catch(() => { _mdEditor = null; });
+    }
+    return _mdEditor;
+}
+
+// Citations resolve against the library through the light lookup endpoint;
+// the editor caches per instance and batches the keys of one render.
+const MD_CITATION_RESOLVER = Object.freeze({
+    resolve: (keys) => api('/api/papers/lookup?' + keys.map((k) => 'keys=' + encodeURIComponent(k)).join('&'))
+        .then((r) => r.papers || []),
+    search: (q) => api('/api/papers/lookup?limit=7&q=' + encodeURIComponent(q || '')).then((r) => r.papers || []),
+});
+
+const MarkdownEditor = {
+    name: 'MarkdownEditor',
+    props: {
+        modelValue: { type: String, default: '' },
+        readonly: { type: Boolean, default: false },
+        placeholder: { type: String, default: '' },
+        // { wikilink: { search(q), resolve(id) -> {title, href, missing}, title } }
+        resolvers: { type: Object, default: null },
+        autofocus: { type: Boolean, default: false },
+        // A small field: no block handle, a short slash menu (fixed at mount).
+        compact: { type: Boolean, default: false },
+    },
+    emits: ['update:modelValue', 'focus', 'blur', 'ready'],
+    data() {
+        return { state: 'loading' }; // loading | ready | fallback
+    },
+    template: `
+        <div class="lb-md-host" :class="'is-' + state" data-testid="markdown-editor"
+             @focusin="$emit('focus')" @focusout="onFocusOut">
+            <div v-show="state !== 'fallback'" ref="mount" class="lb-md-mount"></div>
+            <template v-if="state === 'fallback'">
+                <textarea class="lb-input lb-md-fallback" rows="8" :value="modelValue" :readonly="readonly"
+                          :placeholder="placeholder || $t('editor.placeholder')" @input="onFallbackInput"></textarea>
+                <p class="lb-md-fallback-note">{{ $t('editor.unavailable') }}</p>
+            </template>
+        </div>`,
+    async mounted() {
+        this._value = this.modelValue;
+        try {
+            const mod = await loadMarkdownEditor();
+            if (this._gone) return;
+            const initial = this.modelValue;
+            const ed = await mod.createMarkdownEditor(this.$refs.mount, {
+                value: initial,
+                readonly: this.readonly,
+                placeholder: this.placeholder,
+                compact: this.compact,
+                resolvers: {
+                    citation: MD_CITATION_RESOLVER,
+                    open: (href) => this.$router.push(String(href).replace(/^#/, '')),
+                    ...(this.resolvers || {}),
+                },
+                t: (key, vars) => t(key, vars),
+                onChange: (value) => this.changed(value),
+            });
+            if (this._gone) { ed.destroy(); return; }
+            this._ed = ed;
+            // A value that arrived while the editor was built: the watcher
+            // already took it into _value, the editor still shows `initial`.
+            if (this.modelValue !== initial) { this._value = this.modelValue; ed.setValue(this.modelValue); }
+            this.state = 'ready';
+            if (this.autofocus) ed.focus();
+            this.$emit('ready');
+        } catch (e) {
+            console.error('Markdown editor unavailable:', e);
+            if (!this._gone) this.state = 'fallback';
+        }
+    },
+    beforeUnmount() {
+        this._gone = true;
+        this.flush();
+        if (this._ed) this._ed.destroy();
+        this._ed = null;
+    },
+    watch: {
+        modelValue(v) {
+            if (v === this._value) return;
+            this._value = v;
+            if (this._ed) this._ed.setValue(v);
+        },
+        readonly(on) {
+            if (this._ed) this._ed.setReadonly(on);
+        },
+    },
+    methods: {
+        changed(value) {
+            if (value === this._value) return;
+            this._value = value;
+            this.$emit('update:modelValue', value);
+        },
+        // Hands out typing the editor has not reported yet (it debounces):
+        // callers that save on leave flush first.
+        flush() {
+            if (this._ed) this.changed(this._ed.getValue());
+        },
+        focus() {
+            if (this._ed) this._ed.focus();
+            else if (this.state === 'fallback') { const ta = this.$el.querySelector('textarea'); if (ta) ta.focus(); }
+        },
+        onFallbackInput(e) {
+            this.changed(e.target.value);
+        },
+        onFocusOut(e) {
+            // Focus moving inside the editor (toolbar, popover input) is no blur.
+            if (e.relatedTarget && this.$el.contains(e.relatedTarget)) return;
+            this.flush();
+            this.$emit('blur');
+        },
+    },
+};
+
+// Read views: Markdown with the same chips, sanitised. A twin of the syntax
+// in static/markdown/syntax.mjs, pinned by tests/js/markdown_syntax.test.js -
+// app.js is a classic script and renders synchronously.
+const MD_KEY = String.raw`[\p{L}\p{N}_](?:[\p{L}\p{N}_:.#$%&+?<>~\/-]*[\p{L}\p{N}_])?`;
+const MD_CITE_ITEM = String.raw`-?@${MD_KEY}(?:,\s*[^;\[\]\n]+?)?`;
+const MD_CITE_SOURCE = String.raw`\[(${MD_CITE_ITEM}(?:;\s*${MD_CITE_ITEM})*)\]`;
+const MD_WIKI_SOURCE = String.raw`\[\[([^\[\]|\n]+?)(?:\|([^\[\]\n]*))?\]\]`;
+const MD_CITE_AT = new RegExp('^' + MD_CITE_SOURCE, 'u');
+const MD_WIKI_AT = new RegExp('^' + MD_WIKI_SOURCE);
+const MD_CITE_ONE = new RegExp(String.raw`^(-?)@(${MD_KEY})(?:,\s*(.+))?$`, 'u');
+
+function mdEscape(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function mdChipExtensions(opts) {
+    const wiki = opts && opts.wikilink;
+    return [
+        {
+            name: 'lbCitation',
+            level: 'inline',
+            start: (src) => { const i = src.search(/\[-?@/); return i < 0 ? undefined : i; },
+            tokenizer(src) {
+                const m = MD_CITE_AT.exec(src);
+                if (m) return { type: 'lbCitation', raw: m[0], cite: m[1] };
+                return undefined;
+            },
+            renderer(tok) {
+                const chips = tok.cite.split(';').map((part) => MD_CITE_ONE.exec(part.trim())).filter(Boolean)
+                    .map((m) => `<span class="lb-md-cite-chip" data-key="${mdEscape(m[2])}" data-locator="${mdEscape((m[3] || '').trim())}">`
+                        + `<span class="lb-md-cite-label">@${mdEscape(m[2])}</span>`
+                        + (m[3] ? `<span class="lb-md-cite-loc">${mdEscape(m[3].trim())}</span>` : '') + '</span>');
+                return `<span class="lb-md-citation" data-raw="${mdEscape(tok.cite)}">${chips.join('')}</span>`;
+            },
+        },
+        {
+            name: 'lbWikilink',
+            level: 'inline',
+            start: (src) => { const i = src.indexOf('[['); return i < 0 ? undefined : i; },
+            tokenizer(src) {
+                const m = MD_WIKI_AT.exec(src);
+                if (m) return { type: 'lbWikilink', raw: m[0], id: m[1].trim(), alias: (m[2] || '').trim() };
+                return undefined;
+            },
+            renderer(tok) {
+                const target = wiki ? wiki(tok.id) : null;
+                const text = mdEscape(tok.alias || (target && target.title) || tok.id);
+                const glyph = '<span class="lb-md-wiki-glyph">↗</span>';
+                if (target && target.href && !target.missing) {
+                    return `<a class="lb-md-wikilink" href="${mdEscape(target.href)}" title="${mdEscape(tok.id)}">${glyph}${text}</a>`;
+                }
+                return `<span class="lb-md-wikilink${wiki ? ' is-dangling' : ''}" title="${mdEscape(tok.id)}">${glyph}${text}</span>`;
+            },
+        },
+    ];
+}
+
+// `opts.wikilink(id) -> {title, href, missing}` resolves wikilinks
+// synchronously (an Add-on's own cache); without it they render as text chips.
+function renderMarkdownChips(text, opts) {
+    if (!text) return '';
+    if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined' || !marked.Marked) return renderMarkdownSafe(text);
+    const md = new marked.Marked({ breaks: true });
+    md.use({ extensions: mdChipExtensions(opts) });
+    return DOMPurify.sanitize(md.parse(String(text)));
+}
+
+// Labels the citation chips of a rendered element from the library and
+// makes them links: "Müller 2021", with a locator to its PDF page.
+async function hydrateMarkdownChips(root) {
+    if (!root || !root.querySelectorAll) return;
+    const chips = [...root.querySelectorAll('.lb-md-cite-chip[data-key]')];
+    const keys = [...new Set(chips.map((c) => c.dataset.key))];
+    if (!keys.length) return;
+    let papers = [];
+    try {
+        papers = await MD_CITATION_RESOLVER.resolve(keys);
+    } catch (e) {
+        return;
+    }
+    const byKey = new Map(papers.map((p) => [p.cite_key, p]));
+    for (const chip of chips) {
+        const p = byKey.get(chip.dataset.key);
+        const label = chip.querySelector('.lb-md-cite-label');
+        if (!p) {
+            chip.classList.add('is-missing');
+            chip.title = t('editor.cite.missing', { key: chip.dataset.key });
+            continue;
+        }
+        if (label) label.textContent = mdCiteLabel(p);
+        chip.title = `${p.title || ''}\n${p.authors || ''}${p.year ? ' · ' + p.year : ''}`;
+        const page = p.has_pdf ? (/^(?:S\.|p\.|pp\.|Seite|page)?\s*(\d+)/i.exec(chip.dataset.locator || '') || [])[1] : null;
+        chip.dataset.href = `#/paper/${p.id}${page ? '?page=' + page : ''}`;
+        chip.setAttribute('role', 'link');
+        chip.tabIndex = 0;
+        if (!chip._lbOpen) {
+            chip._lbOpen = true;
+            const go = () => { window.location.hash = chip.dataset.href; };
+            chip.addEventListener('click', go);
+            chip.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+        }
+    }
+}
+
+// Twin of shortAuthors/citeLabel in static/markdown/syntax.mjs.
+function mdCiteLabel(p) {
+    const a = String(p.authors || '').trim();
+    let names = [];
+    if (a.includes(';')) names = a.split(';').map((x) => x.split(',')[0].trim()).filter(Boolean);
+    else if (a) {
+        const segs = a.split(',').map((x) => x.trim()).filter(Boolean);
+        names = segs.length && segs[0].includes(' ') ? segs.map((s) => s.split(/\s+/).pop()) : segs.filter((_, i) => i % 2 === 0);
+    }
+    const who = names.length === 0 ? '' : names.length === 1 ? names[0]
+        : names.length === 2 ? `${names[0]} & ${names[1]}` : `${names[0]} et al.`;
+    return [who || p.cite_key, p.year].filter(Boolean).join(' ');
+}
+
 const AnnotationsBlock = {
     props: {
         // { status: 'loading' | 'ready' | 'unreadable' | 'error', data, error }
@@ -5094,7 +5356,7 @@ const AnnotationsBlock = {
 // =============================================================================
 
 const PaperDetail = {
-    components: { CollectionPicker, CategoryPicker, PdfPreview, AnnotationsBlock },
+    components: { CollectionPicker, CategoryPicker, PdfPreview, AnnotationsBlock, MarkdownEditor },
     template: `
         <div class="lb-modal-overlay" @click.self="close">
         <!-- Two-panel assembly (#161). It owns the gap between the panels, so a
@@ -5372,18 +5634,12 @@ const PaperDetail = {
                             <h4 class="lb-detail-h" style="margin: 0;">{{ $t('notes.heading') }}</h4>
                             <div class="flex items-center gap-3">
                                 <span v-if="notesStatus" class="lb-notes-status" :data-state="notesSaveState">{{ notesStatus }}</span>
-                                <button @click="notesEditing ? showNotes() : editNotes()" class="lb-btn-text" style="font-size: 11.5px;">
-                                    {{ notesEditing ? $t('notes.view') : $t('common.edit') }}
-                                </button>
                             </div>
                         </div>
-                        <div v-if="notesEditing" class="lb-notes-editor" data-testid="paper-notes-editor">
-                            <textarea ref="notesInput" v-model="notesDraft" @input="onNotesTyped()"
-                                      rows="6" class="lb-input"
-                                      :placeholder="$t('notes.placeholder')"></textarea>
+                        <div class="lb-notes-editor" data-testid="paper-notes-editor">
+                            <markdown-editor ref="notesEditor" compact :model-value="notesDraft" @update:model-value="onNotesTyped"
+                                             @blur="saveNotes()" :placeholder="$t('notes.placeholder')" />
                         </div>
-                        <div v-else class="lb-md lb-notes-rendered" data-testid="paper-notes-rendered"
-                             :title="$t('notes.clickToEdit')" @click="editNotes()" v-html="notesHtml"></div>
                     </section>
 
                     <!-- Custom Fields -->
@@ -5870,7 +6126,6 @@ const PaperDetail = {
             customValues: {},
             savingCustom: false,
             // Notizen (#160): Ansicht/Bearbeiten + Autosave-Status
-            notesEditing: false,
             notesDraft: '',
             notesSaveState: 'idle',   // idle | dirty | saving | saved | error
             extractingRefs: false,
@@ -5993,11 +6248,6 @@ const PaperDetail = {
             return '/api/papers/' + this.paper.id + '/pdf'
                 + (this.pdfVersion ? '?v=' + encodeURIComponent(this.pdfVersion) : '');
         },
-        notesHtml() {
-            const notes = this.paper && this.paper.notes;
-            return notes ? renderMarkdownSafe(notes)
-                         : '<p class="lb-notes-empty">' + t('notes.empty') + '</p>';
-        },
         notesStatus() {
             return {
                 dirty: t('notes.unsaved'), saving: t('notes.saving'),
@@ -6056,20 +6306,10 @@ const PaperDetail = {
     },
     watch: {
         '$route'() { this.load(); },
-        // Das Metadaten-Formular ersetzt den Notiz-Block im DOM. Vorher die
-        // offene Notiz sichern und den Editor abbauen, nachher wieder in den
-        // Oeffnungszustand gehen.
+        // Das Metadaten-Formular ersetzt den Notiz-Block im DOM: vorher die
+        // offene Notiz sichern.
         editingMeta(on) {
             if (on) this.teardownNotes();
-            else this.$nextTick(() => this.openNotes());
-        },
-        // The notes editor was laid out while its panel was hidden: measure it
-        // again once the panel shows.
-        activeTab() {
-            this.$nextTick(() => { if (this._notesCm) this._notesCm.refresh(); });
-        },
-        sideOpen() {
-            this.$nextTick(() => { if (this._notesCm) this._notesCm.refresh(); });
         },
     },
     methods: {
@@ -6127,64 +6367,9 @@ const PaperDetail = {
             }
         },
         // --- Notizen (#160) ------------------------------------------------
-        // Der Editor ist CodeMirror 5 (Markdown-Mode + continuelist-Addon) auf
-        // dem Textarea darunter. Fehlt das CDN, bleibt das Textarea selbst der
-        // Editor — eine Notiz zu schreiben soll an keiner Bibliothek haengen.
-        openNotes() {
-            // Paper ohne Notiz oeffnet direkt im Editor, Paper mit Notiz
-            // gerendert. Schreiben soll keinen zusaetzlichen Klick kosten.
-            if (this.paper && !(this.paper.notes || '').trim()) this.editNotes();
-        },
-        editNotes() {
-            if (this.notesEditing || this.editingMeta) return;
-            // Den Entwurf nur dann am gespeicherten Stand ausrichten, wenn
-            // nichts Ungesichertes darin steht: nach einem fehlgeschlagenen
-            // Save wuerde ein Wechsel Ansicht -> Bearbeiten sonst genau den
-            // Text loeschen, der noch nirgends angekommen ist.
-            if (this.notesSaveState === 'idle' || this.notesSaveState === 'saved') {
-                this.notesDraft = (this.paper && this.paper.notes) || '';
-            }
-            this.notesEditing = true;
-            this.$nextTick(() => this.mountNotesEditor());
-        },
-        showNotes() {
-            this.teardownNotes();
-        },
-        mountNotesEditor() {
-            const textarea = this.blockRef('notesInput');
-            if (!textarea) return;
-            if (typeof CodeMirror === 'undefined' || !CodeMirror.fromTextArea) {
-                textarea.focus();
-                return;
-            }
-            this._notesCm = CodeMirror.fromTextArea(textarea, {
-                mode: 'markdown',
-                lineWrapping: true,
-                viewportMargin: Infinity,
-                extraKeys: {
-                    // Aus dem continuelist-Addon: Enter in einer Liste setzt
-                    // die Liste fort, statt den Marker neu tippen zu lassen.
-                    Enter: 'newlineAndIndentContinueMarkdownList',
-                    'Ctrl-B': () => this.wrapNotesSelection('**'),
-                    'Ctrl-I': () => this.wrapNotesSelection('*'),
-                },
-            });
-            this._notesCm.on('change', () => this.onNotesTyped(this._notesCm.getValue()));
-            this._notesCm.focus();
-        },
-        wrapNotesSelection(marker) {
-            const cm = this._notesCm;
-            if (!cm) return;
-            const selected = cm.getSelection();
-            cm.replaceSelection(marker + selected + marker);
-            if (!selected) {
-                // Ohne Auswahl gehoert der Cursor zwischen die Marker, sonst
-                // tippt man hinter das schliessende Sternchen weiter.
-                const at = cm.getCursor();
-                cm.setCursor({ line: at.line, ch: at.ch - marker.length });
-            }
-            cm.focus();
-        },
+        // Der Editor ist der WYSIWYG-Markdown-Editor (ADR-0026), immer offen:
+        // es gibt keinen Lese-/Schreib-Umschalter mehr. Er meldet nur echte
+        // Bearbeitungen; geladen und nicht angefasst wird nie gespeichert.
         onNotesTyped(value) {
             if (value !== undefined) this.notesDraft = value;
             this.notesSaveState = 'dirty';
@@ -6247,14 +6432,12 @@ const PaperDetail = {
             }, 2500);
         },
         teardownNotes() {
-            // Offene Aenderung sichern (fire-and-forget), dann den Editor loesen.
+            // Was der Editor noch nicht gemeldet hat, holen, dann eine offene
+            // Aenderung sichern (fire-and-forget).
             clearTimeout(this._notesSavedTimer);
-            if (this.notesEditing) this.saveNotes();
-            if (this._notesCm) {
-                this._notesCm.toTextArea();
-                this._notesCm = null;
-            }
-            this.notesEditing = false;
+            const ed = this.blockRef('notesEditor');
+            if (ed) ed.flush();
+            this.saveNotes();
         },
         async load() {
             this.teardownNotes();
@@ -6296,7 +6479,6 @@ const PaperDetail = {
                 }
                 this.notesDraft = paper.notes || '';
                 this.notesSaveState = 'idle';
-                this.$nextTick(() => this.openNotes());
             } catch (e) {
                 console.error('Load paper error:', e);
             }
@@ -8084,6 +8266,14 @@ const ImportPage = {
                                     <p class="text-xs text-gray-400">{{ $t('import.optAbstractHint') }}</p>
                                 </div>
                             </label>
+                            <label class="flex items-center gap-3 cursor-pointer group">
+                                <input type="checkbox" v-model="uploadOpts.references" data-testid="upload-opt-references"
+                                       class="w-4 h-4 rounded border-gray-300 text-accent focus:ring-accent" />
+                                <div>
+                                    <span class="text-sm font-medium text-gray-700 group-hover:text-gray-900">{{ $t('import.optReferences') }}</span>
+                                    <p class="text-xs text-gray-400">{{ $t('import.optReferencesHint') }}</p>
+                                </div>
+                            </label>
                         </div>
                         <!-- Zielsammlung (#203): auch erkannte Dubletten landen darin -->
                         <h4 id="upload-target-label" class="text-sm font-semibold text-gray-800 mb-2">{{ $t('import.target.heading') }}</h4>
@@ -8204,6 +8394,23 @@ const ImportPage = {
                             </template>
                         </div>
 
+                        <!-- Literaturverzeichnisse der neuen Items: laeuft nach dem Import,
+                             das Ergebnis oben ist schon nutzbar. -->
+                        <div v-if="uploadRefs.state !== 'idle'" data-testid="upload-references"
+                             class="mt-4 pt-4 border-t border-gray-100 text-xs text-gray-600">
+                            <template v-if="uploadRefs.state === 'running'">
+                                <div class="flex items-center gap-2 mb-1.5">
+                                    <span class="spinner" style="width:12px;height:12px;border-width:1.5px;"></span>
+                                    <span>{{ uploadRefs.message || $t('import.references.running') }}</span>
+                                </div>
+                                <div class="w-full bg-gray-200 rounded-full h-1.5">
+                                    <div class="bg-accent h-1.5 rounded-full transition-all duration-300" :style="{ width: uploadRefs.percent + '%' }"></div>
+                                </div>
+                            </template>
+                            <p v-else-if="uploadRefs.state === 'done'">{{ $t('import.references.done', { count: uploadRefs.total_references, library: uploadRefs.total_in_library }) }}</p>
+                            <p v-else class="text-accent-ink">{{ $t('import.references.failed') }}</p>
+                        </div>
+
                         <div class="flex justify-end mt-4 pt-4 border-t border-gray-100">
                             <button @click="closeUploadDialog" class="px-4 py-2 text-sm text-white bg-accent rounded-lg hover:bg-accent-ink">{{ $t('common.close') }}</button>
                         </div>
@@ -8225,7 +8432,9 @@ const ImportPage = {
             showUploadDialog: false,
             uploadDialogPhase: 'options', // 'options' | 'processing' | 'result'
             uploadQueue: [],
-            uploadOpts: { doi: true, validate: true, categories: true, abstract: true },
+            uploadOpts: { doi: true, validate: true, categories: true, abstract: true, references: true },
+            // Reference extraction for the new Items, after the import itself.
+            uploadRefs: { state: 'idle', percent: 0, message: '', total_references: 0, total_in_library: 0 },
             uploadProgress: 0,
             uploadSteps: [],
             currentUploadFile: '',
@@ -8268,6 +8477,7 @@ const ImportPage = {
             this.uploadDialogResults = [];
             this.uploadSteps = [];
             this.uploadProgress = 0;
+            this.uploadRefs = { state: 'idle', percent: 0, message: '', total_references: 0, total_in_library: 0 };
             this.uploadTargetError = '';
             this.uploadNewCollectionName = '';
             this.showUploadDialog = true;
@@ -8386,6 +8596,40 @@ const ImportPage = {
             this.uploadDialogPhase = 'result';
             await this.loadPending();
             window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            const newIds = this.uploadDialogResults.filter(r => !r.error && r.paper_id).map(r => r.paper_id);
+            if (this.uploadOpts.references && newIds.length) {
+                await this.extractUploadReferences(newIds);
+            }
+        },
+        // The bibliographies of the Items just imported, through the same
+        // bulk run the migration uses (only Items without references yet).
+        async extractUploadReferences(paperIds) {
+            this.uploadRefs = { state: 'running', percent: 0, message: '', total_references: 0, total_in_library: 0 };
+            try {
+                const resp = await fetch('/api/papers/bulk-extract-references', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ paper_ids: paperIds }),
+                });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                let done = null;
+                await readSseStream(resp, (evt) => {
+                    if (evt.type === 'progress') {
+                        this.uploadRefs.percent = evt.percent || 0;
+                        this.uploadRefs.message = evt.message ? translateDetail(evt.message) : '';
+                    } else if (evt.type === 'complete') {
+                        done = evt;
+                    }
+                });
+                if (!done) throw new Error('stream ended early');
+                this.uploadRefs = {
+                    state: 'done', percent: 100, message: '',
+                    total_references: done.total_references || 0,
+                    total_in_library: done.total_in_library || 0,
+                };
+            } catch (e) {
+                this.uploadRefs = { ...this.uploadRefs, state: 'failed' };
+            }
         },
         // One sentence for the whole import: all failed steps share a cause
         // (the same model behind the fast role), so the first entry names it.
@@ -17614,6 +17858,10 @@ window.LocalBib = Object.freeze({
     tn: (key, n, vars) => tn(key, n, vars),
     api: (url, options) => api(url, options),
     events: Object.freeze({ changed: ADDON_EVENT }),
+    // Contract 2.4 (ADR-0026): the core's Markdown editor and read renderer.
+    components: Object.freeze({ MarkdownEditor }),
+    renderMarkdown: (text, opts) => renderMarkdownChips(text, opts),
+    hydrateMarkdown: (el) => hydrateMarkdownChips(el),
 });
 
 

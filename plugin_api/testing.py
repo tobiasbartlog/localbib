@@ -68,6 +68,12 @@ class InMemoryLibrary:
     ``library.write``: :func:`make_api` sets it from the declared permissions,
     and while it is False ``create_by_doi`` raises ``PermissionError``.
 
+    A reference may carry ``passages``: a list of ``{"text", "page_start"?,
+    "page_end"?, "printed_page_start"?, "printed_page_end"?}`` (missing
+    pages are ``None``). :meth:`search_passages` ranks them by how many
+    query words they contain, :meth:`get_passages` pages through them
+    (contract 2.5.0).
+
     ``collections`` seeds Collections the way the core holds them: each dict
     takes ``name`` and optionally ``id``, ``description``, ``refs`` (Cite
     Keys), ``archived`` / ``archived_at``, ``deleted`` / ``deleted_at``,
@@ -140,6 +146,51 @@ class InMemoryLibrary:
         if ref.get("year"):
             fields.append(f"  year = {{{ref['year']}}}")
         return "@article{" + key + ",\n" + ",\n".join(fields) + "\n}"
+
+    # --- Passages (contract 2.5) -------------------------------------------
+    @staticmethod
+    def _passage_wire(passage: dict) -> dict:
+        start = passage.get("page_start")
+        return {
+            "text": passage.get("text") or "",
+            "page_start": start,
+            "page_end": passage.get("page_end", start),
+            "printed_page_start": passage.get("printed_page_start"),
+            "printed_page_end": passage.get("printed_page_end", passage.get("printed_page_start")),
+        }
+
+    def search_passages(self, query: str, limit: int = 10) -> list[dict]:
+        words = [w for w in re.findall(r"\w+", (query or "").lower()) if w]
+        if not words:
+            return []
+        scored = []
+        for ref in self._refs.values():
+            for passage in ref.get("passages") or ():
+                text = (passage.get("text") or "").lower()
+                score = sum(text.count(w) for w in words)
+                if score:
+                    scored.append((score, ref, passage))
+        scored.sort(key=lambda item: -item[0])
+        return [
+            {"citekey": ref["citekey"], "title": ref.get("title") or "", "year": ref.get("year"),
+             **self._passage_wire(p), "score": float(score)}
+            for score, ref, p in scored[:max(1, limit)]
+        ]
+
+    def get_passages(self, citekey: str, offset: int = 0, limit: int = 20) -> Optional[dict]:
+        ref = self._refs.get(citekey)
+        if ref is None:
+            return None
+        passages = list(ref.get("passages") or ())
+        offset, limit = max(0, offset), max(1, limit)
+        return {
+            "citekey": citekey,
+            "total": len(passages),
+            "passages": [
+                {"index": offset + i, **self._passage_wire(p)}
+                for i, p in enumerate(passages[offset:offset + limit])
+            ],
+        }
 
     # --- Collections (contract 2.1) ----------------------------------------
     def list_collections(self) -> list[dict]:

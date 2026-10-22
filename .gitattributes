@@ -7,3 +7,7 @@ tests/fixtures/**/*.pdf -text
 # Vendored third-party files (PDF.js, #229) stay byte-identical to the pinned
 # upstream release, so their hashes can always be checked against it.
 static/vendor/** -text
+
+# The Markdown round-trip corpus (ADR-0026) is compared byte for byte: a
+# checkout must not turn its LF into CRLF.
+tests/js/fixtures/notes/*.md eol=lf

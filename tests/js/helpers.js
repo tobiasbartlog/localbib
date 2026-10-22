@@ -459,6 +459,12 @@ export function liveStream(signal) {
 }
 
 // Vue's v-model listens on `input`; setting .value alone never reaches it.
+// The textarea of a Markdown field (ADR-0026): the seam's fake renders one
+// inside the editor host, which carries the field's id.
+export function mdField(id) {
+    return document.querySelector(`#${id} textarea`);
+}
+
 export function typeInto(el, value) {
     el.value = value;
     el.dispatchEvent(new Event('input'));

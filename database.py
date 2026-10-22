@@ -730,6 +730,60 @@ class Database:
         conn.close()
         return [dict(r) for r in rows]
 
+    _LOOKUP_COLUMNS = "id, cite_key, title, authors, year, doi, filename"
+
+    def lookup_papers(self, query: str = "", keys: Optional[List[str]] = None,
+                      limit: int = 20) -> List[Dict]:
+        """The light lookup behind citation chips and the ``@`` suggestion list.
+
+        ``keys`` resolves exact citekeys (every match, in the given order);
+        otherwise ``query`` searches title, authors, citekey and DOI, citekey
+        prefixes first, then author matches, then the rest, newest first.
+        Returns ``{id, cite_key, title, authors, year, doi, has_pdf}``.
+        """
+        conn = self._connect()
+        try:
+            if keys is not None:
+                wanted = [k for k in dict.fromkeys(k.strip() for k in keys) if k]
+                if not wanted:
+                    return []
+                marks = ",".join("?" for _ in wanted)
+                rows = conn.execute(
+                    f"SELECT {self._LOOKUP_COLUMNS} FROM papers WHERE cite_key IN ({marks})",
+                    wanted,
+                ).fetchall()
+                order = {k: i for i, k in enumerate(wanted)}
+                rows = sorted(rows, key=lambda r: order.get(r["cite_key"], len(order)))
+            else:
+                # SQLite's LOWER() folds ASCII only ("Özdemir" stays "Ö"), and
+                # LIKE reads "_"/"%" in a citekey as wildcards: fold in Python
+                # and match with instr(), which takes the query literally.
+                conn.create_function("lb_fold", 1, lambda s: s.casefold() if isinstance(s, str) else s,
+                                     deterministic=True)
+                q = (query or "").strip().casefold()
+                rows = conn.execute(
+                    f"""
+                    SELECT {self._LOOKUP_COLUMNS} FROM papers
+                    WHERE instr(lb_fold(title), ?) OR instr(lb_fold(authors), ?)
+                       OR instr(lb_fold(cite_key), ?) OR instr(lb_fold(doi), ?)
+                    ORDER BY CASE
+                        WHEN instr(lb_fold(cite_key), ?) = 1 THEN 0
+                        WHEN instr(lb_fold(authors), ?) THEN 1
+                        ELSE 2 END,
+                        year DESC, title
+                    LIMIT ?
+                    """,
+                    (q, q, q, q, q, q, max(1, int(limit))),
+                ).fetchall()
+        finally:
+            conn.close()
+        return [
+            {"id": r["id"], "cite_key": r["cite_key"] or "", "title": r["title"] or "",
+             "authors": r["authors"] or "", "year": r["year"], "doi": r["doi"] or "",
+             "has_pdf": bool(r["filename"])}
+            for r in rows
+        ]
+
     # --- App-Settings (globale Key-Value-Einstellungen) ---
 
     def get_app_setting(self, key: str) -> str:

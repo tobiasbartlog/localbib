@@ -11,6 +11,36 @@ from config import Config
 from openalex_client import OpenAlexClient
 
 
+_DOI_CORE = r'10\.\d{4,9}/[^\s"<>]+'
+
+# A DOI the text names as one ("doi:", "doi.org/"), as opposed to any
+# 10.xxxx/... string, which may just as well be a cited work.
+_LABELED_DOI = re.compile(
+    rf'(?:https?://(?:dx\.)?doi\.org/|\bdoi[:\s]\s*)({_DOI_CORE})', re.IGNORECASE)
+
+# Where the bibliography starts, nothing after it names the document itself.
+_REFERENCE_HEADING = re.compile(
+    r'\n\s*(?:\d+\.?\s*)?(?:references|bibliography|literature cited|works cited'
+    r'|literatur(?:verzeichnis)?|quellenverzeichnis)\s*\n', re.IGNORECASE)
+
+_CLOSERS = {")": "(", "]": "[", "}": "{"}
+
+
+def _clean_doi(doi: str) -> str:
+    """Trailing punctuation the regex swallowed (``…123726.``, ``(doi:…)``)
+    does not belong to the DOI; a closing bracket only when it is unbalanced
+    — ``10.1016/0002-9149(83)90013-1`` keeps its own."""
+    while doi:
+        last = doi[-1]
+        if last in ".,;:'":
+            doi = doi[:-1]
+        elif last in _CLOSERS and doi.count(last) > doi.count(_CLOSERS[last]):
+            doi = doi[:-1]
+        else:
+            break
+    return doi
+
+
 def extract_doi_from_text(text: str, max_chars: int = 3000) -> Optional[str]:
     """Extrahiert DOI aus Text mittels Regex.
 
@@ -28,9 +58,75 @@ def extract_doi_from_text(text: str, max_chars: int = 3000) -> Optional[str]:
     for pattern in patterns:
         match = re.search(pattern, search_text, re.IGNORECASE)
         if match:
-            doi = match.group(1).rstrip(".")
-            return doi
+            doi = _clean_doi(match.group(1))
+            if doi:
+                return doi
     return None
+
+
+def extract_labeled_doi_from_text(text: str, max_chars: int = 12000) -> Optional[str]:
+    """The first DOI the text *names* as one (``https://doi.org/…``, ``doi:…``)
+    before its bibliography, within ``max_chars``.
+
+    Wider than :func:`extract_doi_from_text`: a journal's first page often
+    carries its DOI in the footer, after title, abstract and keywords — in a
+    large publisher's PDF well past the first 3000 characters. Only a labelled DOI
+    counts out there, and never one after the reference heading, so a cited
+    work's DOI is not taken for the document's own.
+    """
+    search_text = text[:max_chars]
+    heading = _REFERENCE_HEADING.search(search_text)
+    if heading:
+        search_text = search_text[:heading.start()]
+    match = _LABELED_DOI.search(search_text)
+    if not match:
+        return None
+    return _clean_doi(match.group(1)) or None
+
+
+def doi_from_pdf_metadata(info: Optional[dict], xmp: str = "") -> Optional[str]:
+    """The DOI a PDF's own metadata names: the XMP's ``prism:doi`` /
+    ``crossmark:DOI`` / ``pdfx:doi`` first, then any DOI in the Info
+    dictionary (e.g. ``subject = "Engineering Structures, 368 (2026)
+    123726. doi:10.1016/…"``). The publisher wrote these about this very
+    file, so they beat anything read from the page text."""
+    if xmp:
+        tagged = re.search(
+            r'<(?:prism:doi|crossmark:DOI|pdfx:doi)>\s*(?:doi:|https?://(?:dx\.)?doi\.org/)?'
+            r'(10\.\d{4,9}/[^\s"<>]+)\s*<', xmp, re.IGNORECASE)
+        if tagged:
+            return _clean_doi(tagged.group(1)) or None
+    for key in ("doi", "subject", "keywords", "title"):
+        value = (info or {}).get(key) or ""
+        match = re.search(_DOI_CORE, value)
+        if match:
+            doi = _clean_doi(match.group(0))
+            if doi:
+                return doi
+    return None
+
+
+def read_pdf_metadata(filepath: str) -> tuple[dict, str]:
+    """The PDF's Info dictionary and XMP packet; ``({}, "")`` when unreadable."""
+    try:
+        import fitz  # PyMuPDF
+        with fitz.open(filepath) as doc:
+            return dict(doc.metadata or {}), doc.get_xml_metadata() or ""
+    except Exception as e:
+        logging.debug("PDF metadata unreadable (%s): %s", filepath, e)
+        return {}, ""
+
+
+_UNUSABLE_TITLE = re.compile(r'(?i)^(untitled|microsoft word|document\d*)\b|\.(pdf|docx?|tex|indd)$')
+
+
+def title_from_pdf_metadata(info: Optional[dict]) -> str:
+    """The Info dictionary's title when it reads like one — not empty, not a
+    file name (``paper.docx``), not a word processor's placeholder."""
+    title = ((info or {}).get("title") or "").strip()
+    if len(title) < 10 or len(title.split()) < 2 or _UNUSABLE_TITLE.search(title):
+        return ""
+    return title
 
 
 def extract_year_from_text(text: str) -> Optional[int]:
@@ -171,13 +267,22 @@ def search_openalex_for_doi(title: str, authors: str = "", year: Optional[int] =
     return None
 
 
-def discover_doi(text: str, title: str = "", authors: str = "", year: Optional[int] = None) -> Optional[str]:
+def discover_doi(text: str, title: str = "", authors: str = "", year: Optional[int] = None,
+                 pdf_metadata: Optional[tuple[dict, str]] = None) -> Optional[str]:
     """Versucht ueber mehrere Strategien eine DOI zu finden:
-    1. DOI direkt im Text
+    0. DOI in den PDF-Metadaten (``pdf_metadata`` = :func:`read_pdf_metadata`)
+    1. DOI direkt im Text (Anfang)
     2. arXiv-ID im Text → arXiv DataCite DOI
-    3. OpenAlex Titelsuche
-    4. CrossRef Titelsuche
+    3. als DOI ausgezeichnete DOI bis zum Literaturverzeichnis
+    4. OpenAlex Titelsuche
+    5. CrossRef Titelsuche
     """
+    # Strategie 0: die Metadaten, die der Verlag in genau diese Datei schrieb
+    if pdf_metadata:
+        doi = doi_from_pdf_metadata(*pdf_metadata)
+        if doi:
+            return doi
+
     # Strategie 1: DOI direkt im Text
     doi = extract_doi_from_text(text)
     if doi:
@@ -190,16 +295,18 @@ def discover_doi(text: str, title: str = "", authors: str = "", year: Optional[i
         if doi:
             return doi
 
-    # Strategie 3: OpenAlex Titelsuche
-    if title:
-        doi = search_openalex_for_doi(title, authors, year)
-        if doi:
-            return doi
+    # Strategie 3: Fusszeile der ersten Seite (grosse Verlage), nach Strategie
+    # 2, damit ein arXiv-Preprint nicht die DOI eines zitierten Werks bekommt
+    doi = extract_labeled_doi_from_text(text)
+    if doi:
+        return doi
 
-    # Strategie 4: CrossRef Titelsuche (nur wenn Titel vorhanden)
-    if title:
-        doi = search_crossref_for_doi(title, authors)
-        if doi:
-            return doi
+    # Strategie 4+5: OpenAlex, dann CrossRef Titelsuche
+    return search_doi_by_title(title, authors, year)
 
-    return None
+
+def search_doi_by_title(title: str, authors: str = "", year: Optional[int] = None) -> Optional[str]:
+    """OpenAlex Titelsuche, dann CrossRef — ``None`` ohne Titel."""
+    if not title:
+        return None
+    return search_openalex_for_doi(title, authors, year) or search_crossref_for_doi(title, authors)

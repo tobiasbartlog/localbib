@@ -69,6 +69,7 @@ from cite_key_generator import base_key as _legacy_cite_key_base
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+import passage_retrieval
 import services.research_rag as _rag
 import services.semantic_search as _semantic
 from context import get_conn
@@ -80,7 +81,7 @@ router = APIRouter()
 
 DEFAULT_TOP_K = 10
 ABSTRACT_EXCERPT_CHARS = 300
-RRF_K = 60
+RRF_K = passage_retrieval.RRF_K
 
 
 class SemanticSearchRequest(BaseModel):
@@ -91,13 +92,6 @@ class SemanticSearchRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers (I/O -- live in the router, not the pure service)
 # ---------------------------------------------------------------------------
-
-def _load_papers(conn) -> list[dict]:
-    rows = conn.execute(
-        "SELECT id, cite_key, title, year, abstract FROM papers ORDER BY id"
-    ).fetchall()
-    return [dict(r) for r in rows]
-
 
 def _excerpt(text: str, n: int = ABSTRACT_EXCERPT_CHARS) -> str:
     text = (text or "").strip()
@@ -175,7 +169,7 @@ def _search(q: str, top_k: int) -> dict:
 
     conn = get_conn()
     try:
-        papers = _load_papers(conn)
+        papers = passage_retrieval.load_papers(conn)
 
         model = Config.embed_model()
         if not model:
@@ -258,20 +252,13 @@ async def semantic_search_post(req: SemanticSearchRequest):
 PASSAGE_TOP_K = 10
 # How many top-ranked papers stay in the pool before the chunk-level cosine
 # pass runs -- the "keeps the matrix small" half of the two-stage design.
-PASSAGE_TOP_N_PAPERS = 20
+PASSAGE_TOP_N_PAPERS = passage_retrieval.PASSAGE_TOP_N_PAPERS
 PASSAGE_EXCERPT_CHARS = 300
 
 
 class PassageSearchRequest(BaseModel):
     q: str
     top_k: int = PASSAGE_TOP_K
-
-
-def _load_all_chunks_meta(conn) -> list[dict]:
-    rows = conn.execute(
-        "SELECT id AS chunk_id, paper_id, chunk_text, page_start FROM paper_chunks"
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
 def _passage_hit(chunk: dict, by_paper: dict, score: float) -> dict:
@@ -287,114 +274,27 @@ def _passage_hit(chunk: dict, by_paper: dict, score: float) -> dict:
     }
 
 
-def _passage_bm25_fallback(q: str, top_k: int, chunks: list[dict], by_paper: dict, note: str = "") -> dict:
-    """Lexical fallback over the REAL ``paper_chunks`` (unlike the paper-level
-    fallback, there is no pseudo-chunk substitute here -- passages ARE
-    chunks)."""
-    hits = _rag.bm25_search(q, chunks, top_k=top_k)
-    results = [_passage_hit(h, by_paper, h["score"]) for h in hits]
-    resp: dict = {"mode": "bm25", "results": results}
-    if note:
-        resp["note"] = note
-    return resp
-
-
 def _passage_search(q: str, top_k: int) -> dict:
-    q = (q or "").strip()
-    if not q:
-        return {"mode": "bm25", "results": []}
-    top_k = max(1, top_k)
-
+    """The ranking lives in ``passage_retrieval`` (shared with the Add-on
+    Contract's ``search_passages``); this shapes the HTTP answer."""
     conn = get_conn()
     try:
-        papers = _load_papers(conn)
-        by_paper = {p["id"]: p for p in papers}
-        all_chunks = _load_all_chunks_meta(conn)
-
-        model = Config.embed_model()
-        if not model:
-            return _passage_bm25_fallback(q, top_k, all_chunks, by_paper)
-
-        paper_vector_rows = conn.execute(
-            "SELECT paper_id, vector FROM paper_embeddings WHERE model = ?", (model,)
-        ).fetchall()
-        chunk_vector_rows = conn.execute(
-            """SELECT pc.id AS chunk_id, pc.paper_id, pc.chunk_text, pc.page_start, ce.vector
-               FROM chunk_embeddings ce
-               JOIN paper_chunks pc ON pc.id = ce.chunk_id
-               WHERE ce.model = ?""",
-            (model,),
-        ).fetchall()
-        if not paper_vector_rows or not chunk_vector_rows:
-            return _passage_bm25_fallback(
-                q, top_k, all_chunks, by_paper,
-                note="Kein Chunk-Embedding-Index fuer das aktuell konfigurierte Modell vorhanden "
-                     "(lexikalischer Passagen-Fallback statt stillem Modell-Mismatch).",
-            )
-
-        try:
-            query_vector = embed_texts([q], mode="query")[0]
-        except Exception as e:
-            logging.warning(f"Passagensuche: Query-Embedding fehlgeschlagen: {e}")
-            return _passage_bm25_fallback(
-                q, top_k, all_chunks, by_paper,
-                note="Embedding-Anfrage fehlgeschlagen, lexikalischer Passagen-Fallback.",
-            )
-
-        paper_candidates = [
-            {"paper_id": r["paper_id"], "vector": unpack_vector(r["vector"])}
-            for r in paper_vector_rows
-            if r["paper_id"] in by_paper
-        ]
-        chunk_candidates = [
-            {
-                "chunk_id": r["chunk_id"],
-                "paper_id": r["paper_id"],
-                "chunk_text": r["chunk_text"],
-                "page_start": r["page_start"],
-                "vector": unpack_vector(r["vector"]),
-            }
-            for r in chunk_vector_rows
-        ]
-
-        # Stage 1+2 (pure, services.semantic_search): rank papers, then only
-        # cosine-rank chunks belonging to the top-ranked papers. Not truncated
-        # to top_k yet -- the BM25/RRF fusion below needs the full pooled
-        # ranking, truncation happens after fusion.
-        cosine_chunks = _semantic.two_stage_paper_then_chunk_ranking(
-            query_vector, paper_candidates, chunk_candidates,
-            top_n_papers=PASSAGE_TOP_N_PAPERS, top_k_chunks=len(chunk_candidates),
+        ranked = passage_retrieval.rank_passages(
+            conn, q, top_k,
+            model=Config.embed_model(),
+            embed=embed_texts,
+            top_n_papers=PASSAGE_TOP_N_PAPERS,
         )
-        if not cosine_chunks:
-            # Embeddings exist, but none belong to a paper that made the
-            # paper-level top-N cut -- nothing to show, not an error.
-            return {"mode": "semantic", "results": []}
-
-        # BM25 within the SAME paper pool the cosine stage settled on, so the
-        # RRF fusion below compares two rankings over one consistent chunk set.
-        pool_paper_ids = {c["paper_id"] for c in cosine_chunks}
-        pooled_chunks = [c for c in all_chunks if c["paper_id"] in pool_paper_ids]
-        bm25_hits = _rag.bm25_search(q, pooled_chunks, top_k=len(pooled_chunks)) if pooled_chunks else []
-        bm25_chunk_ranking = [h["chunk_id"] for h in bm25_hits]
-
-        if not bm25_chunk_ranking:
-            results = [_passage_hit(c, by_paper, c["score"]) for c in cosine_chunks[:top_k]]
-            return {"mode": "semantic", "results": results}
-
-        cosine_chunk_ranking = [c["chunk_id"] for c in cosine_chunks]
-        cosine_by_id = {c["chunk_id"]: c for c in cosine_chunks}
-        bm25_by_id = {h["chunk_id"]: h for h in bm25_hits}
-        fused = _rag.reciprocal_rank_fusion([cosine_chunk_ranking, bm25_chunk_ranking], k=RRF_K)
-
-        results = []
-        for chunk_id, score in fused[:top_k]:
-            base = cosine_by_id.get(chunk_id) or bm25_by_id.get(chunk_id)
-            if base is None:
-                continue
-            results.append(_passage_hit(base, by_paper, score))
-        return {"mode": "hybrid", "results": results}
     finally:
         conn.close()
+    by_paper = ranked["papers"]
+    resp: dict = {
+        "mode": ranked["mode"],
+        "results": [_passage_hit(c, by_paper, score) for c, score in ranked["hits"]],
+    }
+    if ranked.get("note"):
+        resp["note"] = ranked["note"]
+    return resp
 
 
 @router.get("/api/search/passages")
@@ -412,6 +312,7 @@ async def passage_search_post(req: PassageSearchRequest):
 # ---------------------------------------------------------------------------
 
 REFERENCE_CHUNKS_DEFAULT_LIMIT = 50
+_CHUNK_FIELDS = ("chunk_id", "page_start", "page_end", "chunk_text")
 
 
 def _cite_key(p: dict) -> str:
@@ -472,18 +373,12 @@ async def get_reference_chunks(
         p = _find_paper_by_citekey(conn, citekey)
         if not p:
             raise HTTPException(status_code=404, detail={"code": "error.unknown_citekey", "params": {"citekey": citekey}})
-        total = conn.execute(
-            "SELECT COUNT(*) AS n FROM paper_chunks WHERE paper_id = ?", (p["id"],)
-        ).fetchone()["n"]
-        rows = conn.execute(
-            "SELECT id AS chunk_id, page_start, page_end, chunk_text FROM paper_chunks "
-            "WHERE paper_id = ? ORDER BY chunk_index LIMIT ? OFFSET ?",
-            (p["id"], max(1, limit), max(0, offset)),
-        ).fetchall()
+        total = passage_retrieval.count_chunks(conn, p["id"])
+        rows = passage_retrieval.paper_chunks(conn, p["id"], limit=limit, offset=offset)
         return {
             "citekey": _cite_key(p),
             "total": total,
-            "chunks": [dict(r) for r in rows],
+            "chunks": [{k: r[k] for k in _CHUNK_FIELDS} for r in rows],
         }
     finally:
         conn.close()

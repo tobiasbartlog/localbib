@@ -143,3 +143,85 @@ class TestDiscoverDOI:
         monkeypatch.setattr(doi_discovery, "search_openalex_for_doi", lambda t, a, y: None)
         monkeypatch.setattr(doi_discovery, "search_crossref_for_doi", lambda t, a: None)
         assert discover_doi("nothing", title="Title") is None
+
+
+# -- First-page footer, PDF metadata (2026-10-21) ------------------------------
+
+from doi_discovery import (  # noqa: E402
+    doi_from_pdf_metadata,
+    extract_labeled_doi_from_text,
+    read_pdf_metadata,
+    title_from_pdf_metadata,
+)
+
+# A journal first page: title, abstract, keywords, then the footer DOI
+# well past 3000 characters (seen at 4713 in a real Engineering Structures PDF).
+_JOURNAL_PAGE = ("Engineering Structures 368 (2026) 123726\n" + "abstract words " * 300
+                  + "\nhttps://doi.org/10.1016/j.engstruct.2026.123726\nReceived 27 May 2026\n")
+
+
+class TestLabeledDOI:
+    def test_footer_doi_past_3000_chars(self):
+        assert extract_doi_from_text(_JOURNAL_PAGE) is None
+        assert extract_labeled_doi_from_text(_JOURNAL_PAGE) == "10.1016/j.engstruct.2026.123726"
+
+    def test_doi_after_the_reference_heading_is_a_cited_work(self):
+        text = "x " * 2000 + "\nReferences\n[1] Doe. doi:10.1/cited\n"
+        assert extract_labeled_doi_from_text(text) is None
+
+    def test_unlabeled_doi_does_not_count(self):
+        assert extract_labeled_doi_from_text("x " * 2000 + " 10.1234/bare ") is None
+
+    def test_discover_finds_the_footer_doi(self, monkeypatch):
+        monkeypatch.setattr(doi_discovery, "search_openalex_for_doi", lambda *a, **k: pytest.fail("called"))
+        assert discover_doi(_JOURNAL_PAGE) == "10.1016/j.engstruct.2026.123726"
+
+    def test_arxiv_id_wins_over_a_footer_doi(self):
+        text = "arXiv:1803.10122v2\n" + "y " * 2000 + "see https://doi.org/10.1/other\n"
+        assert discover_doi(text) == "10.48550/arXiv.1803.10122"
+
+
+class TestCleanDOI:
+    def test_trailing_punctuation_dropped(self):
+        assert extract_doi_from_text("(doi:10.1234/abc.def).") == "10.1234/abc.def"
+
+    def test_balanced_parentheses_kept(self):
+        assert extract_doi_from_text("doi:10.1016/0002-9149(83)90013-1 x") == "10.1016/0002-9149(83)90013-1"
+
+
+class TestPdfMetadata:
+    def test_doi_in_the_subject(self):
+        info = {"subject": "Engineering Structures, 368 (2026) 123726. doi:10.1016/j.engstruct.2026.123726"}
+        assert doi_from_pdf_metadata(info) == "10.1016/j.engstruct.2026.123726"
+
+    def test_xmp_prism_doi_first(self):
+        xmp = "<rdf:Description><prism:doi>10.1007/s1-2</prism:doi></rdf:Description>"
+        assert doi_from_pdf_metadata({"subject": "doi:10.9/other"}, xmp) == "10.1007/s1-2"
+
+    def test_none_without_a_doi(self):
+        assert doi_from_pdf_metadata({"title": "A Paper", "subject": ""}, "") is None
+        assert doi_from_pdf_metadata(None) is None
+
+    def test_metadata_short_circuits_discovery(self, monkeypatch):
+        monkeypatch.setattr(doi_discovery, "search_openalex_for_doi", lambda *a, **k: pytest.fail("called"))
+        meta = ({"subject": "doi:10.5555/meta"}, "")
+        assert discover_doi("doi: 10.1234/text", pdf_metadata=meta) == "10.5555/meta"
+
+    def test_read_from_a_real_pdf(self, tmp_path):
+        import fitz
+        path = tmp_path / "m.pdf"
+        doc = fitz.open()
+        doc.new_page()
+        doc.set_metadata({"title": "A Real Title Here", "subject": "J. 1 (2026). doi:10.5555/real.1"})
+        doc.save(path)
+        doc.close()
+        info, _xmp = read_pdf_metadata(str(path))
+        assert doi_from_pdf_metadata(info) == "10.5555/real.1"
+        assert title_from_pdf_metadata(info) == "A Real Title Here"
+
+    def test_unreadable_file(self, tmp_path):
+        assert read_pdf_metadata(str(tmp_path / "missing.pdf")) == ({}, "")
+
+    @pytest.mark.parametrize("title", ["", "Untitled", "paper_final.docx", "Microsoft Word - draft", "Short"])
+    def test_placeholder_titles_rejected(self, title):
+        assert title_from_pdf_metadata({"title": title}) == ""

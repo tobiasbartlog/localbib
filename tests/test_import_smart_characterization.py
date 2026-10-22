@@ -283,24 +283,33 @@ class TestUploadSmart:
 
     def test_content_title_dedup_emits_sse_error(self, client, db):
         """A paper with the same normalised title already in the DB triggers the
-        content-duplicate check and emits an SSE error event (HTTP 200)."""
+        content-duplicate check and emits an SSE error event (HTTP 200).
+        The existing Item holds its PDF in all/ — without one the upload would
+        be its only copy and stay (``test_import_smart_only_copy``)."""
         existing_title = "Der Klimawandel und seine Folgen fuer die Arktis"
-        conn = db._connect()
-        conn.execute(
-            "INSERT INTO papers (file_hash, filename, original_filename, title, authors) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ("existinghash_abc", "existing.pdf", "existing.pdf", existing_title, "Schmidt"),
-        )
-        conn.commit()
-        conn.close()
-
-        # Upload different bytes whose extracted text starts with the same title
-        with _patch_text(existing_title + "\nSome additional body content."), \
-             _patch_no_doi(), _patch_no_chunks(), _patch_no_symlinks():
-            resp = client.post(
-                f"/api/import/upload-smart{_SKIP_ALL}",
-                files={"file": ("klimawandel.pdf", b"%PDF-1.4 other bytes xyz", "application/pdf")},
+        stored = Path(Config.ALL_DIR) / "existing.pdf"
+        stored.write_bytes(b"%PDF-1.4 the existing item's stored copy")
+        try:
+            conn = db._connect()
+            conn.execute(
+                "INSERT INTO papers (file_hash, filename, original_filename, title, authors) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("existinghash_abc", "existing.pdf", "existing.pdf", existing_title, "Schmidt"),
             )
+            conn.commit()
+            conn.close()
+
+            # Upload different bytes whose extracted text starts with the same title
+            with _patch_text(existing_title + "\nSome additional body content."), \
+                 _patch_no_doi(), _patch_no_chunks(), _patch_no_symlinks():
+                resp = client.post(
+                    f"/api/import/upload-smart{_SKIP_ALL}",
+                    files={"file": ("klimawandel.pdf", b"%PDF-1.4 other bytes xyz", "application/pdf")},
+                )
+        finally:
+            # all/ is shared by the whole session: the seeded copy must not
+            # outlive this test, whatever fails above.
+            stored.unlink(missing_ok=True)
         assert resp.status_code == 200
         events = _parse_sse(resp)
         err = _event_by_type(events, "error")

@@ -174,6 +174,31 @@ class LibraryApi(Protocol):
         when the host predates it (``getattr(..., None)``)."""
         ...
 
+    def search_passages(self, query: str, limit: int = 10) -> list[dict]:
+        """Text passages of the library ranked for ``query`` (contract 2.5.0):
+        ``[{citekey, title, year, text, page_start, page_end,
+        printed_page_start, printed_page_end, score}]``, best first.
+
+        The ranking is the core's passage search (hybrid semantic + BM25, BM25
+        alone without embeddings). ``text`` is the whole passage.
+        ``page_start``/``page_end`` are 1-based **PDF** pages (``None`` when
+        unknown); ``printed_page_*`` is the page printed on the paper — the
+        PDF's page label, or the metadata ``pages`` range when its length
+        matches the PDF — and ``None`` when neither is reliable. The core never
+        guesses a printed page: cite the PDF page explicitly as such then.
+        Guard with ``getattr(library, "search_passages", None)`` for hosts
+        older than 2.5."""
+        ...
+
+    def get_passages(self, citekey: str, offset: int = 0, limit: int = 20) -> Optional[dict]:
+        """The Item's passages in reading order (contract 2.5.0):
+        ``{citekey, total, passages: [{index, text, page_start, page_end,
+        printed_page_start, printed_page_end}]}``, ``limit`` of them from
+        ``offset``. ``None`` for an unknown Cite Key; ``total: 0`` means the
+        Item has no extracted text (degrade to the abstract). Page fields as
+        in :meth:`search_passages`."""
+        ...
+
     def list_collections(self) -> list[dict]:
         """Every Collection — active, archived and tombstoned — by name."""
         ...

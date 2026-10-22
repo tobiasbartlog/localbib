@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import import_indexing
+import paper_ingest
 import pipeline
 from config import Config
 from database import Database
@@ -55,6 +56,42 @@ def _make_pdf(input_dir: Path, name: str = "paper.pdf") -> str:
     fp = input_dir / name
     fp.write_bytes(b"%PDF-1.4 fake")
     return str(fp)
+
+
+def _clear_pdf(db: Database, all_dir: Path, paper_id: int) -> None:
+    """The state Diagnosis ``clear_pdf`` leaves: the file in all/ is gone, the
+    row keeps its hash but its ``filename`` is empty."""
+    row = next(p for p in db.get_all_papers() if p["id"] == paper_id)
+    (all_dir / row["filename"]).unlink(missing_ok=True)
+    conn = db._connect()
+    try:
+        conn.execute("UPDATE papers SET filename = '' WHERE id = ?", (paper_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _wire_attach(db: Database, mp) -> list:
+    """``paper_ingest`` writes through ``Config.DB_PATH`` (the one DB every
+    caller of ``process_paper`` passes) — point it at this test's Database and
+    neutralise its IO boundaries. Returns the recorded symlink calls."""
+    mp.setattr(Config, "DB_PATH", db.db_path)
+    links = []
+    mp.setattr(paper_ingest, "create_symlinks",
+               lambda _db, pid, name: links.append((pid, name)))
+    mp.setattr(paper_ingest, "extract_text_from_pdf", lambda fp, mp_: "attached text")
+    mp.setattr(paper_ingest, "index_paper_after_import",
+               lambda pid, path: {"chunks": 0, "paper_embedded": False, "chunk_vectors": 0})
+    return links
+
+
+def _seed_item(db: Database, *, filename: str, doi: str = "", title: str = "Existing") -> int:
+    return db.add_paper({
+        "file_hash": f"seed-{doi or title}", "filename": filename,
+        "original_filename": filename, "title": title, "authors": "", "year": 2020,
+        "doi": doi, "isbn": "", "abstract": "", "journal": "", "publisher": "",
+        "raw_metadata": "", "ocr_text": "",
+    })
 
 
 class TestProcessPaper:
@@ -107,13 +144,10 @@ class TestProcessPaper:
 
     def test_title_doi_duplicate_detected(self, env):
         db, input_dir, all_dir, mp = env
-        # Seed an existing paper with a known DOI.
-        db.add_paper({
-            "file_hash": "other-hash", "filename": "x.pdf", "original_filename": "x.pdf",
-            "title": "Existing", "authors": "", "year": 2020, "doi": "10.9/dup",
-            "isbn": "", "abstract": "", "journal": "", "publisher": "",
-            "raw_metadata": "", "ocr_text": "",
-        })
+        # Seed an existing paper with a known DOI — and its file in all/, so
+        # the input is a second copy, not the only one.
+        _seed_item(db, filename="x.pdf", doi="10.9/dup")
+        (all_dir / "x.pdf").write_bytes(b"%PDF-1.4 stored")
         mp.setattr(pipeline, "discover_doi", lambda *a, **k: "10.9/dup")
         path = _make_pdf(input_dir)
 
@@ -199,6 +233,130 @@ class TestNoPdfIsLost:
         assert stored.exists()
         assert not Path(again).exists()
         assert len(db.get_all_papers()) == 1 and pid is not None
+
+    def test_hash_duplicate_whose_name_is_taken_by_a_folder_keeps_the_input(self, env):
+        """Drift (review 2026-10-18, C7): a folder sits in all/ under the name
+        the row points to. It is not the stored PDF (the one rule,
+        ``filenames.stored_pdf_path``, asks for a file), so the input is the
+        only copy — and it cannot be restored under that name either. It
+        stays; nothing is copied into the folder."""
+        db, input_dir, all_dir, mp = env
+        pipeline.process_paper(_make_pdf(input_dir, "a.pdf"), db)
+        stored = all_dir / db.get_all_papers()[0]["filename"]
+        stored.unlink()
+        stored.mkdir()
+        again = _make_pdf(input_dir, "a.pdf")
+
+        assert pipeline.process_paper(again, db) is None
+
+        assert Path(again).exists(), "the only copy must not be deleted"
+        assert stored.is_dir() and not any(stored.iterdir())
+        assert len(db.get_all_papers()) == 1
+
+    def test_a_failed_restore_keeps_the_input_and_leaves_no_partial_copy(self, env):
+        """A copy that dies half-way must not leave a file under the row's name:
+        the next run would take it for the stored PDF and delete the input."""
+        db, input_dir, all_dir, mp = env
+        pipeline.process_paper(_make_pdf(input_dir, "a.pdf"), db)
+        stored = all_dir / db.get_all_papers()[0]["filename"]
+        stored.unlink()
+
+        def torn_copy(src, dst):
+            Path(dst).write_bytes(b"%PDF-1.4 fa")  # half of it
+            raise OSError("disk full")
+
+        mp.setattr(pipeline.shutil, "copy2", torn_copy)
+        again = _make_pdf(input_dir, "a.pdf")
+
+        assert pipeline.process_paper(again, db) is None
+
+        assert Path(again).exists(), "the only copy must survive a failed restore"
+        assert not stored.exists(), "a torn copy is no stored PDF"
+
+    def test_hash_match_on_an_item_without_file_attaches_the_input(self, env):
+        """Bug 4 (review 2026-10-18): the row kept the hash but has no file
+        (Diagnosis clear_pdf). The input is the only copy — it is attached to
+        that row (file in all/, symlinks), never deleted. The PDF did land in
+        the library, so the Item's id comes back (C5): the callers report it
+        as imported, not as "skipped"."""
+        db, input_dir, all_dir, mp = env
+        pid = pipeline.process_paper(_make_pdf(input_dir, "a.pdf"), db)
+        _clear_pdf(db, all_dir, pid)
+        links = _wire_attach(db, mp)
+        again = _make_pdf(input_dir, "again.pdf")
+
+        assert pipeline.process_paper(again, db) == pid
+
+        rows = db.get_all_papers()
+        assert len(rows) == 1
+        filename = rows[0]["filename"]
+        assert filename, "the input must be attached to the file-less row"
+        assert (all_dir / filename).read_bytes() == b"%PDF-1.4 fake"
+        assert links == [(pid, filename)]
+        assert not Path(again).exists()  # attached, so the input may go
+
+    def test_failed_attach_keeps_the_input(self, env):
+        db, input_dir, all_dir, mp = env
+        pid = pipeline.process_paper(_make_pdf(input_dir, "a.pdf"), db)
+        _clear_pdf(db, all_dir, pid)
+        _wire_attach(db, mp)
+
+        def boom(paper_id, path, do_chunks=True):
+            raise OSError("disk full")
+
+        mp.setattr(paper_ingest, "attach_pdf_from_path", boom)
+        again = _make_pdf(input_dir, "again.pdf")
+
+        assert pipeline.process_paper(again, db) is None
+
+        assert Path(again).exists(), "the only copy must survive a failed attach"
+        assert db.get_all_papers()[0]["filename"] == ""
+
+    def test_doi_match_on_an_item_without_file_keeps_the_input(self, env):
+        """An Item from the DOI intake or the BibTeX import has no PDF: a
+        DOI match against it makes the input the only copy of that PDF."""
+        db, input_dir, all_dir, mp = env
+        _seed_item(db, filename="", doi="10.9/nofile")
+        mp.setattr(pipeline, "discover_doi", lambda *a, **k: "10.9/nofile")
+        path = _make_pdf(input_dir)
+
+        assert pipeline.process_paper(path, db) is None
+
+        assert Path(path).exists(), "the only copy must not be deleted"
+        rows = db.get_all_papers()
+        assert len(rows) == 1 and rows[0]["filename"] == ""
+        assert not list(all_dir.glob("*.pdf"))
+
+    def test_title_match_on_an_item_whose_file_is_missing_keeps_the_input(self, env):
+        db, input_dir, all_dir, mp = env
+        title = "A Sufficiently Long Matching Title"
+        _seed_item(db, filename="gone.pdf", title=title)  # row says gone.pdf, all/ has none
+        mp.setattr(pipeline, "extract_text_from_pdf", lambda fp, mp_: f"{title}\nbody")
+        path = _make_pdf(input_dir)
+
+        assert pipeline.process_paper(path, db) is None
+
+        assert Path(path).exists(), "the only copy must not be deleted"
+        assert len(db.get_all_papers()) == 1
+        assert not (all_dir / "gone.pdf").exists()
+
+    @pytest.mark.parametrize("filename", ["", "gone.pdf"])
+    def test_an_uploaded_copy_is_removed_on_a_match_without_stored_file(self, env, filename):
+        """A browser upload is a copy — the user's original stays on their
+        disk — so "never delete the only copy" does not hold for it: on a
+        DOI/title match it goes like any duplicate, even when the Item has no
+        PDF (review 2026-10-18, C1). The Item stays as it was."""
+        db, input_dir, all_dir, mp = env
+        _seed_item(db, filename=filename, doi="10.9/upload")
+        mp.setattr(pipeline, "discover_doi", lambda *a, **k: "10.9/upload")
+        path = _make_pdf(input_dir)
+
+        assert pipeline.process_paper(path, db, upload=True) is None
+
+        assert not Path(path).exists(), "the upload copy must not pile up in the input folder"
+        rows = db.get_all_papers()
+        assert len(rows) == 1 and rows[0]["filename"] == filename
+        assert not list(all_dir.glob("*.pdf"))
 
 
 class TestValidAssignments:

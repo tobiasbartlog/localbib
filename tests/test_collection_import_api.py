@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import importlib
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 import paper_ingest
 import services.smart_import_pipeline as smart_import_pipeline
+from literature_manager import Config
 
 import_router = importlib.import_module("routers.import")
 
@@ -198,12 +200,24 @@ def test_upload_assigns_a_duplicate_file_too(client, db):
 def test_upload_assigns_a_content_duplicate_too(client, db):
     existing = _seed(db, "Der Klimawandel und seine Folgen fuer die Arktis")
     cid = client.post("/api/collections", json={"name": "Paper X"}).json()["id"]
-    resp = _upload(client, "k.pdf", "Der Klimawandel und seine Folgen fuer die Arktis\nText.",
-                   collection_id=cid, data=b"%PDF-1.4 other bytes")
-    err = next(e for e in _sse(resp) if e["type"] == "error")
-    assert err["message"] == "import.step.duplicateItem"
-    assert err["collection"]["added"] is True
-    assert _members(client, cid) == [existing]
+    kept = Path(Config.INPUT_DIR) / "k.pdf"
+    kept.unlink(missing_ok=True)
+    try:
+        resp = _upload(client, kept.name, "Der Klimawandel und seine Folgen fuer die Arktis\nText.",
+                       collection_id=cid, data=b"%PDF-1.4 other bytes")
+        err = next(e for e in _sse(resp) if e["type"] == "error")
+        # The seeded Item has no PDF. An upload is a copy (the original stays
+        # on the user's disk): it goes like any duplicate, and the Item still
+        # lands in the target Collection.
+        assert err["message"] == "import.step.duplicateItemNoPdf"
+        assert err["kept"] is False
+        assert not kept.exists()
+        assert err["collection"]["added"] is True
+        assert _members(client, cid) == [existing]
+    finally:
+        # The input folder is shared by the whole session: a copy left by a
+        # failing run must not leak into other tests.
+        kept.unlink(missing_ok=True)
 
 
 def test_upload_to_an_unknown_collection_is_refused_up_front(client, db):

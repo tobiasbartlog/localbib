@@ -4,7 +4,7 @@
 // consumes them via destructuring at module evaluation time. This setup file
 // recreates exactly that contract inside jsdom before any test imports app.js.
 import DOMPurify from 'dompurify';
-import { marked } from 'marked';
+import * as marked from 'marked';
 import * as Vue from 'vue';
 import * as VueRouter from 'vue-router';
 import { readFileSync } from 'node:fs';
@@ -23,7 +23,8 @@ import '../../static/locales/core.de.js';
 
 // Markdown rendering: the real libraries, pinned in package.json to the exact
 // versions index.html loads from the CDN, so a test asserting that stored text
-// is sanitised asserts the sanitiser that actually ships.
+// is sanitised asserts the sanitiser that actually ships. `marked` is the
+// module namespace, as the CDN's UMD build exposes it (`marked.Marked` too).
 globalThis.marked = marked;
 globalThis.DOMPurify = DOMPurify;
 
@@ -93,6 +94,34 @@ window.LB_PDF_VIEWER = (host, handlers = {}) => {
 };
 window.LB_PDF_VIEWER.log = pdfViewerLog;
 
+// Markdown editor (ADR-0026): the SPA reaches Milkdown through one seam,
+// `window.LB_MD_EDITOR` (else a lazy import of static/markdown/editor.mjs).
+// The smokes get a textarea that keeps the real editor's contract: onChange
+// only after typing, setValue is not an edit, getValue hands out the text.
+// `window.LB_MD_EDITOR.log` records what the SPA created. The real editor
+// is tested on its own (markdown_roundtrip.test.js).
+const mdEditorLog = { created: [] };
+window.LB_MD_EDITOR = {
+    async createMarkdownEditor(root, opts = {}) {
+        const ta = document.createElement('textarea');
+        ta.className = 'lb-md-fake';
+        ta.value = opts.value || '';
+        ta.readOnly = !!opts.readonly;
+        ta.placeholder = opts.placeholder || '';
+        ta.addEventListener('input', () => opts.onChange && opts.onChange(ta.value));
+        root.append(ta);
+        mdEditorLog.created.push({ value: ta.value, readonly: !!opts.readonly, resolvers: opts.resolvers || {} });
+        return {
+            getValue: () => ta.value,
+            setValue: (v) => { ta.value = v || ''; },
+            setReadonly: (on) => { ta.readOnly = !!on; },
+            focus: () => ta.focus(),
+            destroy: () => ta.remove(),
+        };
+    },
+};
+window.LB_MD_EDITOR.log = mdEditorLog;
+
 // jsdom's alert/confirm raise "not implemented" — default to silent OK;
 // individual tests override with vi.fn() to assert on the dialog.
 window.alert = () => {};
@@ -106,9 +135,8 @@ window.confirm = () => true;
 // instead of thirty ES modules keeps every smoke's setup quick.
 new Function(readFileSync(resolve(__dirname, '../../node_modules/d3/dist/d3.min.js'), 'utf8'))();
 
-// CodeMirror 5: callable (the manuscript editor mounts into a host element)
-// and with .fromTextArea (the notes editor upgrades a textarea). The stub
-// keeps the textarea in the DOM, which is what the notes smoke test looks at.
+// CodeMirror 5: callable (an Add-on's manuscript editor mounts into a host
+// element) and with .fromTextArea. The stub keeps a textarea in the DOM.
 function fakeEditor(textarea) {
     return {
         on: () => {},

@@ -63,6 +63,7 @@ from typing import Iterable, Iterator, Sequence
 FORBIDDEN_IDENTIFIERS: tuple[str, ...] = (
     "atlas",
     "hipster",
+    "lacite",
     "elsevier",
     "plugin-export-",
     "@rwth-aachen.de",

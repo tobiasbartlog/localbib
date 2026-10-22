@@ -146,11 +146,21 @@ Everything on `api.library` except `create_by_doi` reads and needs only
 | `search_references(query, limit=20)` | a list of those dicts (semantic ranking when the user has embeddings, lexical otherwise) |
 | `get_abstract(citekey)` / `get_full_text(citekey)` | a string or `None` — many Items have no extractable text; degrade to the abstract |
 | `export_bibtex()` | the whole library as one `.bib` string |
+| `search_passages(query, limit=10)` | text passages ranked like the core's passage search: `[{citekey, title, year, text, page_start, page_end, printed_page_start, printed_page_end, score}]` — `text` is the whole passage (since 2.5) |
+| `get_passages(citekey, offset=0, limit=20)` | `{citekey, total, passages: [{index, text, page_start, page_end, printed_page_start, printed_page_end}]}` in reading order; `None` for an unknown key, `total: 0` = no extracted text (since 2.5) |
 | `list_collections()` | every Collection — active, archived **and deleted** — by name (since 2.1) |
 | `get_collection(collection_id)` | one Collection or `None` (since 2.1) |
 | `get_collection_refs(collection_id)` | its Items as Cite Keys, oldest addition first; `[]` for an unknown id (since 2.1) |
 | `export_collection_bibtex(collection_id)` | its Items as one `.bib` string, keyed by the same Cite Keys (since 2.1) |
 | `on_change(callback)` | subscribes to change events; returns the unsubscriber |
+
+**Pages** (since 2.5): `page_start`/`page_end` are 1-based PDF pages
+(`None` when unknown). `printed_page_start`/`printed_page_end` are the pages
+printed on the work: the PDF's own page label, else the Item's metadata
+`pages` range when its length equals the PDF's page count, else `None`. The
+core never guesses one — when it is `None`, cite the PDF page and say that it
+is one. Guard both passage methods with `getattr(api.library,
+"search_passages", None)` for hosts older than 2.5.
 
 A **Collection** is a hand-curated list of Items, shaped
 `{id, name, description, archived, archived_at, deleted, deleted_at,
@@ -200,6 +210,40 @@ window.LocalBib.registerPlugin({
 locale catalog under your namespace), `api(url, options)` (fetch against the
 core, JSON in and out) and `isActive(id)` / the `events.changed` custom event.
 
+### The Markdown editor (contract 2.4)
+
+Notes are written in the core's WYSIWYG Markdown editor; reuse it instead of
+a `<textarea>` so the user gets the same formatting, citations and links
+everywhere:
+
+```js
+const { MarkdownEditor } = window.LocalBib.components;
+// in a component: components: { MarkdownEditor }
+// <markdown-editor v-model="draft.body" :resolvers="resolvers"
+//                  placeholder="…" :readonly="false" @blur="save" />
+```
+
+| Prop / event | Meaning |
+|---|---|
+| `v-model` (`modelValue`) | The Markdown text. `update:modelValue` fires **only after the user edited**; a text that was loaded and not touched is never handed back changed, and an edit that ends where it started hands back the original bytes. Saving on `update:modelValue` therefore never rewrites a user's file just because it was opened. |
+| `readonly` | Shows the text with live chips, no editing. |
+| `placeholder` | Shown in an empty block. |
+| `resolvers` | Optional. `{ wikilink: { search(q) → [{id, title, kindLabel?}] or a Promise, resolve(id) → {title, href, missing, kindLabel?} or null (or a Promise), title?: 'header of the [[ list' } }`. Without it, `[[id]]` stays a neutral chip showing its id. Citations need nothing: the core resolves them against the library. |
+| `focus` / `blur` / `ready` | Focus entered / left the editor (a blur hands out pending typing first); the editor finished loading. The component's `flush()` method does the same for a save on leave. |
+
+The syntax is plain Markdown plus two inline forms that stay readable outside
+LocalBib (Pandoc): citations `[@citekey]`, `[@citekey, S. 12]`, `[@a; @b]` —
+the chip opens the Item, with a page locator the PDF on that page — and
+wikilinks `[[id]]` / `[[id|Alias]]`. Inside code both stay text. Typing `@`
+searches the library, `[[` your `resolvers.wikilink.search`; `/` opens the
+block menu. A renamed citekey is shown as missing, never rewritten.
+
+For a read view outside the editor, `LocalBib.renderMarkdown(text, opts)`
+returns sanitised HTML with the same chips (`opts.wikilink(id) → {title,
+href, missing}`, synchronous, resolves wikilinks); `LocalBib.hydrateMarkdown(el)`
+labels the citation chips inside `el` from the library ("Müller 2021") and
+makes them open their Item.
+
 The four Slots, each a Vue component with fixed props:
 
 | Slot | Props | Contract |
@@ -226,6 +270,7 @@ release to release without notice:
 | Item by DOI | `POST /api/papers/by-doi`, `POST /api/papers/by-doi/batch` — creates; an Item with that DOI answers untouched (`created: false`) |
 | DOI existence check | `POST /api/papers/by-doi/exists` — `{dois: [...]}` → `{papers: {<DOI as sent>: <Item id> or null}}`; reads only |
 | BibTeX of an Item | `GET /api/papers/{id}/bibtex` |
+| Item lookup (citations) | `GET /api/papers/lookup?q=&limit=` (title, authors, citekey, DOI; at most 50) or `?keys=<citekey>&keys=<citekey>` → `{papers: [{id, cite_key, title, authors, year, doi, has_pdf}]}`; light rows, reads only |
 | OA-PDF fetch | `POST /api/papers/{id}/fetch-oa-pdf` |
 | Model list | `GET /api/llm/models` |
 | Item detail (route) | `/paper/{id}` — `id` is the Item id (`get_reference(...)["id"]`) |

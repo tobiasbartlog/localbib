@@ -53,16 +53,23 @@ def generate_filename(metadata: Dict) -> str:
     return filename
 
 
+def stored_pdf_target(filename: str) -> str | None:
+    """Wohin die gespeicherte PDF eines Eintrags gehoert — ob sie da ist oder
+    nicht; ``None`` fuer einen Eintrag ohne Dateinamen. Dorthin stellt ein
+    Import eine fehlende PDF wieder her."""
+    if not (filename or "").strip():
+        return None
+    return os.path.join(Config.ALL_DIR, os.path.basename(filename))
+
+
 def stored_pdf_path(filename: str) -> str | None:
     """Pfad der gespeicherten PDF eines Eintrags — oder ``None``, wenn keine da ist.
 
     Eintraege ohne PDF (BibTeX-/DOI-Import) haben ``filename == ""``; ein
     ``os.path.join(ALL_DIR, "")`` waere dann der Ordner selbst, und
     ``os.path.exists`` ist fuer einen Ordner wahr. Daher ``isfile``."""
-    if not (filename or "").strip():
-        return None
-    path = os.path.join(Config.ALL_DIR, os.path.basename(filename))
-    return path if os.path.isfile(path) else None
+    path = stored_pdf_target(filename)
+    return path if path is not None and os.path.isfile(path) else None
 
 
 def _category_path_parts(cat: dict, cat_map: dict) -> list:

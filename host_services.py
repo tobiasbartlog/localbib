@@ -23,6 +23,7 @@ import bibtex_builder
 import embedding_index
 import library_events
 import paper_ingest
+import passage_retrieval
 from cite_key_generator import base_key as _legacy_cite_key_base
 from context import get_conn
 from filenames import stored_pdf_path
@@ -275,6 +276,87 @@ class _CoreLibraryApi:
             raise ValueError(error)
         return result
 
+    # --- Passages with pages (contract 2.5.0): read-only, library.read -----
+    # The ranking is /api/search/passages' own (passage_retrieval); the text
+    # is the whole chunk, and every page carries its printed twin when the
+    # PDF or the metadata knows it reliably (passage_retrieval.printed_pages).
+
+    def _page_resolver(self, paper: dict):
+        """``pdf_page -> printed page or None`` for one Item. Labels are read
+        from its PDF once per process (``_PAGE_LABELS``); any failure there is
+        "no labels"."""
+        labels, count = _PAGE_LABELS.labels(stored_pdf_path(paper.get("filename")))
+        if count is None:
+            count = paper.get("page_count") or None
+        pages_field = _reference_details(paper)["pages"]
+
+        def resolve(pdf_page):
+            return passage_retrieval.printed_pages(
+                pdf_page, page_labels=labels, pages_field=pages_field, pdf_page_count=count)
+        return resolve
+
+    @staticmethod
+    def _page_fields(chunk: dict, resolve) -> dict:
+        start = chunk.get("page_start") or None
+        end = chunk.get("page_end") or start
+        return {
+            "page_start": start,
+            "page_end": end,
+            "printed_page_start": resolve(start),
+            "printed_page_end": resolve(end),
+        }
+
+    def search_passages(self, query: str, limit: int = 10) -> list:
+        conn = _get_conn()
+        try:
+            ranked = passage_retrieval.rank_passages(
+                conn, query, max(1, int(limit)), model=Config.embed_model(), embed=embed_texts,
+                with_papers=False)
+            ids = sorted({c["paper_id"] for c, _ in ranked["hits"]})
+            marks = ",".join("?" * len(ids))
+            rows = conn.execute(f"SELECT * FROM papers WHERE id IN ({marks})", ids).fetchall() if ids else []
+        finally:
+            conn.close()
+        papers = {r["id"]: dict(r) for r in rows}
+        resolvers: dict = {}
+        out = []
+        for chunk, score in ranked["hits"]:
+            paper = papers.get(chunk["paper_id"])
+            if paper is None:
+                continue
+            if paper["id"] not in resolvers:
+                resolvers[paper["id"]] = self._page_resolver(paper)
+            out.append({
+                "citekey": _cite_key(paper),
+                "title": paper.get("title") or "",
+                "year": paper.get("year"),
+                "text": chunk.get("chunk_text") or "",
+                **self._page_fields(chunk, resolvers[paper["id"]]),
+                "score": score,
+            })
+        return out
+
+    def get_passages(self, citekey: str, offset: int = 0, limit: int = 20) -> Optional[dict]:
+        paper = self._find(citekey)
+        if paper is None:
+            return None
+        offset, limit = max(0, int(offset)), max(1, int(limit))
+        conn = _get_conn()
+        try:
+            total = passage_retrieval.count_chunks(conn, paper["id"])
+            chunks = passage_retrieval.paper_chunks(conn, paper["id"], limit=limit, offset=offset)
+        finally:
+            conn.close()
+        resolve = self._page_resolver(paper) if chunks else None
+        return {
+            "citekey": _cite_key(paper),
+            "total": total,
+            "passages": [
+                {"index": offset + i, "text": c.get("chunk_text") or "", **self._page_fields(c, resolve)}
+                for i, c in enumerate(chunks)
+            ],
+        }
+
     # --- Collections (#204): read-only, under library.read -----------------
     # Unlike every user-facing read, these include tombstones: an Add-on that
     # was off when a Collection was deleted still finds its frozen membership.
@@ -333,6 +415,9 @@ class _CoreLibraryApi:
         # plugin_loader drops whatever it left behind on unload.
         return library_events.subscribe(callback)
 
+
+#: Page labels per PDF, read only for Items a passage answer shows (2.5.0).
+_PAGE_LABELS = passage_retrieval.PageLabelCache()
 
 #: The wire shape of one Collection in the Add-on Contract.
 COLLECTION_FIELDS = (

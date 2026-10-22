@@ -118,7 +118,10 @@ async def bulk_extract_references(payload: Optional[BulkExtractRequest] = Body(N
     finally:
         conn.close()
 
-    async def generate():
+    # A plain generator on purpose: the PDF reading, LLM calls and sleeps
+    # below block, and Starlette iterates a sync generator in its threadpool
+    # -- an async one would hold the event loop (the whole app) for minutes.
+    def generate():
         total_papers = len(candidates)
         if total_papers == 0:
             yield _sse({"type": "complete", "processed": 0, "total_references": 0, "total_in_library": 0, "results": []})

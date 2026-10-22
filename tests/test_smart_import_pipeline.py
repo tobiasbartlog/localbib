@@ -197,3 +197,54 @@ def test_every_progress_message_is_a_code_never_a_sentence():
         msg = e["message"]
         code = msg["code"] if isinstance(msg, dict) else msg
         assert _re.fullmatch(r"import\.step\.[A-Za-z.]+", code), msg
+
+
+# -- DOI by title after the AI step, PDF metadata (2026-10-21) ---------------
+
+def test_title_search_after_validation_finds_and_checks_the_doi():
+    """No DOI in metadata or text: the AI's title goes to the title search,
+    and the DOI it finds passes the same CrossRef plausibility check."""
+    title = "Shear Capacity Of Unstabilised Earth Masonry Walls"
+    pdf_text = "Engineering Structures 368 (2026)\n" + title + "\nabstract text"
+    crossref_data = {"title": title, "authors": "Schneider, A.", "year": 2026,
+                     "doi": "10.1016/j.x.1", "abstract": "", "journal": "ES", "publisher": "E"}
+    with patch.object(sip, "extract_text_from_pdf", return_value=pdf_text), \
+         patch.object(sip, "discover_doi", side_effect=[None, "10.1016/j.x.1"]) as mock_doi, \
+         patch.object(sip, "llm_extract_metadata", return_value={"title": title}), \
+         patch.object(sip, "fetch_crossref_metadata", return_value=crossref_data):
+        events, result = _drain(sip.run_pipeline("/tmp/x.pdf", "x.pdf", do_doi=True, do_validate=True))
+    assert mock_doi.call_args_list[1].args[:2] == ("", title)
+    assert result.metadata["doi"] == "10.1016/j.x.1"
+    assert result.metadata["authors"] == "Schneider, A."
+    assert result.crossref_plausible is True
+    assert "import.step.doiTitleSearch" in [e["message"] for e in events]
+
+
+def test_title_search_skipped_when_a_doi_is_already_known():
+    with patch.object(sip, "extract_text_from_pdf", return_value="Title Words Here\nbody"), \
+         patch.object(sip, "discover_doi", return_value="10.1/x") as mock_doi, \
+         patch.object(sip, "fetch_crossref_metadata", return_value=None):
+        events, _ = _drain(sip.run_pipeline("/tmp/x.pdf", "x.pdf", do_doi=True, do_validate=False))
+    assert mock_doi.call_count == 1
+    assert "import.step.doiTitleSearch" not in [e["message"] for e in events]
+
+
+def test_title_search_does_not_retry_a_rejected_doi():
+    crossref_data = {"title": "Bananen Gurken Zucchini Tomaten", "doi": "10.9/m"}
+    with patch.object(sip, "extract_text_from_pdf", return_value="Quantum Mechanics Superposition\nx"), \
+         patch.object(sip, "discover_doi", return_value="10.9/m"), \
+         patch.object(sip, "fetch_crossref_metadata", return_value=crossref_data) as mock_cr:
+        _, result = _drain(sip.run_pipeline("/tmp/x.pdf", "x.pdf", do_doi=True, do_validate=False))
+    assert mock_cr.call_count == 1
+    assert result.metadata["doi"] == ""
+
+
+def test_pdf_metadata_reaches_discovery_and_titles_the_item(monkeypatch):
+    info = {"title": "Shear capacity of unstabilised earth masonry walls", "subject": ""}
+    monkeypatch.setattr(sip, "read_pdf_metadata", lambda _p: (info, ""))
+    with patch.object(sip, "extract_text_from_pdf", return_value="Engineering Structures 368\nbody"), \
+         patch.object(sip, "discover_doi", return_value=None) as mock_doi:
+        _, result = _drain(sip.run_pipeline("/tmp/x.pdf", "x.pdf", do_doi=True, do_validate=False))
+    assert mock_doi.call_args_list[0].kwargs["pdf_metadata"] == (info, "")
+    # The metadata title beats the journal line at the top of the page.
+    assert result.metadata["title"] == info["title"]

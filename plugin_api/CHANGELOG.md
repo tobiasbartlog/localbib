@@ -4,6 +4,44 @@ The package version follows semver; its major number is the Add-on Contract
 version (`plugin_api.API_VERSION`). A core accepts exactly one contract
 version; an Add-on built against another one is shown as incompatible.
 
+## 2.5.0 — Passages with page numbers
+
+Added (additive, `API_VERSION` stays `2`; needs only `library.read`):
+
+- `LibraryApi.search_passages(query, limit=10)` — the library's text
+  passages ranked like the core's passage search (hybrid semantic + BM25,
+  BM25 alone without embeddings): `[{citekey, title, year, text, page_start,
+  page_end, printed_page_start, printed_page_end, score}]`. `text` is the
+  whole passage, not an excerpt.
+- `LibraryApi.get_passages(citekey, offset=0, limit=20)` — one Item's
+  passages in reading order: `{citekey, total, passages: [{index, text,
+  page_start, page_end, printed_page_start, printed_page_end}]}`; `None` for
+  an unknown Cite Key, `total: 0` when the Item has no extracted text.
+- `page_*` are 1-based PDF pages; `printed_page_*` is the page printed on the
+  work — the PDF's page label, else the metadata `pages` range when its
+  length equals the PDF's page count — and `None` when neither is reliable.
+  The core never guesses a printed page. Guard both methods with
+  `getattr(library, "search_passages", None)` for hosts before 2.5.
+- `plugin_api.testing.InMemoryLibrary` takes `passages=[...]` per reference
+  and answers both methods in the same shape.
+
+## 2.4.0 — The Markdown editor for Add-ons
+
+Added (additive, `API_VERSION` stays `2`; frontend contract, no Python API
+change):
+
+- `window.LocalBib.components.MarkdownEditor` — the core's WYSIWYG Markdown
+  editor as a Vue component (`v-model`, `readonly`, `placeholder`,
+  `resolvers`, events `focus`/`blur`/`ready`, method `flush()`). It emits
+  only after an edit, so saving on `update:modelValue` never rewrites an
+  untouched file. Citations `[@key, S. 12]` resolve against the library;
+  wikilinks `[[id|Alias]]` through the Add-on's `resolvers.wikilink`.
+- `window.LocalBib.renderMarkdown(text, opts)` — sanitised HTML with the
+  same citation/wikilink chips; `window.LocalBib.hydrateMarkdown(el)` labels
+  and links the citation chips of a rendered element.
+- Stable core endpoint `GET /api/papers/lookup` (`q`/`limit` or repeatable
+  `keys`) → `{papers: [{id, cite_key, title, authors, year, doi, has_pdf}]}`.
+
 ## 2.3.0 — Reference details for literature checks
 
 Added (additive, `API_VERSION` stays `2`):

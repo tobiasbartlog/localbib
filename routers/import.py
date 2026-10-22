@@ -62,7 +62,9 @@ from literature_manager import (
 )
 import metadata_validation
 import paper_ingest
+from filenames import stored_pdf_path, stored_pdf_target
 from import_indexing import index_paper_after_import
+from pipeline import restore_stored_pdf
 from llm_client import llm_for
 from paper_matcher import match as match_ref
 
@@ -110,6 +112,37 @@ def _rematch_references_for_paper(paper_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Upload into the input folder (shared by both upload endpoints)
+# ---------------------------------------------------------------------------
+
+def _save_upload(filename: str, content: bytes) -> tuple[str, str]:
+    """Write an upload into the input folder under a name of its own; return
+    ``(path, name)``.
+
+    A taken name gets a counter (``_1``, ``_2`` …), whatever the file under it
+    holds: every upload is its own copy. Two uploads of one file — one batch,
+    or a retry while the first import still runs — must never share a path,
+    or the first import removes the file under the second one (review
+    2026-10-18). The name is claimed by an exclusive create, so not even a
+    request between the check and the write can take it."""
+    os.makedirs(Config.INPUT_DIR, exist_ok=True)
+    base_name = os.path.basename(filename)
+    stem, ext = os.path.splitext(base_name)
+    safe_name, counter = base_name, 1
+    while True:
+        target_path = os.path.join(Config.INPUT_DIR, safe_name)
+        if not os.path.lexists(target_path):
+            try:
+                with open(target_path, "xb") as f:
+                    f.write(content)
+                return target_path, safe_name
+            except FileExistsError:
+                pass
+        safe_name = f"{stem}_{counter}{ext}"
+        counter += 1
+
+
+# ---------------------------------------------------------------------------
 # Classic synchronous import
 # ---------------------------------------------------------------------------
 
@@ -119,27 +152,14 @@ async def upload_and_import_pdf(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="error.only_pdf_accepted")
 
-    # Datei in Input-Ordner speichern
-    os.makedirs(Config.INPUT_DIR, exist_ok=True)
-    safe_name = os.path.basename(file.filename)
-    target_path = os.path.join(Config.INPUT_DIR, safe_name)
+    # Datei in Input-Ordner speichern (Namenskollision: _1, _2 …)
+    target_path, safe_name = _save_upload(file.filename, await file.read())
 
-    # Bei Namenskollision umbenennen
-    counter = 1
-    base_name = safe_name
-    while os.path.exists(target_path):
-        name, ext = os.path.splitext(base_name)
-        safe_name = f"{name}_{counter}{ext}"
-        target_path = os.path.join(Config.INPUT_DIR, safe_name)
-        counter += 1
-
-    content = await file.read()
-    with open(target_path, "wb") as f:
-        f.write(content)
-
-    # Direkt importieren
+    # Direkt importieren. ``upload``: die Datei ist eine Kopie, das Original
+    # liegt beim Nutzer — ein DOI-/Titel-Treffer auf einen Eintrag ohne PDF
+    # entfernt sie wie jedes Duplikat, statt sie im Input-Ordner zu lassen.
     try:
-        paper_id = process_paper(target_path, db)
+        paper_id = process_paper(target_path, db, upload=True)
         if paper_id:
             # Rematch: Pruefen ob dieses Paper eine bekannte Referenz ist
             try:
@@ -201,6 +221,7 @@ def _assign_to_collection(collection_id: Optional[int], paper_id) -> Optional[di
 
 
 def _smart_import_response(target_path: str, original_filename: str, *,
+                           uploaded: bool,
                            do_doi: bool, do_categories: bool,
                            do_abstract: bool, do_validate: bool,
                            collection_id: Optional[int] = None) -> StreamingResponse:
@@ -209,6 +230,12 @@ def _smart_import_response(target_path: str, original_filename: str, *,
     Both ``/upload-smart`` (file freshly written to INPUT_DIR) and
     ``/process-smart`` (file already in INPUT_DIR) funnel through here, so the
     pipeline exists exactly once.
+
+    ``uploaded``: ``target_path`` is the copy of a browser upload, the user's
+    original stays on their disk. "Never delete the only copy" does not hold
+    for it — on a DOI/title match with an Item without a stored PDF it goes
+    like any duplicate upload, where a file the user put in the input folder
+    stays (review 2026-10-18).
 
     ``collection_id`` (#203): the target Collection of the upload dialog. The
     new Item lands in it, and so does an Item recognised as a duplicate —
@@ -235,10 +262,14 @@ def _smart_import_response(target_path: str, original_filename: str, *,
                 ).fetchone()
             finally:
                 dup_conn.close()
-            # The row exists but its copy in all/ does not (an earlier run
-            # died between the two): this input is the only copy left, so
-            # restore it before the input is removed.
-            if dup_row and not (dup_row["filename"] or "").strip():
+            duplicate_file = {"type": "error", "message": "import.step.duplicateFile"}
+            if dup_row:
+                duplicate_file.update(duplicate_paper_id=dup_row["id"],
+                                      duplicate_title=dup_row["title"],
+                                      duplicate_filename=dup_row["filename"])
+            # Whether the row holds its PDF is the one rule
+            # (``filenames.stored_pdf_path``), shared with ``process_paper``.
+            if dup_row and stored_pdf_target(dup_row["filename"]) is None:
                 # The row kept the hash but has no file (e.g. Diagnosis
                 # "clear_pdf"): this input is the only copy. Attach it to that
                 # row instead of deleting it.
@@ -247,13 +278,7 @@ def _smart_import_response(target_path: str, original_filename: str, *,
                                             dup_row["id"], target_path)
                 except Exception as e:
                     logging.warning("Smart import: attaching to item %s failed: %s", dup_row["id"], e)
-                    yield _sse(_with_collection({
-                        "type": "error",
-                        "message": "import.step.duplicateFile",
-                        "duplicate_paper_id": dup_row["id"],
-                        "duplicate_title": dup_row["title"],
-                        "duplicate_filename": dup_row["filename"],
-                    }, dup_row["id"]))
+                    yield _sse(_with_collection(duplicate_file, dup_row["id"]))
                     return
                 try:
                     os.remove(target_path)
@@ -267,42 +292,20 @@ def _smart_import_response(target_path: str, original_filename: str, *,
                     "attached": True,
                 }, dup_row["id"]))
                 return
-            if dup_row:
-                stored_name = os.path.basename(dup_row["filename"] or "")
-                stored_path = os.path.join(Config.ALL_DIR, stored_name)
-                if stored_name and not os.path.exists(stored_path):
-                    try:
-                        shutil.copy2(target_path, stored_path)
-                        create_symlinks(db, dup_row["id"], stored_name)
-                    except Exception as e:
-                        # Restore failed: keep the input, it is the only copy.
-                        logging.warning("Smart import: restore of %s failed: %s", stored_name, e)
-                        try:
-                            os.remove(stored_path)
-                        except OSError:
-                            pass
-                        yield _sse(_with_collection({
-                            "type": "error",
-                            "message": "import.step.duplicateFile",
-                            "duplicate_paper_id": dup_row["id"],
-                            "duplicate_title": dup_row["title"],
-                            "duplicate_filename": dup_row["filename"],
-                        }, dup_row["id"]))
-                        return
+            if dup_row and stored_pdf_path(dup_row["filename"]) is None:
+                # The row names a file all/ does not hold (an earlier run
+                # died between the two): this input is the only copy left —
+                # restore it before the input is removed. If that fails, the
+                # input stays.
+                if not restore_stored_pdf(db, dup_row["id"], dup_row["filename"], target_path):
+                    yield _sse(_with_collection(duplicate_file, dup_row["id"]))
+                    return
             try:
                 os.remove(target_path)
             except Exception:
                 pass
-            if dup_row:
-                yield _sse(_with_collection({
-                    "type": "error",
-                    "message": "import.step.duplicateFile",
-                    "duplicate_paper_id": dup_row["id"],
-                    "duplicate_title": dup_row["title"],
-                    "duplicate_filename": dup_row["filename"],
-                }, dup_row["id"]))
-            else:
-                yield _sse({"type": "error", "message": "import.step.duplicateFile"})
+            yield _sse(_with_collection(duplicate_file, dup_row["id"]) if dup_row
+                       else duplicate_file)
             return
 
         # -- PDF-Schutz --
@@ -336,16 +339,35 @@ def _smart_import_response(target_path: str, original_filename: str, *,
         yield _sse({"type": "progress", "step": "dupcheck", "message": "import.step.dupcheck", "percent": 53})
         dup = db.find_duplicate_paper(doi=metadata.get("doi", ""), title=metadata.get("title", ""))
         if dup:
-            try:
-                os.remove(target_path)
-            except Exception:
-                pass
-            yield _sse(_with_collection({
+            frame = {
                 "type": "error",
                 "message": "import.step.duplicateItem",
                 "duplicate_paper_id": dup["id"],
                 "duplicate_title": dup.get("title", ""),
-            }, dup["id"]))
+            }
+            if stored_pdf_path(dup.get("filename")) is None:
+                # A DOI/title match names the same work, not the same file:
+                # only an Item that holds its PDF in all/ makes this input a
+                # second copy. Without one (DOI intake, BibTeX import,
+                # Diagnosis "clear_pdf") or with its file gone, a file the
+                # user put in the input folder is the only copy: it stays and
+                # is not attached automatically (only a hash match is). A
+                # browser upload is a copy — its original stays on the user's
+                # disk — so it goes like any duplicate upload. Either way the
+                # message says how to attach the file by hand.
+                no_file = not (dup.get("filename") or "").strip()
+                frame["message"] = ("import.step.duplicateItemNoPdf" if no_file
+                                    else "import.step.duplicateItemPdfMissing")
+                frame["kept"] = not uploaded
+            if frame.get("kept"):
+                logging.warning("Smart import: item %s has no stored PDF, input kept: %s",
+                                dup["id"], target_path)
+            else:
+                try:
+                    os.remove(target_path)
+                except Exception:
+                    pass
+            yield _sse(_with_collection(frame, dup["id"]))
             return
 
         # -- Dateiname generieren & speichern --
@@ -594,24 +616,10 @@ async def upload_smart(
     _check_collection(collection_id)
 
     # Datei in Input-Ordner speichern
-    os.makedirs(Config.INPUT_DIR, exist_ok=True)
-    safe_name = os.path.basename(file.filename)
-    target_path = os.path.join(Config.INPUT_DIR, safe_name)
-
-    counter = 1
-    base_name = safe_name
-    while os.path.exists(target_path):
-        name, ext = os.path.splitext(base_name)
-        safe_name = f"{name}_{counter}{ext}"
-        target_path = os.path.join(Config.INPUT_DIR, safe_name)
-        counter += 1
-
-    content = await file.read()
-    with open(target_path, "wb") as f:
-        f.write(content)
+    target_path, safe_name = _save_upload(file.filename, await file.read())
 
     return _smart_import_response(
-        target_path, safe_name,
+        target_path, safe_name, uploaded=True,
         do_doi=do_doi, do_categories=do_categories,
         do_abstract=do_abstract, do_validate=do_validate,
         collection_id=collection_id,
@@ -722,7 +730,7 @@ async def process_smart_from_input(
     _check_collection(collection_id)
 
     return _smart_import_response(
-        target_path, safe_name,
+        target_path, safe_name, uploaded=False,
         do_doi=do_doi, do_categories=do_categories,
         do_abstract=do_abstract, do_validate=do_validate,
         collection_id=collection_id,

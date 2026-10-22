@@ -2,6 +2,7 @@
 
 Serves:
   GET    /api/papers
+  GET    /api/papers/lookup
   POST   /api/papers/bulk-delete
   POST   /api/papers/categories
   POST   /api/papers/categories/remove
@@ -190,6 +191,25 @@ async def list_papers(
         conn.close()
 
     return papers
+
+
+LOOKUP_MAX = 50
+
+
+@router.get("/api/papers/lookup")
+async def lookup_papers(
+    q: str = Query(""),
+    keys: Optional[List[str]] = Query(None),
+    limit: int = Query(20, ge=1, le=LOOKUP_MAX),
+):
+    """Light lookup for citations in notes: ``q`` searches title, authors,
+    citekey and DOI; ``keys`` (repeatable, or comma-separated) resolves
+    citekeys. Never the heavy ``/api/papers`` row (categories, fields)."""
+    db = _get_db()
+    if keys is not None:
+        wanted = [k for part in keys for k in part.split(",")]
+        return {"papers": db.lookup_papers(keys=wanted[:500])}
+    return {"papers": db.lookup_papers(query=q, limit=limit)}
 
 
 def _remove_pdf_file_if_any(filename: str) -> None:

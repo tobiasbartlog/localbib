@@ -3283,20 +3283,6 @@ main:has(> .lb-papers) { overflow-x: clip; overflow-y: visible; }
 .lb-md hr { border: 0; border-top: 1px solid var(--lb-hairline); margin: 16px 0; }
 
 /* ---- Notiz-Block im Paper-Detail (#160) ---- */
-.lb-notes-rendered {
-  font-family: var(--lb-font-serif);
-  font-size: 15.5px;
-  line-height: 1.65;
-  color: var(--lb-ink-2);
-  cursor: text;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  padding: 10px 12px;
-  margin: 0 -12px;
-  transition: background .12s, border-color .12s;
-}
-.lb-notes-rendered:hover { background: var(--lb-bg-soft); border-color: var(--lb-hairline); }
-.lb-notes-empty { color: var(--lb-mute); font-style: italic; }
 .lb-notes-status {
   font-family: var(--lb-font-mono);
   font-size: 10.5px;
@@ -3304,30 +3290,153 @@ main:has(> .lb-papers) { overflow-x: clip; overflow-y: visible; }
   color: var(--lb-mute);
 }
 .lb-notes-status[data-state="error"] { color: var(--lb-accent); }
-/* Der Notiz-Editor waechst mit dem Text, statt wie der Manuskript-Editor die
-   volle Hoehe seiner Spalte einzunehmen. */
-.lb-notes-editor .CodeMirror {
-  height: auto;
-  min-height: 140px;
-  font-family: var(--lb-font-mono);
-  font-size: 13px;
-  line-height: 1.6;
-  background: var(--lb-bg-elev);
-  color: var(--lb-ink);
+
+/* ---- Markdown-Editor (ADR-0026): Milkdown/Crepe auf den Tokens ---- */
+/* Crepe liest seine Farben aus --crepe-*; hier zeigen sie auf die
+   LocalBib-Tokens, damit Hell/Dunkel ohne eigenes Theme mitgeht. */
+.lb-md-editor .milkdown {
+  --crepe-color-background: var(--lb-bg-elev);
+  --crepe-color-on-background: var(--lb-ink);
+  --crepe-color-surface: var(--lb-bg);
+  --crepe-color-surface-low: var(--lb-bg-soft);
+  --crepe-color-on-surface: var(--lb-ink-2);
+  --crepe-color-on-surface-variant: var(--lb-ink-3);
+  --crepe-color-outline: var(--lb-hairline-2);
+  --crepe-color-primary: var(--lb-accent);
+  --crepe-color-secondary: var(--lb-accent-soft);
+  --crepe-color-on-secondary: var(--lb-accent-ink);
+  --crepe-color-inverse: var(--lb-ink);
+  --crepe-color-on-inverse: var(--lb-bg);
+  --crepe-color-inline-code: var(--lb-accent-ink);
+  --crepe-color-error: var(--lb-danger);
+  --crepe-color-hover: var(--lb-bg-soft);
+  --crepe-color-selected: var(--lb-accent-soft);
+  --crepe-color-inline-area: var(--lb-bg-soft);
+  --crepe-base-font-size: 15px;
+  --crepe-font-title: var(--lb-font-serif);
+  --crepe-font-default: var(--lb-font-sans);
+  --crepe-font-code: var(--lb-font-mono);
+  --crepe-shadow-1: var(--lb-shadow);
+  --crepe-shadow-2: var(--lb-shadow-lg);
+  background: transparent;
+}
+.lb-md-host {
   border: 1px solid var(--lb-hairline);
   border-radius: 10px;
-  padding: 8px 4px;
+  background: var(--lb-bg-elev);
+  min-height: 140px;
+  transition: border-color var(--lb-dur-1);
 }
-.lb-notes-editor .CodeMirror-cursor { border-left: 1.5px solid var(--lb-ink); }
-.lb-notes-editor .CodeMirror-selected { background: var(--lb-accent-soft); }
-.lb-notes-editor .cm-header { color: var(--lb-ink); font-weight: 600; }
-.lb-notes-editor .cm-strong { color: var(--lb-ink); font-weight: 600; }
-.lb-notes-editor .cm-em { color: var(--lb-ink-2); font-style: italic; }
-.lb-notes-editor .cm-link { color: var(--lb-accent-ink); }
-.lb-notes-editor .cm-url { color: var(--lb-mute); }
-.lb-notes-editor .cm-quote { color: var(--lb-ink-3); font-style: italic; }
-.lb-notes-editor .cm-variable-2 { color: var(--lb-accent); }   /* Listenmarker */
-.lb-notes-editor .cm-comment { color: var(--lb-mute); }
+.lb-md-host:focus-within { border-color: var(--lb-hairline-2); }
+.lb-md-host.is-loading { background: var(--lb-bg-soft); }
+.lb-md-host.is-fallback { border: 0; background: transparent; }
+.lb-md-fallback { width: 100%; font-family: var(--lb-font-mono); font-size: 13px; }
+.lb-md-fallback-note { margin: 4px 0 0; font-size: 11.5px; color: var(--lb-mute); }
+/* Links Platz fuer Griff und "+" der Blockleiste, sonst knapp. */
+.lb-md-editor .milkdown .ProseMirror {
+  padding: 14px 18px 18px 44px;
+  min-height: 108px;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--lb-ink-2);
+}
+.lb-md-editor .milkdown .ProseMirror h1,
+.lb-md-editor .milkdown .ProseMirror h2,
+.lb-md-editor .milkdown .ProseMirror h3 { font-weight: var(--lb-title-weight); color: var(--lb-ink); }
+.lb-md-editor .milkdown .ProseMirror h1 { font-size: 22px; line-height: 1.3; margin: 18px 0 6px; padding: 0; }
+.lb-md-editor .milkdown .ProseMirror h2 { font-size: 19px; line-height: 1.3; margin: 16px 0 6px; padding: 0; }
+.lb-md-editor .milkdown .ProseMirror h3 { font-size: 16.5px; line-height: 1.35; margin: 14px 0 4px; padding: 0; }
+.lb-md-editor .milkdown .ProseMirror p { margin: 4px 0; padding: 0; }
+.lb-md-editor .milkdown .ProseMirror > :first-child { margin-top: 0; }
+.lb-md-host.is-readonly .lb-md-editor .milkdown .ProseMirror { padding-left: 18px; }
+
+/* Kompakt (Notizfeld der Detailspalte): kein Blockgriff, also kein Einzug;
+   das Slash-Menue ist eine kurze Liste ohne Reiter, schmal genug fuer die Spalte. */
+.lb-md-editor.is-compact .milkdown { --crepe-base-font-size: 14px; }
+.lb-md-editor.is-compact .milkdown .ProseMirror {
+  padding: 10px 14px 14px;
+  min-height: 96px;
+  font-size: 14px;
+  line-height: 1.55;
+}
+.lb-md-editor.is-compact .milkdown .ProseMirror h1,
+.lb-md-editor.is-compact .milkdown .ProseMirror h2,
+.lb-md-editor.is-compact .milkdown .ProseMirror h3 { font-size: 15.5px; line-height: 1.35; margin: 12px 0 4px; }
+.lb-md-editor.is-compact .milkdown .milkdown-block-handle { display: none; }
+.lb-md-editor.is-compact .milkdown .milkdown-slash-menu { border-radius: 10px; border: 1px solid var(--lb-hairline); }
+.lb-md-editor.is-compact .milkdown .milkdown-slash-menu .tab-group,
+.lb-md-editor.is-compact .milkdown .milkdown-slash-menu .menu-groups .menu-group h6 { display: none; }
+.lb-md-editor.is-compact .milkdown .milkdown-slash-menu .menu-groups { padding: 4px; max-height: 300px; }
+.lb-md-editor.is-compact .milkdown .milkdown-slash-menu .menu-groups .menu-group + .menu-group::before { margin: 3px 6px; }
+.lb-md-editor.is-compact .milkdown .milkdown-slash-menu .menu-groups .menu-group li {
+  min-width: 190px;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 6px;
+}
+.lb-md-editor.is-compact .milkdown .milkdown-slash-menu .menu-groups .menu-group li svg { width: 16px; height: 16px; }
+.lb-md-editor.is-compact .milkdown .milkdown-slash-menu .menu-groups .menu-group li > span { font-size: 13px; font-weight: 500; }
+.lb-md-editor.is-compact .milkdown .milkdown-toolbar .toolbar-item { width: 26px; height: 26px; margin: 3px; padding: 3px; }
+.lb-md-editor.is-compact .milkdown .milkdown-toolbar .toolbar-item svg { width: 20px; height: 20px; }
+.lb-md-editor.is-compact .milkdown .milkdown-toolbar .divider { height: 20px; margin: 6px 4px; }
+
+/* Zitat- und Verweis-Chips — im Editor wie in gerenderten Lese-Ansichten. */
+.lb-md-citation { display: inline-flex; gap: 3px; vertical-align: baseline; }
+.lb-md-cite-chip, .lb-md-wikilink {
+  display: inline-flex; align-items: baseline; gap: 5px; cursor: pointer; user-select: none;
+  font: 500 .86em/1.5 var(--lb-font-sans); padding: 0 7px; border-radius: 6px; white-space: nowrap;
+  text-decoration: none;
+}
+.lb-md-cite-chip { background: var(--lb-accent-soft); color: var(--lb-accent-ink); border: 1px solid transparent; }
+.lb-md-cite-chip:hover, .lb-md-cite-chip:focus-visible { border-color: var(--lb-accent); outline: none; }
+.lb-md-cite-loc { font-weight: 400; opacity: .8; }
+.lb-md-cite-loc::before { content: "·"; margin-right: 4px; }
+.lb-md-cite-chip.is-missing { background: transparent; border: 1px dashed var(--lb-danger); color: var(--lb-danger); }
+.lb-md-wikilink { background: var(--lb-bg-soft); color: var(--lb-ink-2); border: 1px solid var(--lb-hairline-2); }
+.lb-md-wikilink:hover { border-color: var(--lb-ink-3); }
+.lb-md-wiki-glyph { color: var(--lb-mute); font-size: .9em; }
+.lb-md-wikilink.is-dangling { background: transparent; border-style: dashed; color: var(--lb-mute); }
+.lb-md-citation.is-selected .lb-md-cite-chip, .lb-md-wikilink.is-selected { outline: 2px solid var(--lb-accent); outline-offset: 1px; }
+
+/* Vorschlagsliste ("@", "[[") und Chip-Popover: fixed, am Body. */
+.lb-md-suggest, .lb-md-pop {
+  position: fixed; z-index: 200; background: var(--lb-bg-elev); color: var(--lb-ink);
+  border: 1px solid var(--lb-hairline-2); border-radius: 10px; box-shadow: var(--lb-shadow-lg);
+  font-family: var(--lb-font-sans);
+}
+.lb-md-suggest { display: none; width: 380px; max-width: calc(100vw - 16px); padding: 4px; }
+.lb-md-suggest-head {
+  font: 600 10.5px var(--lb-font-sans); letter-spacing: .08em; text-transform: uppercase;
+  color: var(--lb-mute); padding: 6px 10px 4px;
+}
+.lb-md-suggest-row { padding: 6px 10px; border-radius: 7px; cursor: pointer; }
+.lb-md-suggest-row.is-active { background: var(--lb-accent-soft); }
+.lb-md-suggest-top { display: flex; align-items: baseline; gap: 8px; }
+.lb-md-suggest-main { font-weight: 500; font-size: 13.5px; }
+.lb-md-suggest-key { margin-left: auto; font: 11.5px var(--lb-font-mono); color: var(--lb-ink-3); }
+.lb-md-suggest-kind {
+  font: 600 10.5px var(--lb-font-sans); text-transform: uppercase; letter-spacing: .05em; color: var(--lb-accent);
+}
+.lb-md-suggest-sub { font-size: 12px; color: var(--lb-ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lb-md-suggest-empty { padding: 8px 10px; color: var(--lb-mute); font-size: 13px; }
+.lb-md-pop { width: 340px; max-width: calc(100vw - 16px); padding: 12px 14px; }
+.lb-md-pop-title { font: 500 15px/1.3 var(--lb-font-serif); }
+.lb-md-pop-title.is-missing { color: var(--lb-danger); font-family: var(--lb-font-sans); font-size: 13.5px; }
+.lb-md-pop-meta { color: var(--lb-ink-3); font-size: 12px; margin-top: 3px; }
+.lb-md-pop-meta.is-mono, .lb-md-suggest-sub.is-mono { font-family: var(--lb-font-mono); }
+.lb-md-pop-field { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--lb-ink-3); }
+.lb-md-pop-field input {
+  flex: 1; font: 13px var(--lb-font-sans); padding: 5px 8px; border: 1px solid var(--lb-hairline-2);
+  border-radius: 6px; background: var(--lb-bg); color: var(--lb-ink);
+}
+.lb-md-pop-field input:focus { outline: 2px solid var(--lb-accent); outline-offset: -1px; }
+.lb-md-pop-actions { display: flex; gap: 6px; margin-top: 10px; }
+.lb-md-btn {
+  font: 500 12.5px var(--lb-font-sans); border: 1px solid var(--lb-hairline-2); background: var(--lb-bg-elev);
+  color: var(--lb-ink-2); border-radius: 8px; padding: 5px 11px; cursor: pointer;
+}
+.lb-md-btn:hover { border-color: var(--lb-ink-3); }
+.lb-md-btn.is-primary { background: var(--lb-accent); border-color: var(--lb-accent); color: #fff; }
 
 /* ─────────────────────────────────────────────────────────── */
 /*        Tailwind-Standardpalette -> Tokens (nur Dark)        */

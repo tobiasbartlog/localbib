@@ -13,10 +13,77 @@ from pdf_text import compute_file_hash, extract_text_from_pdf, unlock_pdf
 from doi_discovery import discover_doi, extract_isbn_from_text, extract_year_from_text
 from crossref import fetch_crossref_metadata
 from llm_categorize import categorize_with_llm
-from filenames import generate_filename, create_symlinks
+from filenames import generate_filename, create_symlinks, stored_pdf_path, stored_pdf_target
 
 
-def process_paper(filepath: str, db: Database) -> Optional[int]:
+def _has_stored_file(paper: dict) -> bool:
+    """True when the Item's PDF is in all/ — only then is an input that
+    matches it a second copy that may be removed. The one rule
+    (``filenames.stored_pdf_path``) the smart import applies too."""
+    return stored_pdf_path(paper.get("filename")) is not None
+
+
+def restore_stored_pdf(db: Database, paper_id: int, filename: str, source: str) -> bool:
+    """Puts ``source`` back under the Item's file name in all/, for a row whose
+    stored PDF is gone (an earlier run died between the copy and the row, or
+    the file was removed by hand). ``True`` once the file is there again: the
+    input that matched it may go then.
+
+    ``False`` when it cannot be restored: something that is not the PDF holds
+    the name (a folder — never copy into or over it), or the copy fails; a torn
+    copy is removed again, or the next run would take it for the stored PDF
+    and delete the input. The caller keeps the input then, it is the only copy.
+
+    Shared by ``process_paper`` and the smart import (``routers/import.py``),
+    which both judge "stored" by ``filenames.stored_pdf_path``.
+    """
+    target = stored_pdf_target(filename)
+    if target is None or os.path.lexists(target):
+        logging.warning(f"⚠️  all/{os.path.basename(filename or '')} ist keine Datei — "
+                        f"nicht wiederhergestellt, Input bleibt liegen")
+        return False
+    try:
+        shutil.copy2(source, target)
+    except Exception as e:
+        logging.warning(f"⚠️  Fehlende Datei nicht wiederhergestellt ({e}) — Input bleibt liegen")
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        return False
+    try:
+        create_symlinks(db, paper_id, os.path.basename(target))
+    except Exception as e:
+        logging.warning(f"⚠️  Verknüpfungen nach Wiederherstellung fehlgeschlagen: {e}")
+    logging.info(f"🩹 Fehlende Datei wiederhergestellt: all/{os.path.basename(target)}")
+    return True
+
+
+def _attach_to_item(paper_id: int, filepath: str) -> bool:
+    """Attaches the input PDF to an Item without a file (``paper_ingest``:
+    file in all/, real hash, text, symlinks, index hook). ``False`` when that
+    fails — the caller then keeps the input, it is the only copy.
+
+    ``paper_ingest`` writes through ``Config.DB_PATH``, the one DB every caller
+    of ``process_paper`` passes. Import LAZY, for the same reason as
+    ``import_indexing`` below: paper_ingest hangs on literature_manager (the
+    facade that imports this module), and a CLI run without the web
+    dependencies only loses the attach, never the input.
+    """
+    try:
+        from paper_ingest import attach_pdf_from_path
+
+        result = attach_pdf_from_path(paper_id, filepath)
+    except Exception as e:
+        logging.warning(
+            f"⚠️  PDF nicht an Eintrag {paper_id} angehängt, Input bleibt liegen: {e}"
+        )
+        return False
+    logging.info(f"📎 An bestehenden Eintrag angehängt (ID: {paper_id}): all/{result['filename']}")
+    return True
+
+
+def process_paper(filepath: str, db: Database, *, upload: bool = False) -> Optional[int]:
     """
     Verarbeitet ein einzelnes PDF:
     1. Hash prüfen (Duplikat?)
@@ -28,7 +95,14 @@ def process_paper(filepath: str, db: Database) -> Optional[int]:
     7. Kategorien zuweisen, Symlinks erstellen
     8. Abgeleitete Indizes: Chunks + Embeddings (Research-Chat/semantische Suche)
 
-    Gibt paper_id zurück oder None bei Fehler.
+    Gibt die paper_id zurück — auch die des Eintrags ohne Datei, an den ein
+    Hash-Treffer das PDF angehängt hat (es liegt dann in der Bibliothek) —,
+    sonst None (Duplikat, behaltener Input).
+
+    ``upload``: ``filepath`` ist die Kopie eines Browser-Uploads, das Original
+    liegt weiter beim Nutzer. Sie wird bei einem DOI-/Titel-Treffer auf einen
+    Eintrag ohne gespeichertes PDF entfernt wie jedes Duplikat, statt als
+    "einzige Kopie" im Input-Ordner zu warten (wie der Smart-Upload).
     """
     original_filename = os.path.basename(filepath)
     logging.info(f"\n{'='*60}")
@@ -40,22 +114,29 @@ def process_paper(filepath: str, db: Database) -> Optional[int]:
     existing = db.find_duplicate_paper(file_hash=file_hash)
     if existing:
         logging.info(f"⏭️  Bereits in Datenbank (Hash: {file_hash[:12]}...)")
-        # The row exists but its copy in all/ does not (an earlier run died
-        # between the two): this input is the only copy left — restore it
-        # before the input is removed, never delete it unrestored.
-        stored_name = os.path.basename(existing.get("filename") or "")
-        stored_path = os.path.join(Config.ALL_DIR, stored_name)
-        if stored_name and not os.path.exists(stored_path):
-            shutil.copy2(filepath, stored_path)
-            create_symlinks(db, existing["id"], stored_name)
-            logging.info(f"🩹 Fehlende Datei wiederhergestellt: all/{stored_name}")
+        attached_to = None
+        if stored_pdf_target(existing.get("filename")) is None:
+            # The row kept the hash but has no file (Diagnosis "clear_pdf"):
+            # this input is the only copy. Attach it to that row, as the smart
+            # import does; if that fails the input stays where it is.
+            if not _attach_to_item(existing["id"], filepath):
+                return None
+            attached_to = existing["id"]
+        elif stored_pdf_path(existing["filename"]) is None:
+            # The row names a file all/ does not hold (an earlier run died
+            # between the two): this input is the only copy left — restore it
+            # before the input is removed, never delete it unrestored.
+            if not restore_stored_pdf(db, existing["id"], existing["filename"], filepath):
+                return None
         # Datei aus Input-Ordner entfernen, damit sie nicht immer wieder auftaucht
         try:
             os.remove(filepath)
             logging.info(f"🗑️  Duplikat-Datei aus Input entfernt: {original_filename}")
         except Exception as e:
             logging.warning(f"⚠️  Konnte Duplikat-Datei nicht entfernen: {e}")
-        return None
+        # An attached PDF is in the library now: the Item's id, so the callers
+        # report it as imported. A mere duplicate stays None.
+        return attached_to
 
     # 1b. PDF-Schutz entfernen (wenn aktiviert)
     if Config.UNLOCK_PDFS:
@@ -121,6 +202,22 @@ def process_paper(filepath: str, db: Database) -> Optional[int]:
     dup = db.find_duplicate_paper(doi=metadata.get("doi", ""), title=metadata.get("title", ""))
     if dup:
         logging.info(f"⏭️  Duplikat erkannt (DOI/Titel): '{dup.get('title', '')}' (ID: {dup['id']})")
+        # Only a stored file makes the input a second copy. An Item without PDF
+        # (DOI intake, BibTeX import, Diagnosis "clear_pdf") or whose file in
+        # all/ is gone leaves the input as the only copy: it stays in the input
+        # folder. It is not attached — a DOI/title match names the same work,
+        # not the same file, and the smart import attaches only on a hash match.
+        # A browser upload is a copy (its original stays on the user's disk),
+        # so it goes like any duplicate.
+        if not _has_stored_file(dup):
+            if not upload:
+                logging.warning(
+                    f"⚠️  Eintrag {dup['id']} hat kein PDF in all/ — Input bleibt liegen: "
+                    f"{original_filename} (im Eintrag per „PDF anhängen“ zuordnen)"
+                )
+                return None
+            logging.info(f"   Eintrag {dup['id']} hat kein PDF in all/ — Upload-Kopie wird "
+                         f"entfernt, das Original liegt beim Nutzer")
         try:
             os.remove(filepath)
             logging.info(f"🗑️  Duplikat-Datei entfernt: {original_filename}")

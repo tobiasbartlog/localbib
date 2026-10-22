@@ -37,6 +37,7 @@ from literature_manager import (
     extract_year_from_text,
     fetch_crossref_metadata,
 )
+from doi_discovery import read_pdf_metadata, title_from_pdf_metadata
 from llm_client import llm_for
 from services.metadata_extraction import llm_extract_metadata
 
@@ -96,6 +97,42 @@ def _sse(data: dict) -> dict:
     return data
 
 
+_STOPWORDS = {'the', 'a', 'an', 'of', 'in', 'on', 'for', 'and', 'to', 'with', 'by', 'from', 'at', 'as', 'is'}
+
+
+def _apply_crossref(doi: str, text: str, metadata: dict, *, percent: int) -> Iterator[dict]:
+    """Fetch CrossRef for ``doi`` and merge it into ``metadata`` when its
+    title overlaps the PDF's first 5000 characters (>= 50 % of its words).
+    A mismatch drops the DOI. Yields progress, returns the plausibility."""
+    yield _sse({"type": "progress", "step": "crossref", "message": "import.step.crossref", "percent": percent})
+    metadata["doi"] = doi
+    crossref_data = fetch_crossref_metadata(doi)
+    if not crossref_data:
+        yield _sse({"type": "progress", "step": "crossref", "message": "import.step.crossrefEmpty", "percent": percent + 5})
+        return False
+    # Plausibilitaetspruefung: Stimmt der CrossRef-Titel mit dem PDF-Anfang ueberein?
+    cr_words = set(re.sub(r'[^a-z0-9\s]', '', (crossref_data.get("title") or "").lower()).split())
+    cr_words -= _STOPWORDS
+    if cr_words:
+        pdf_first_words = set(re.sub(r'[^a-z0-9\s]', '', text[:5000].lower()).split())
+        plausible = len(cr_words & pdf_first_words) / len(cr_words) >= 0.5
+    else:
+        plausible = True
+    if plausible:
+        metadata.update(crossref_data)
+        yield _sse({"type": "progress", "step": "crossref",
+                    "message": {"code": "import.step.crossrefTitle",
+                                "params": {"title": metadata['title'][:70]}},
+                    "percent": percent + 5})
+    else:
+        yield _sse({"type": "progress", "step": "crossref",
+                    "message": {"code": "import.step.crossrefMismatch",
+                                "params": {"title": crossref_data.get('title', '')[:50]}},
+                    "percent": percent + 5})
+        metadata["doi"] = ""  # Verwerfe falsche DOI
+    return plausible
+
+
 def run_pipeline(
     target_path: str,
     original_filename: str,
@@ -124,41 +161,19 @@ def run_pipeline(
     }
 
     # -- DOI suchen & CrossRef --
+    # The publisher's own metadata (Info dictionary / XMP) is the strongest
+    # DOI signal and often the only clean title; read it once.
+    pdf_metadata = read_pdf_metadata(target_path)
     crossref_plausible = False
+    rejected_doi = ""
     if do_doi:
         yield _sse({"type": "progress", "step": "doi", "message": "import.step.doiSearch", "percent": 20})
-        doi = discover_doi(text, "", "")
+        doi = discover_doi(text, "", "", pdf_metadata=pdf_metadata)
         if doi:
-            metadata["doi"] = doi
             yield _sse({"type": "progress", "step": "doi", "message": {"code": "import.step.doiFound", "params": {"doi": doi}}, "percent": 25})
-
-            yield _sse({"type": "progress", "step": "crossref", "message": "import.step.crossref", "percent": 30})
-            crossref_data = fetch_crossref_metadata(doi)
-            if crossref_data:
-                # Plausibilitaetspruefung: Stimmt der CrossRef-Titel mit dem PDF-Anfang ueberein?
-                cr_words = set(re.sub(r'[^a-z0-9\s]', '', (crossref_data.get("title") or "").lower()).split())
-                cr_words -= {'the', 'a', 'an', 'of', 'in', 'on', 'for', 'and', 'to', 'with', 'by', 'from', 'at', 'as', 'is'}
-                if cr_words:
-                    pdf_first_words = set(re.sub(r'[^a-z0-9\s]', '', text[:5000].lower()).split())
-                    overlap = len(cr_words & pdf_first_words) / len(cr_words)
-                    crossref_plausible = overlap >= 0.5
-                else:
-                    crossref_plausible = True
-
-                if crossref_plausible:
-                    metadata.update(crossref_data)
-                    yield _sse({"type": "progress", "step": "crossref",
-                                "message": {"code": "import.step.crossrefTitle",
-                                            "params": {"title": metadata['title'][:70]}},
-                                "percent": 35})
-                else:
-                    yield _sse({"type": "progress", "step": "crossref",
-                                "message": {"code": "import.step.crossrefMismatch",
-                                            "params": {"title": crossref_data.get('title', '')[:50]}},
-                                "percent": 35})
-                    metadata["doi"] = ""  # Verwerfe falsche DOI
-            else:
-                yield _sse({"type": "progress", "step": "crossref", "message": "import.step.crossrefEmpty", "percent": 35})
+            crossref_plausible = yield from _apply_crossref(doi, text, metadata, percent=30)
+            if not metadata["doi"]:
+                rejected_doi = doi
         else:
             yield _sse({"type": "progress", "step": "doi", "message": "import.step.doiNotFound", "percent": 35})
 
@@ -175,7 +190,10 @@ def run_pipeline(
 
     if not metadata["title"]:
         lines = [l.strip() for l in text.split("\n") if l.strip()]
-        metadata["title"] = lines[0][:200] if lines else original_filename.replace(".pdf", "")
+        # The publisher's metadata title beats the first line, which on a
+        # journal page is often the running head ("Engineering Structures 368").
+        metadata["title"] = (title_from_pdf_metadata(pdf_metadata[0])
+                             or (lines[0][:200] if lines else original_filename.replace(".pdf", "")))
 
     # -- LLM Metadaten-Validierung --
     llm_failures: list[dict] = []
@@ -213,6 +231,21 @@ def run_pipeline(
             yield _sse({"type": "progress", "step": "validate", "message": "import.step.validateEmpty", "percent": 50})
     else:
         yield _sse({"type": "progress", "step": "validate", "message": "import.step.validateSkipped", "percent": 50})
+
+    # -- DOI per Titelsuche --
+    # Neither the metadata nor the first page named a DOI: search by the best
+    # title we now have (the AI's, the metadata's, the first line). A DOI
+    # found this way passes the same plausibility check as one read from
+    # the PDF, so a near-miss title never brings in a stranger's metadata.
+    if do_doi and not metadata["doi"] and metadata["title"]:
+        yield _sse({"type": "progress", "step": "doi", "message": "import.step.doiTitleSearch", "percent": 51})
+        # No text: only the title strategies (OpenAlex, CrossRef) run.
+        doi = discover_doi("", metadata["title"], metadata["authors"], metadata["year"])
+        if doi and doi.lower() != rejected_doi.lower():
+            yield _sse({"type": "progress", "step": "doi", "message": {"code": "import.step.doiFound", "params": {"doi": doi}}, "percent": 51})
+            crossref_plausible = yield from _apply_crossref(doi, text, metadata, percent=52)
+        else:
+            yield _sse({"type": "progress", "step": "doi", "message": "import.step.doiNotFound", "percent": 52})
 
     return ImportResult(
         text=text,

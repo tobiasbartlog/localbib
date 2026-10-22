@@ -44,13 +44,13 @@
     <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
     <script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>
     <script src="https://d3js.org/d3.v7.min.js"></script>
-    <!-- CodeMirror 5 (buildless — ADR-0002 deferred): der Notiz-Editor
-         (Markdown). Add-ons teilen sich diese eine Instanz der Bibliothek und
-         bringen weitere Modi/Addons als eigene Assets mit (ADR-0021). -->
+    <!-- CodeMirror 5 (buildless — ADR-0002 deferred): nur noch der Kern fuer
+         Add-ons, die einen Code-Editor brauchen; sie teilen sich diese eine
+         Instanz und bringen Modi/Addons als eigene Assets mit (ADR-0021).
+         Notizen schreibt der Markdown-Editor (ADR-0026), lazy aus
+         static/vendor/milkdown-*. -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/continuelist.min.js"></script>
     <!-- Markdown-Rendering fuer Notizen und Research-Chat. DOMPurify ist nicht
          optional, sobald gespeicherter Text als HTML eingesetzt wird. -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
@@ -80,12 +80,12 @@
     </script>
     <!-- Add-on frontends (#187): what app.js loads before it mounts the router. -->
     <script>window.LB_ADDONS = {{ addons | tojson }};</script>
-    <script src="/static/locales/core.en.js?v=20261011wissensnetz5"></script>
-    <script src="/static/locales/core.de.js?v=20261011wissensnetz5"></script>
-    <link rel="stylesheet" href="/static/style.css?v=20261011wissensnetz5">
+    <script src="/static/locales/core.en.js?v=20261022mdcompact"></script>
+    <script src="/static/locales/core.de.js?v=20261022mdcompact"></script>
+    <link rel="stylesheet" href="/static/style.css?v=20261022mdcompact">
 </head>
 <body class="bg-bg text-ink font-sans min-h-screen">
     <div id="app"></div>
-    <script src="/static/app.js?v=20261011wissensnetz5"></script>
+    <script src="/static/app.js?v=20261022mdcompact"></script>
 </body>
 </html>
