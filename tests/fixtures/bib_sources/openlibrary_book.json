@@ -1,0 +1,36 @@
+{
+  "ISBN:9780262033848": {
+    "url": "https://openlibrary.org/books/OL23110361M/Introduction_to_algorithms",
+    "key": "/books/OL23110361M",
+    "title": "Introduction to algorithms",
+    "authors": [
+      {"url": "https://openlibrary.org/authors/OL1813870A/Thomas_H._Cormen", "name": "Thomas H. Cormen"},
+      {"url": "https://openlibrary.org/authors/OL2667986A/Charles_E._Leiserson", "name": "Charles E. Leiserson"},
+      {"url": "https://openlibrary.org/authors/OL2667987A/Ronald_L._Rivest", "name": "Ronald L. Rivest"},
+      {"url": "https://openlibrary.org/authors/OL2667988A/Clifford_Stein", "name": "Clifford Stein"}
+    ],
+    "number_of_pages": 1292,
+    "pagination": "xix, 1292 p. :",
+    "by_statement": "Thomas H. Cormen ... [et al.].",
+    "identifiers": {
+      "isbn_13": ["9780262033848"],
+      "isbn_10": ["0262033844"],
+      "lccn": ["2009008593"],
+      "openlibrary": ["OL23110361M"]
+    },
+    "classifications": {"lc_classifications": ["QA76.6 .I5858 2009"], "dewey_decimal_class": ["005.1"]},
+    "publishers": [{"name": "MIT Press"}],
+    "publish_places": [{"name": "Cambridge, Mass"}],
+    "publish_date": "2009",
+    "subjects": [
+      {"name": "Computer programming", "url": "https://openlibrary.org/subjects/computer_programming"},
+      {"name": "Computer algorithms", "url": "https://openlibrary.org/subjects/computer_algorithms"}
+    ],
+    "notes": "Includes bibliographical references and index.",
+    "cover": {
+      "small": "https://covers.openlibrary.org/b/id/6971547-S.jpg",
+      "medium": "https://covers.openlibrary.org/b/id/6971547-M.jpg",
+      "large": "https://covers.openlibrary.org/b/id/6971547-L.jpg"
+    }
+  }
+}

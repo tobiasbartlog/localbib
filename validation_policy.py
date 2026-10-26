@@ -31,6 +31,7 @@ import logging
 import os
 from typing import List
 
+import bib_fields
 import metadata_validation
 from context import get_conn
 from fastapi import HTTPException
@@ -163,17 +164,24 @@ async def validate_apply(paper_id: int, data: ValidateApplyRequest):
     finally:
         conn.close()
 
-    changes = data.changes or {}
+    # The rules of every metadata write, the same as PUT /api/papers/{id}:
+    # a known item type, ISO dates, year and pub_date kept in step.
+    try:
+        changes = bib_fields.checked_changes(data.changes or {}, paper)
+    except bib_fields.InvalidValue as exc:
+        raise HTTPException(status_code=422, detail={"code": exc.code, "params": exc.params})
 
     # 1. Write metadata field updates
     update_fields = []
     update_values = []
-    for fld in ("title", "authors", "year", "doi", "isbn", "abstract",
-                "journal", "publisher"):
+    for fld in bib_fields.WRITABLE_FIELDS:
         if fld in changes and changes[fld] is not None:
             val = changes[fld]
             if fld == "abstract" and isinstance(val, str):
                 val = val[:5000]
+            if fld == "year" and val == "":
+                val = None   # a cleared year is NULL, as PUT writes it
+                changes["year"] = None
             update_fields.append(f"{fld} = ?")
             update_values.append(val)
 

@@ -243,32 +243,25 @@ def test_every_result_of_one_item_carries_its_final_key(client, db):
     assert first["citekey"] == second["citekey"] == final
 
 
-class _CrossRefReply:
-    status_code = 200
-
-    def __init__(self, authors):
-        self._authors = authors
-
-    def json(self):
-        return {"message": {"title": ["Consortium work"], "author": self._authors,
-                            "published-print": {"date-parts": [[2020]]}}}
-
-
 @pytest.mark.real_enrichment
 @respx.mock
 @pytest.mark.parametrize("authors, stored", [
     ([{"name": "The ABC Consortium", "sequence": "first"}, {"family": "Doe", "given": "Jane"}],
-     "The ABC Consortium, Doe, Jane"),
+     "{The ABC Consortium}; Doe, Jane"),
     ([], ""),
     ([{"sequence": "first"}], ""),
 ])
 def test_crossref_authors_count_organizations_and_never_write_a_bare_separator(
-        client, db, monkeypatch, authors, stored):
+        client, db, authors, stored):
     """The core's one CrossRef author format: an organization (``name``) is
-    an author; an author list with no name in it writes nothing — no lone
-    comma."""
+    an author, stored in braces (the library's mark for one), people are
+    joined with "; "; an author list with no name in
+    it writes nothing — no lone separator."""
     respx.get(f"{BASE_URL}/works").mock(return_value=httpx.Response(200, json={"results": []}))
-    monkeypatch.setattr("crossref.requests.get", lambda *a, **k: _CrossRefReply(authors))
+    respx.get("https://api.crossref.org/works/10.5555/consortium").mock(
+        return_value=httpx.Response(200, json={"message": {
+            "title": ["Consortium work"], "author": authors,
+            "published-print": {"date-parts": [[2020]]}}}))
     body = client.post("/api/papers/by-doi", json={"doi": "10.5555/consortium"}).json()
     row = _row(db, body["paper_id"])
     assert row["title"] == "Consortium work"

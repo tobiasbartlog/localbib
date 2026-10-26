@@ -7,6 +7,7 @@ import shutil
 import logging
 from typing import Optional
 
+import bib_lookup
 from config import Config
 from database import Database
 from pdf_text import compute_file_hash, extract_text_from_pdf, unlock_pdf
@@ -162,16 +163,20 @@ def process_paper(filepath: str, db: Database, *, upload: bool = False) -> Optio
         "publisher": "",
     }
 
+    # The bibliographic record of the DOI (bib_lookup): CrossRef, else
+    # DataCite (arXiv, Zenodo …). CrossRef goes through this module's name,
+    # the one patch target.
     doi = discover_doi(text, metadata["title"], metadata["authors"])
     if doi:
         logging.info(f"🔍 DOI gefunden: {doi}")
         metadata["doi"] = doi
-        crossref_data = fetch_crossref_metadata(doi)
-        if crossref_data:
-            metadata.update(crossref_data)
-            logging.info(f"   ✅ CrossRef: {metadata['title'][:80]}...")
+        record = bib_lookup.fetch(doi=doi, crossref_fetch=fetch_crossref_metadata)
+        if record["fields"]:
+            metadata.update(record["fields"])
+            source = next(iter(record["sources"].values()), "")
+            logging.info(f"   ✅ {source}: {metadata['title'][:80]}...")
         else:
-            logging.warning("   ⚠️  CrossRef lieferte keine Daten für diese DOI")
+            logging.warning("   ⚠️  CrossRef/DataCite lieferten keine Daten für diese DOI")
     else:
         logging.info("🔍 Keine DOI gefunden. Extrahiere Metadaten aus Text...")
 
@@ -181,6 +186,8 @@ def process_paper(filepath: str, db: Database, *, upload: bool = False) -> Optio
         if isbn:
             metadata["isbn"] = isbn
             logging.info(f"   ISBN gefunden: {isbn}")
+            # No Open Library lookup here: an ISBN in a PDF's text is as often
+            # a cited book's as the document's own.
 
     # Fallback: Jahr aus Text
     if not metadata["year"]:
@@ -264,6 +271,7 @@ def process_paper(filepath: str, db: Database, *, upload: bool = False) -> Optio
         "publisher": metadata["publisher"],
         "raw_metadata": json.dumps(metadata, ensure_ascii=False),
         "ocr_text": text[:10000],
+        **bib_lookup.bib_columns(metadata),
     }
 
     # Datei zuerst, dann die DB-Zeile: eine Zeile ohne Datei liesse den

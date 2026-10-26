@@ -115,6 +115,32 @@ class TestProcessPaper:
         assert not Path(path).exists()
         assert list(all_dir.glob("*.pdf"))
 
+    def test_the_doi_record_fills_the_bibliographic_columns(self, env):
+        db, input_dir, all_dir, mp = env
+        mp.setattr(pipeline, "discover_doi", lambda *a, **k: "10.1/abc")
+        mp.setattr(pipeline, "fetch_crossref_metadata", lambda doi: {
+            "title": "Resolved Title", "authors": "Doe, Jane; Roe, Rob", "year": 2022, "doi": doi,
+            "abstract": "", "journal": "J", "publisher": "P", "isbn": "",
+            "item_type": "article", "volume": "12", "issue": "3", "pages": "45-67",
+            "pub_date": "2022-05", "issn": "1234-5678",
+        })
+        pid = pipeline.process_paper(_make_pdf(input_dir), db)
+        row = next(p for p in db.get_all_papers() if p["id"] == pid)
+        assert (row["item_type"], row["volume"], row["issue"], row["pages"]) == ("article", "12", "3", "45-67")
+        assert (row["pub_date"], row["issn"]) == ("2022-05", "1234-5678")
+
+    def test_a_doi_crossref_does_not_know_is_asked_at_datacite(self, env):
+        import datacite
+
+        db, input_dir, all_dir, mp = env
+        mp.setattr(pipeline, "discover_doi", lambda *a, **k: "10.48550/arXiv.2108.08090")
+        mp.setattr(datacite, "fetch_datacite_metadata", lambda doi: {
+            "title": "Graph Surrogates", "authors": "Okafor, Ada", "year": 2021,
+            "item_type": "preprint", "eprint": "2108.08090"})
+        pid = pipeline.process_paper(_make_pdf(input_dir), db)
+        row = next(p for p in db.get_all_papers() if p["id"] == pid)
+        assert (row["title"], row["item_type"], row["eprint"]) == ("Graph Surrogates", "preprint", "2108.08090")
+
     def test_assigns_llm_categories(self, env):
         db, input_dir, all_dir, mp = env
         cid = db.add_category("AI", None)

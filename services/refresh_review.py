@@ -24,13 +24,23 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-SCOPES = ("categories", "metadata", "abstracts")
-"""What a refresh may cover. Page counts, citation counts and chunks are
-derived values that overwrite nothing — they stay in the full refresh."""
+from author_names import normalize_people
+from bib_fields import WRITABLE_FIELDS, missing_fields
 
-FIELDS = ("title", "authors", "year", "doi", "isbn", "abstract", "journal", "publisher")
+_PEOPLE = ("authors", "editors")
+
+SCOPES = ("categories", "metadata", "abstracts", "bibliographic")
+"""What a refresh may cover. Page counts, citation counts and chunks are
+derived values that overwrite nothing — they stay in the full refresh.
+
+``bibliographic`` completes the bibliographic data from the DOI's or ISBN's
+record (``bib_lookup``) and needs no PDF text. Its gap fills are written by
+the run itself (user decision: empty fields fill automatically); a differing
+value becomes an ordinary ``field`` row (:func:`bibliographic_rows`)."""
+
+FIELDS = WRITABLE_FIELDS
 """Metadata columns a ``field`` row may write — the same set
-``validation_policy.validate_apply`` persists."""
+``validation_policy.validate_apply`` persists (one constant, ``bib_fields``)."""
 
 
 def _norm(value: Any) -> str:
@@ -43,9 +53,12 @@ def scopes_for(paper: Dict[str, Any], has_categories: bool, scopes: Iterable[str
     which items a refresh touches, so ``propose`` and ``count`` cannot drift.
 
     ``only_gaps``: *categories* only for an item without any category,
-    *metadata* only for an item without a DOI. *abstracts* never changes: it
-    only ever acts on an empty abstract. Without ``only_gaps`` every selected
-    scope applies to every item (the abstracts one still needs the gap)."""
+    *metadata* only for an item without a DOI, *bibliographic* only for an
+    item that lacks a field its type requires (``bib_fields.missing_fields``).
+    *abstracts* never changes: it only ever acts on an empty abstract.
+    *bibliographic* always needs a DOI or an ISBN to look up. Without
+    ``only_gaps`` every selected scope applies to every item (the abstracts
+    one still needs the gap)."""
     out = set()
     for s in scopes:
         if s == "categories" and (not only_gaps or not has_categories):
@@ -53,6 +66,9 @@ def scopes_for(paper: Dict[str, Any], has_categories: bool, scopes: Iterable[str
         elif s == "metadata" and (not only_gaps or not _norm(paper.get("doi"))):
             out.add(s)
         elif s == "abstracts" and not _norm(paper.get("abstract")):
+            out.add(s)
+        elif (s == "bibliographic" and (_norm(paper.get("doi")) or _norm(paper.get("isbn")))
+              and (not only_gaps or missing_fields(paper))):
             out.add(s)
     return out
 
@@ -67,6 +83,15 @@ def select_items(papers: Iterable[Dict[str, Any]], categorised: set, scopes: Ite
         if applicable:
             picked.append((p, applicable))
     return picked
+
+
+def without_identifier(papers: Iterable[Dict[str, Any]], only_gaps: bool) -> int:
+    """How many items the *bibliographic* scope would look at but cannot —
+    no DOI and no ISBN to ask with ("skipped" beside the count). With
+    ``only_gaps`` only those that lack a required field count."""
+    return sum(1 for p in papers
+               if not (_norm(p.get("doi")) or _norm(p.get("isbn")))
+               and (not only_gaps or missing_fields(p)))
 
 
 def row_id(paper_id: int, kind: str, key: Any) -> str:
@@ -84,6 +109,8 @@ def field_rows(paper: Dict[str, Any], changes: Dict[str, Any],
         before, after = paper.get(fld), changes[fld]
         if _norm(before) == _norm(after):
             continue
+        if fld in _PEOPLE and normalize_people(_norm(before)) == normalize_people(_norm(after)):
+            continue  # the same people, only the separators differ (CrossRef's old ", " form)
         rows.append({
             "id": row_id(paper["id"], "field", fld),
             "paper_id": paper["id"],
@@ -95,6 +122,17 @@ def field_rows(paper: Dict[str, Any], changes: Dict[str, Any],
             "clears": bool(_norm(before)) and not _norm(after),
         })
     return rows
+
+
+def bibliographic_rows(paper: Dict[str, Any],
+                       conflicts: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The *bibliographic* scope's review rows: one ``field`` row per
+    conflict of ``bib_lookup.compare`` (a filled field the record names
+    differently) — the same rows, and so the same stale check on apply, as
+    every other field. Its fills never become rows; the run writes them."""
+    conflicts = list(conflicts or [])
+    return field_rows(paper, {c["field"]: c["found"] for c in conflicts},
+                      {c["field"]: c.get("source") or "" for c in conflicts})
 
 
 def category_rows(paper_id: int, current: Iterable[Dict[str, Any]],

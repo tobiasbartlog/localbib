@@ -29,6 +29,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterator
 
+import bib_lookup
 from literature_manager import (
     Config,
     discover_doi,
@@ -101,12 +102,14 @@ _STOPWORDS = {'the', 'a', 'an', 'of', 'in', 'on', 'for', 'and', 'to', 'with', 'b
 
 
 def _apply_crossref(doi: str, text: str, metadata: dict, *, percent: int) -> Iterator[dict]:
-    """Fetch CrossRef for ``doi`` and merge it into ``metadata`` when its
-    title overlaps the PDF's first 5000 characters (>= 50 % of its words).
-    A mismatch drops the DOI. Yields progress, returns the plausibility."""
+    """Fetch the record of ``doi`` (``bib_lookup``: CrossRef, else DataCite)
+    and merge it — bibliographic columns included — into ``metadata`` when
+    its title overlaps the PDF's first 5000 characters (>= 50 % of its
+    words). A mismatch drops the DOI. Yields progress, returns the
+    plausibility."""
     yield _sse({"type": "progress", "step": "crossref", "message": "import.step.crossref", "percent": percent})
     metadata["doi"] = doi
-    crossref_data = fetch_crossref_metadata(doi)
+    crossref_data = bib_lookup.fetch(doi=doi, crossref_fetch=fetch_crossref_metadata)["fields"]
     if not crossref_data:
         yield _sse({"type": "progress", "step": "crossref", "message": "import.step.crossrefEmpty", "percent": percent + 5})
         return False

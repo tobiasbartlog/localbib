@@ -30,6 +30,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
+import bib_export
 from context import get_conn, safe_pdf_path
 from literature_manager import Config, Database
 from services import collection_export as export_svc
@@ -144,7 +145,7 @@ def _build_ris(papers, collection, notes):
 
 def _build_bibtex(papers, collection, notes):
     # Keys are stored and unique -- no export-local dedup needed.
-    content = export_svc.bibtex_text(papers)
+    content = export_svc.bibtex_text(papers, **bib_export.options())
     return _download(content.encode("utf-8"), "application/x-bibtex",
                      f"{_basename(collection)}.bib")
 
@@ -164,7 +165,7 @@ def _build_zip(papers, collection, notes):
 
     spool = tempfile.SpooledTemporaryFile(max_size=_ZIP_SPOOL)
     with zipfile.ZipFile(spool, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"{base}.bib", export_svc.bibtex_text(papers))
+        zf.writestr(f"{base}.bib", export_svc.bibtex_text(papers, **bib_export.options()))
         zf.writestr(f"{base}.ris", export_svc.ris_text(papers, Config.ALL_DIR))
         zf.writestr(export_svc.MISSING_PDFS_NAME, plan.missing_text)
         for paper_id, member in plan.pdfs:

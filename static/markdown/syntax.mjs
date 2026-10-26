@@ -78,8 +78,11 @@ export function splitInline(value) {
 export function shortAuthors(authors) {
     const a = String(authors || '').trim();
     if (!a) return '';
+    // A name in braces is an organization: named whole, without its braces.
+    const org = (x) => (/^\{.*\}$/.test(x.trim()) ? x.trim().slice(1, -1).trim() : null);
     let names;
-    if (a.includes(';')) names = a.split(';').map((x) => x.split(',')[0].trim()).filter(Boolean);
+    if (a.includes(';')) names = a.split(';').map((x) => org(x) ?? x.split(',')[0].trim()).filter(Boolean);
+    else if (org(a)) names = [org(a)];
     else {
         const segs = a.split(',').map((x) => x.trim()).filter(Boolean);
         if (segs.length && segs[0].includes(' ')) names = segs.map((s) => s.split(/\s+/).pop());

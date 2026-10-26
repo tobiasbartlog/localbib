@@ -3,6 +3,12 @@
 Serves:
   GET /api/papers/{paper_id}/annotations
   GET /api/papers/{paper_id}/annotations/{annotation_id}/image
+  GET /api/papers/{paper_id}/locate?page=N&text=...   (contract 2.6)
+
+``locate`` finds where a passage (an MCP hit, say) starts on its PDF page, for
+the preview's frame (``/paper/{id}?page=N&find=...``). It lives here because it
+must run under the same ``_pdf_lock`` as the annotations, and a router never
+imports another router.
 
 Read-only by design: the PDF is the only source, nothing is persisted and the
 file is never written. Every rule lives in the pure module ``pdf_annotations``;
@@ -28,7 +34,7 @@ import threading
 import weakref
 from collections import OrderedDict
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
@@ -46,6 +52,7 @@ _pdf_lock = threading.Lock()   # serialises every PyMuPDF call (read and render)
 # Where requests wait for their turn: on the event loop, so a queue of pictures
 # holds no worker thread of the shared pool. ``_pdf_lock`` stays the real guard.
 _queues: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+LOCATE_TEXT_MAX = 2000   # characters of a passage the locate search may see (only its start counts)
 
 
 def _queue() -> asyncio.Lock:
@@ -139,6 +146,27 @@ def _image(path: str, page_index: int, rect) -> bytes:
             return pdf_annotations.render_image(path, page_index, rect)
         except pdf_annotations.UnreadablePdf as exc:
             raise _unreadable(path, exc)
+
+
+def _locate(path: str, page: int, text: str):
+    with _pdf_lock:
+        try:
+            return pdf_annotations.locate(path, page, text)
+        except pdf_annotations.UnreadablePdf as exc:
+            raise _unreadable(path, exc)
+
+
+@router.get("/api/papers/{paper_id}/locate")
+async def locate_passage(paper_id: int, page: int = Query(..., ge=1), text: str = ""):
+    """Where a passage starts on a PDF page (contract 2.6): ``rect`` in page
+    fractions for the preview's frame, ``null`` when the start is not on that
+    page or not unambiguous there - the caller then only goes to the page."""
+    path = _pdf_path(paper_id)
+    rect = None
+    if text.strip():
+        async with _queue():
+            rect = await run_in_threadpool(_locate, path, page, text[:LOCATE_TEXT_MAX])
+    return {"page": page, "rect": rect}
 
 
 @router.get("/api/papers/{paper_id}/annotations")

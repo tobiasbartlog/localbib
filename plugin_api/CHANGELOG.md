@@ -4,6 +4,37 @@ The package version follows semver; its major number is the Add-on Contract
 version (`plugin_api.API_VERSION`). A core accepts exactly one contract
 version; an Add-on built against another one is shown as incompatible.
 
+## 2.6.0 — BibTeX into the core's import, the PDF viewer, links to a passage
+
+Added (additive, `API_VERSION` stays `2`; frontend contract, no Python API
+change):
+
+- `window.LocalBib.importBibtex(text, { collection, filename })` hands BibTeX
+  text to the core's import: the import page opens its BibTeX dialog with the
+  text as the `.bib` file, previews it (at once when `collection` names an
+  active Collection, which is preselected as the target; otherwise after the
+  user picks one) and creates only when the user confirms — new entries keep
+  their keys, entries the library holds are matched, and all of them land in
+  the chosen Collection. The text stays in memory. Returns `true`, or `false`
+  for an empty text. Feature-check it
+  (`typeof LocalBib.importBibtex === 'function'`) for cores before 2.6.
+- The Item detail route `/paper/{id}` takes `?page=N&find=<passage text>`:
+  the PDF preview opens on PDF page `N` and frames the paragraph where the
+  passage starts on that page — no frame when it is not found there or not
+  unambiguous, never a guessed spot. `?back=<route>` puts a key "← Back to
+  <label>" at the start of the detail head (`label` = the nav label of the
+  route's area, else "Back") that returns there with `router.push`; only an
+  internal route counts (starts with `/`, not `//`, no backslash, whitespace
+  or scheme), anything else is ignored. A core before 2.6 ignores `find` and
+  `back` and only goes to the page.
+- `window.LocalBib.components.PdfPreview` — the detail view's PDF preview as
+  a component: props `paperId`, `page`, `find` (frames the passage's
+  paragraph on that page like `?find=`, the page only when it is not found),
+  event `state` `{status: loading|ready|nopdf|failed, page, pages, found}`.
+  Feature-check it in `LocalBib.components` for cores before 2.6.
+- The import route takes `?bibtex=1` (with the optional `collection=<id>`):
+  the BibTeX dialog opens at once, for a `.bib` file the user picks.
+
 ## 2.5.0 — Passages with page numbers
 
 Added (additive, `API_VERSION` stays `2`; needs only `library.read`):

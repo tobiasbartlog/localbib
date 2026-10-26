@@ -3,16 +3,17 @@
 
 import os
 import threading
-import re
 import logging
 import argparse
 from pathlib import Path
 
+import bib_export
 from config import Config, setup_logging
 from database import Database
 from pipeline import process_paper
 from filenames import clear_category_folders, create_symlinks
 from watcher import start_watcher
+from services import collection_export
 
 
 # =============================================================================
@@ -187,29 +188,9 @@ def cmd_export_bibtex(args):
 
     output_path = args.output or os.path.join(Config.BASE_DIR, "literatur.bib")
 
+    # Derselbe Builder (und dieselben Cite Keys) wie der .bib-Export der App.
     with open(output_path, "w", encoding="utf-8") as f:
-        for p in papers:
-            # BibTeX-Key generieren
-            author_key = re.sub(r'[^\w]', '', (p["authors"] or "Unknown").split(",")[0])
-            year = p["year"] or "XXXX"
-            key = f"{author_key}{year}"
-
-            f.write(f"@article{{{key},\n")
-            if p["title"]:
-                f.write(f"  title = {{{p['title']}}},\n")
-            if p["authors"]:
-                f.write(f"  author = {{{p['authors']}}},\n")
-            if p["year"]:
-                f.write(f"  year = {{{p['year']}}},\n")
-            if p["journal"]:
-                f.write(f"  journal = {{{p['journal']}}},\n")
-            if p["doi"]:
-                f.write(f"  doi = {{{p['doi']}}},\n")
-            if p["isbn"]:
-                f.write(f"  isbn = {{{p['isbn']}}},\n")
-            if p["abstract"]:
-                f.write(f"  abstract = {{{p['abstract'][:500]}}},\n")
-            f.write(f"}}\n\n")
+        f.write(collection_export.bibtex_text(papers, **bib_export.options()))
 
     print(f"✅ BibTeX exportiert: {output_path} ({len(papers)} Einträge)")
 

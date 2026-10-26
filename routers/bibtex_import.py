@@ -28,11 +28,13 @@ from typing import List, Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 # Import the top-level pure module under an alias so the name does not shadow
 # this router module (which Python knows as routers.bibtex_import).
 import bibtex_import as bibtex_import_core  # noqa: E402
 
+import bib_fields
 import ca_trust
 import collection_membership as membership
 import library_events as events
@@ -424,6 +426,9 @@ async def bibtex_import_commit(payload: BibtexCommitRequest):
                 "ocr_text": "",
                 "cite_key": entry.key,  # de-dupliziert in add_paper
                 "import_source": payload.source_name or "",
+                # Typ, Band, Heft, Seiten & Co. in ihre Spalten; der Buchtitel
+                # eines @inproceedings/@incollection nach booktitle, nicht journal.
+                **bib_fields.import_columns(entry.entry_type, entry.raw, entry.journal),
             }
             paper_id = _db.add_paper(paper_data)
             conn = _get_conn()
@@ -443,8 +448,9 @@ async def bibtex_import_commit(payload: BibtexCommitRequest):
 
     # Frisch angelegte Eintraege nicht-destruktiv anreichern (Abstract + fehlende
     # Metadaten), damit Importe nicht "nackt" ohne Abstract in der Bibliothek landen.
-    enriched = paper_ingest.enrich_imported_papers(
-        [r for r in results if r["status"] == "created"])
+    # Network lookups block: off the event loop, like every blocking step here.
+    enriched = await run_in_threadpool(
+        paper_ingest.enrich_imported_papers, [r for r in results if r["status"] == "created"])
 
     return {
         "total": len(payload.entries),
@@ -547,7 +553,7 @@ async def attach_pdf(
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT title, abstract, raw_metadata FROM papers WHERE id = ?", (paper_id,)
+            "SELECT title, abstract, raw_metadata, pages FROM papers WHERE id = ?", (paper_id,)
         ).fetchone()
     finally:
         conn.close()
@@ -555,8 +561,8 @@ async def attach_pdf(
     book = None
     if detect_book:
         try:
-            pages_field = ""
-            if row["raw_metadata"]:
+            pages_field = row["pages"] or ""
+            if not pages_field and row["raw_metadata"]:
                 pages_field = (json.loads(row["raw_metadata"]) or {}).get("pages", "") or ""
             book = detect_book_structure(
                 os.path.join(Config.ALL_DIR, result["filename"]), row["title"], pages_field

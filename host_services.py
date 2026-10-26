@@ -19,11 +19,13 @@ import json
 import logging
 from typing import Optional
 
+import bib_export
 import bibtex_builder
 import embedding_index
 import library_events
 import paper_ingest
 import passage_retrieval
+from author_names import display_people
 from cite_key_generator import base_key as _legacy_cite_key_base
 from context import get_conn
 from filenames import stored_pdf_path
@@ -89,9 +91,10 @@ def _has_pdf_file(paper: dict) -> bool:
 
 
 def _reference_details(paper: dict) -> dict:
-    """``volume``/``issue``/``pages`` (contract 2.3) from what the Item's
-    stored metadata knows — a BibTeX import keeps them in ``raw_metadata``.
-    The library has no columns for them; unknown is ``None``, never a guess."""
+    """``volume``/``issue``/``pages`` (contract 2.3): the Item's columns
+    first, else what an import kept in ``raw_metadata`` (the columns came
+    later; the one-time backfill copies what it can read). Unknown is
+    ``None``, never a guess."""
     try:
         raw = json.loads(paper.get("raw_metadata") or "{}")
     except (TypeError, ValueError):
@@ -99,7 +102,10 @@ def _reference_details(paper: dict) -> dict:
     if not isinstance(raw, dict):
         raw = {}
 
-    def pick(*keys):
+    def pick(column, *keys):
+        stored = str(paper.get(column) or "").strip()
+        if stored:
+            return stored
         for key in keys:
             value = raw.get(key)
             if value not in (None, "", [], {}):
@@ -107,9 +113,9 @@ def _reference_details(paper: dict) -> dict:
         return None
 
     return {
-        "volume": pick("volume"),
-        "issue": pick("issue", "number"),
-        "pages": pick("pages", "page"),
+        "volume": pick("volume", "volume"),
+        "issue": pick("issue", "issue", "number"),
+        "pages": pick("pages", "pages", "page"),
     }
 
 
@@ -139,7 +145,9 @@ class _CoreLibraryApi:
             "citekey": _cite_key(paper),
             "id": paper.get("id"),
             "title": paper.get("title"),
-            "authors": paper.get("authors"),
+            # A display field: the braces that mark an organization in the
+            # library stay inside it (the .bib export writes them itself).
+            "authors": display_people(paper.get("authors")) if paper.get("authors") else paper.get("authors"),
             "year": paper.get("year"),
             "journal": paper.get("journal"),
             "doi": paper.get("doi"),
@@ -213,8 +221,9 @@ class _CoreLibraryApi:
         # Gesamte Bibliothek als .bib (gespeicherte Cite Keys) — fuettert die
         # Manuskript-Vorschau des LaTeX-Editors.
         papers = db.get_all_papers()
+        options = bib_export.options()
         return "\n\n".join(
-            bibtex_builder.format_entry(p, _cite_key(p)) for p in papers
+            bibtex_builder.format_entry(p, _cite_key(p), **options) for p in papers
         ) + "\n"
 
     def get_core_projects(self) -> list:
@@ -407,7 +416,8 @@ class _CoreLibraryApi:
     def export_collection_bibtex(self, collection_id: int) -> str:
         # The same builder (and the same Cite Keys) as the Collection's .bib
         # download (#202) and export_bibtex().
-        return collection_export.bibtex_text(self._collection_papers(collection_id))
+        return collection_export.bibtex_text(self._collection_papers(collection_id),
+                                             **bib_export.options())
 
     def on_change(self, callback):
         # The core's change feed (library_events): Collection events after

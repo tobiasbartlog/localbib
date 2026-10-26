@@ -48,6 +48,9 @@ describe('citation syntax', () => {
         expect(citeLabel({ cite_key: 'k', authors: 'Müller, Anna', year: 2021 })).toBe('Müller 2021');
         expect(citeLabel({ cite_key: 'k', authors: 'Anna Müller, Bernd Schmidt, Carla Weber', year: 2021 })).toBe('Müller et al. 2021');
         expect(citeLabel({ cite_key: 'k', authors: '', year: null })).toBe('k');
+        // A name in braces is an organization: whole, without its braces.
+        expect(citeLabel({ cite_key: 'k', authors: '{Autobahn Westfalen}', year: 2023 })).toBe('Autobahn Westfalen 2023');
+        expect(citeLabel({ cite_key: 'k', authors: '{Autobahn Westfalen}; Chen, Li', year: 2023 })).toBe('Autobahn Westfalen & Chen 2023');
     });
 });
 
@@ -57,6 +60,7 @@ describe('LocalBib.renderMarkdown', () => {
         const calls = installFetchMock([
             { method: 'GET', url: /^\/api\/papers\/lookup\?/, reply: { papers: [
                 { id: 4, cite_key: 'Niu.2026', title: 'Dotted', authors: 'Niu, Li; Chen, Bo', year: 2026, doi: '', has_pdf: true },
+                { id: 5, cite_key: 'AW.2023', title: 'Org', authors: '{Autobahn Westfalen}', year: 2023, doi: '', has_pdf: false },
             ] } },
             ...defaultRoutes(),
         ]);
@@ -81,5 +85,14 @@ describe('LocalBib.renderMarkdown', () => {
         expect(found.dataset.href).toBe('#/paper/4?page=3');
         expect(missing.classList.contains('is-missing')).toBe(true);
         expect(calls.some((c) => c.url === '/api/papers/lookup?keys=Niu.2026&keys=Gone1999')).toBe(true);
+
+        // An organization's braces never reach the chip, its label nor its tooltip.
+        const org = document.createElement('div');
+        org.innerHTML = window.LocalBib.renderMarkdown('Siehe [@AW.2023].');
+        document.body.append(org);
+        await window.LocalBib.hydrateMarkdown(org);
+        const chip = org.querySelector('.lb-md-cite-chip');
+        expect(chip.querySelector('.lb-md-cite-label').textContent).toBe('Autobahn Westfalen 2023');
+        expect(chip.title).not.toContain('{');
     });
 });

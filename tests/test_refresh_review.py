@@ -89,6 +89,13 @@ class TestRows:
         assert by_field["journal"]["clears"] is False
         assert by_field["journal"]["source"] == "crossref"
 
+    def test_field_rows_skip_the_same_people_in_another_separator_form(self):
+        # CrossRef's old ", " form against the "; " form it sends now.
+        paper = {"id": 1, "authors": "Müller, Hans, Schmidt, Eva", "editors": "Doe, Jane"}
+        rows = svc.field_rows(paper, {"authors": "Müller, Hans; Schmidt, Eva",
+                                      "editors": "Doe, Jane; Roe, Rob"})
+        assert [r["field"] for r in rows] == ["editors"]
+
     def test_category_rows_add_and_remove(self):
         current = [{"id": 1, "name": "A", "assigned_by": "manual"}, {"id": 2, "name": "B"}]
         rows = svc.category_rows(7, current, [{"category_id": 2, "confidence": 0.8},

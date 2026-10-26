@@ -227,6 +227,7 @@ from routers.custom_fields import router as _custom_fields_router
 from routers.bibtex_import import router as _bibtex_import_router
 from routers.paper_by_doi import router as _paper_by_doi_router
 from routers.papers import router as _papers_router
+from routers.metadata_lookup import router as _metadata_lookup_router
 from routers.annotations import router as _annotations_router
 from routers.collections import router as _collections_router
 from routers.validate import router as _validate_router
@@ -277,6 +278,7 @@ app.include_router(_bibtex_import_router)
 # Literal /api/papers/by-doi… before the parametric /api/papers/{paper_id} family.
 app.include_router(_paper_by_doi_router)
 app.include_router(_papers_router)
+app.include_router(_metadata_lookup_router)
 app.include_router(_annotations_router)
 app.include_router(_collections_router)
 app.include_router(_validate_router)

@@ -54,6 +54,7 @@ modules =
     routers.bibtex_import
     routers.paper_by_doi
     routers.papers
+    routers.metadata_lookup
     routers.annotations
     routers.collections
     routers.validate

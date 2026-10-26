@@ -1,0 +1,43 @@
+{
+  "data": {
+    "id": "10.5281/zenodo.7301245",
+    "type": "dois",
+    "attributes": {
+      "doi": "10.5281/zenodo.7301245",
+      "identifiers": [{"identifier": "https://zenodo.org/record/7301245", "identifierType": "URL"}],
+      "creators": [
+        {"name": "Nguyen, Thi", "nameType": "Personal", "givenName": "Thi", "familyName": "Nguyen", "affiliation": ["TU Dresden"], "nameIdentifiers": []},
+        {"name": "Patel, Raj", "nameType": "Personal", "givenName": "Raj", "familyName": "Patel", "affiliation": [], "nameIdentifiers": []}
+      ],
+      "titles": [{"title": "fem-bridges: finite element tools for bridge assessment"}],
+      "publisher": {"name": "Zenodo"},
+      "container": {},
+      "publicationYear": "2022",
+      "subjects": [],
+      "contributors": [],
+      "dates": [{"date": "2022-11-02", "dateType": "Issued"}],
+      "language": "en",
+      "types": {"ris": "COMP", "bibtex": "misc", "citeproc": "article", "schemaOrg": "SoftwareSourceCode", "resourceTypeGeneral": "Software"},
+      "relatedIdentifiers": [{"relationType": "IsSupplementTo", "relatedIdentifier": "https://github.com/example/fem-bridges/tree/v0.4.1", "relatedIdentifierType": "URL"}],
+      "sizes": [],
+      "formats": [],
+      "version": "v0.4.1",
+      "rightsList": [{"rights": "MIT License", "rightsUri": "https://opensource.org/licenses/MIT"}],
+      "descriptions": [{"description": "Release v0.4.1 of fem-bridges.", "descriptionType": "Abstract"}],
+      "geoLocations": [],
+      "fundingReferences": [],
+      "url": "https://zenodo.org/record/7301245",
+      "contentUrl": null,
+      "metadataVersion": 1,
+      "schemaVersion": "http://datacite.org/schema/kernel-4",
+      "source": "api",
+      "isActive": true,
+      "state": "findable",
+      "reason": null,
+      "registered": "2022-11-02T14:01:33Z",
+      "published": "2022",
+      "updated": "2022-11-02T14:01:34Z"
+    },
+    "relationships": {"client": {"data": {"id": "cern.zenodo", "type": "clients"}}}
+  }
+}

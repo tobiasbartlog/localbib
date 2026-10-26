@@ -193,6 +193,10 @@ class Config:
         _link = os.getenv("LINK_MODE", "").strip().lower()
         cls.LINK_MODE = _link if _link in cls.LINK_MODES else (
             "hardlink" if sys.platform == "win32" else "symlink")
+        # Dialekt des BibTeX-Exports. biblatex ist der Default: es liest auch
+        # die klassischen Feldnamen; "bibtex" faellt auf die alten Typen zurueck.
+        _dialect = os.getenv("BIB_DIALECT", "").strip().lower()
+        cls.BIB_DIALECT = _dialect if _dialect in cls.BIB_DIALECTS else "biblatex"
         # Backups (backup.py). Kein Ordner, kein Automatik-Intervall, kein
         # Umfang per Default: wohin gesichert wird und ob die PDFs mitkommen,
         # entscheidet der Nutzer ausdruecklich — None heisst "nie gefragt".
@@ -366,6 +370,11 @@ class Config:
     # wirksame Wert, von reload_from_env gesetzt.
     LINK_MODES = ("symlink", "hardlink", "copy")
     LINK_MODE = ""
+
+    # BibTeX-Export (bib_fields/bibtex_builder): "biblatex" oder "bibtex".
+    # Der wirksame Wert, von reload_from_env gesetzt.
+    BIB_DIALECTS = ("biblatex", "bibtex")
+    BIB_DIALECT = "biblatex"
 
     # Backups (von reload_from_env gesetzt). Die Intervalle spiegeln
     # backup.INTERVALS; config.py bleibt ohne Projekt-Import.

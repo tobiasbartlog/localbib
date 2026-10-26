@@ -34,6 +34,9 @@ Rules, in the order a reading applies them:
   block start (never a figure/table/algorithm/listing caption), searched only
   a few pages back from each annotation.
 * **Order**: page, then top to bottom, then left to right.
+
+``locate`` (contract 2.6) shares the page geometry: where a passage starts on
+one page, as the same page fractions an annotation's ``rect`` uses.
 """
 
 from __future__ import annotations
@@ -812,6 +815,76 @@ def _read(doc, stand: str) -> Reading:
 
 
 IMAGE_MAX_SIDE = 900  # pixels
+
+# --- Finding a passage on a page (contract 2.6, ``GET /api/papers/{id}/locate``)
+# The start of a passage is searched on the one page it is said to be on: its
+# first words, then shorter starts. A start that occurs more than once on the
+# page is no answer - never a guessed spot.
+LOCATE_WORDS = (12, 8, 5)       # the starts tried, longest first
+LOCATE_MIN_CHARS = 16           # a shorter start is too common to mean one place
+LOCATE_MAX_BLOCK = 0.5          # a text block taller than this part of the page is no paragraph
+
+
+def _starts(text: str) -> list[str]:
+    words = _norm(text).split()
+    out: list[str] = []
+    for n in LOCATE_WORDS:
+        start = " ".join(words[:n])
+        if len(start) >= LOCATE_MIN_CHARS and start not in out:
+            out.append(start)
+    return out
+
+
+def _occurrences(page_text: str, start: str) -> int:
+    """How often ``start`` stands in the page text (case-folded, whitespace
+    collapsed, hyphenated line ends joined) - what ``search_for`` matches."""
+    flat = _norm(re.sub(r"-\s*\n\s*", "", page_text)).casefold()
+    return flat.count(start.casefold())
+
+
+def _paragraph(page, hits: list[fitz.Rect]) -> fitz.Rect:
+    """The hits, grown to the text block (paragraph) the first one stands in."""
+    area = fitz.Rect(hits[0])
+    for hit in hits[1:]:
+        area |= hit
+    first = hits[0]
+    # Hits and blocks are unrotated page coordinates: so is the height compared.
+    height = page.cropbox.height or 1
+    for block in page.get_text("blocks"):
+        rect = fitz.Rect(block[:4])
+        if block[6] == 0 and rect.intersects(first) \
+                and rect.height <= LOCATE_MAX_BLOCK * height:
+            area |= rect
+            break
+    return area
+
+
+def locate(path: str, page_number: int, text: str) -> Optional[dict]:
+    """The area of the passage starting with ``text`` on page ``page_number``
+    (1-based) as page fractions ``{x, y, w, h}`` (origin top left, like an
+    annotation's ``rect``), or ``None``: page not in the file, start not
+    found, or found more than once. Raises ``UnreadablePdf`` like ``read``."""
+    starts = _starts(text)
+    if not starts:
+        return None
+    doc = _open(path)
+    try:
+        if not 1 <= page_number <= doc.page_count:
+            return None
+        page = doc[page_number - 1]
+        page_text = page.get_text()
+        for start in starts:
+            hits = page.search_for(start)
+            if not hits:
+                continue
+            if _occurrences(page_text, start) > 1:
+                return None      # a shorter start only matches more often
+            return _fraction(page, _paragraph(page, hits))
+        return None
+    except RuntimeError as exc:   # MuPDF's failures; our own bugs pass through
+        raise UnreadablePdf(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        doc.close()
 
 
 def render_image(path: str, page_index: int, area: fitz.Rect) -> bytes:

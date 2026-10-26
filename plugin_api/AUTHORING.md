@@ -208,7 +208,9 @@ window.LocalBib.registerPlugin({
 
 `window.LocalBib` also gives you `t(key, vars)` / `tn(key, n, vars)` (your
 locale catalog under your namespace), `api(url, options)` (fetch against the
-core, JSON in and out) and `isActive(id)` / the `events.changed` custom event.
+core, JSON in and out), `isActive(id)` / the `events.changed` custom event
+and, since 2.6, `importBibtex(text, options)` and the PDF viewer
+`components.PdfPreview` (below).
 
 ### The Markdown editor (contract 2.4)
 
@@ -244,6 +246,82 @@ href, missing}`, synchronous, resolves wikilinks); `LocalBib.hydrateMarkdown(el)
 labels the citation chips inside `el` from the library ("Müller 2021") and
 makes them open their Item.
 
+### Handing BibTeX to the import (contract 2.6)
+
+An Add-on that found entries the library lacks — say, in a `.bib` file of a
+user's project — hands them to the core's own BibTeX import instead of
+creating Items itself:
+
+```js
+if (typeof window.LocalBib.importBibtex === 'function') {   // a core before 2.6 has none
+  window.LocalBib.importBibtex(bibtexText, { collection: 42, filename: 'old.bib' });
+}
+```
+
+| Argument | Meaning |
+|---|---|
+| `text` | The BibTeX text, e.g. a cut-out of the entries you found. Keys stay as written: a new entry keeps its key (made unique only if the library already uses it for another Item); an entry the library already holds (same DOI, else a close title) is matched and keeps the library's key, never duplicated. |
+| `collection` | Optional Collection id to preselect as the import's target. Only an active Collection is preselected; `null`/absent, or one that is not available, leaves the choice to the user. |
+| `filename` | Optional name the import shows and records as the source (default `import.bib`; `.bib` is added when missing). |
+
+It returns `true` when the text was handed over and `false` for an empty
+text. The text stays in the page's memory only. The core opens its import
+page (`/import`) with the BibTeX dialog: with a preselected Collection the
+preview runs at once, otherwise the user picks the target first. **Nothing is
+created until the user confirms there** — every Item of the import, new and
+matched, lands in the chosen Collection, like a `.bib` the user picked
+themselves. So, like the DOI import route below, it needs no `library.write`.
+Hide your button when the function is missing (a core before 2.6).
+
+To let the user pick a `.bib` file themselves instead, send them to
+`/import?bibtex=1&collection=<id>`: the import page opens its BibTeX dialog
+at once, with that Collection preselected (`collection` optional, as below).
+A core before 2.6 ignores `bibtex` and shows the import page as it is.
+
+### The PDF viewer (contract 2.6)
+
+`window.LocalBib.components.PdfPreview` is the detail view's own PDF preview
+as a component — the same viewer and the same frame around a passage:
+
+```js
+const { PdfPreview } = window.LocalBib.components;   // a core before 2.6 has none
+// in a component: components: { PdfPreview }
+// <pdf-preview :paper-id="id" :page="12" :find="passage.text" @state="onState" />
+```
+
+| Prop / event | Meaning |
+|---|---|
+| `paperId` | The Item id (`get_reference(...)["id"]`, or the lookup endpoint below). Another id loads that Item's PDF. |
+| `page` | The PDF page (1-based, never the printed page) to show. |
+| `find` | Optional passage text, as for the detail route's `?find=` below: the paragraph where it starts **on that page** is framed. Not found there, or not unambiguous, means the page only — never a guessed spot. |
+| `state` | Emitted on every change: `{status, page, pages, found}`. `status` is `loading`, `ready`, `nopdf` (the Item has no PDF — show your own hint or none) or `failed`; `page`/`pages` follow the reader's scrolling; `found` is `true` (framed), `false` (page only) or `null` (nothing to look for). |
+
+It fills its parent (give it a height, e.g. a flex child with
+`min-height: 0`). Check `PdfPreview` in `LocalBib.components` before using it
+and fall back to linking the detail route on an older core.
+
+### Linking to a passage in an Item's PDF (contract 2.6)
+
+The Item detail route takes query parameters that open its PDF preview at a
+spot — e.g. for a passage that `search_passages`/`get_passages` returned:
+
+```js
+this.$router.push({ path: `/paper/${id}`, query: { page: 12, find: passage.text, back: '/yourid/page' } });
+```
+
+| Parameter | Meaning |
+|---|---|
+| `page` | The PDF page (1-based, the passage's `page_start` — never the printed page). The preview opens on it. |
+| `find` | The passage text (its start is enough; the core reads only the first words). The core looks for where it starts **on that page** and frames the paragraph there, briefly pulsing. Not found there, or found more than once, means no frame — only the page jump. The core never guesses a spot. Needs `page`. |
+| `back` | An internal route the detail view offers a way back to: a key "← Back to <label>" at the start of its head, `label` being the nav label of the route's area (your registered nav item for `/yourid/…`), else just "Back". Only a route starting with `/` — not `//`, no backslash, whitespace or scheme — counts; anything else is ignored and the head stays as it is. The key returns with `router.push(back)`: your view mounts again, so keep what it must restore (scroll position, an open selection) in `sessionStorage` yourself. |
+
+A core before 2.6 ignores `find` and `back` and only goes to the page.
+Without a PDF the Item opens without a preview; check `has_pdf` first
+(`get_reference`, or the lookup endpoint below) if your link promises one.
+Behind `find` is the core's `GET /api/papers/{id}/locate?page=&text=`
+(`{page, rect}`, `rect` in page fractions or `null`); it serves the detail
+view and is not a stable endpoint of its own — link to the route instead.
+
 The four Slots, each a Vue component with fixed props:
 
 | Slot | Props | Contract |
@@ -273,9 +351,10 @@ release to release without notice:
 | Item lookup (citations) | `GET /api/papers/lookup?q=&limit=` (title, authors, citekey, DOI; at most 50) or `?keys=<citekey>&keys=<citekey>` → `{papers: [{id, cite_key, title, authors, year, doi, has_pdf}]}`; light rows, reads only |
 | OA-PDF fetch | `POST /api/papers/{id}/fetch-oa-pdf` |
 | Model list | `GET /api/llm/models` |
-| Item detail (route) | `/paper/{id}` — `id` is the Item id (`get_reference(...)["id"]`) |
+| Item detail (route) | `/paper/{id}` — `id` is the Item id (`get_reference(...)["id"]`); since 2.6 with `?page=N&find=<passage>&back=<route>` (see "Linking to a passage") |
 | Collection (route) | `/collection/{id}` |
 | Import with a DOI list (route) | `/import?dois=<doi>&dois=<doi>&collection=<id>` — both parameters optional; pass one `dois` per DOI (a resolver link or `doi:` in front is fine), `collection` preselects the target Collection if it is an active one |
+| BibTeX import dialog (route) | `/import?bibtex=1&collection=<id>` — since 2.6: opens the BibTeX dialog, the user picks the `.bib` file; `collection` optional as above |
 
 The import route creates nothing by itself: the page shows the DOIs, previews
 through the DOI existence check what is new and what the library already

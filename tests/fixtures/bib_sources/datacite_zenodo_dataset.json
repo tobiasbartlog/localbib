@@ -1,0 +1,48 @@
+{
+  "data": {
+    "id": "10.5281/zenodo.7898765",
+    "type": "dois",
+    "attributes": {
+      "doi": "10.5281/zenodo.7898765",
+      "identifiers": [{"identifier": "https://zenodo.org/record/7898765", "identifierType": "URL"}],
+      "creators": [
+        {"name": "Bundesanstalt für Wasserbau", "nameType": "Organizational", "affiliation": [], "nameIdentifiers": []},
+        {"name": "Weber, Clara", "nameType": "Personal", "givenName": "Clara", "familyName": "Weber", "affiliation": ["Bundesanstalt für Wasserbau"], "nameIdentifiers": [{"schemeUri": "https://orcid.org", "nameIdentifier": "https://orcid.org/0000-0001-5109-3700", "nameIdentifierScheme": "ORCID"}]}
+      ],
+      "titles": [{"title": "Scour depths at bridge piers, flume series 2019-2022"}],
+      "publisher": "Zenodo",
+      "container": {},
+      "publicationYear": 2023,
+      "subjects": [{"subject": "scour"}, {"subject": "hydraulic engineering"}],
+      "contributors": [
+        {"name": "Weber, Clara", "nameType": "Personal", "givenName": "Clara", "familyName": "Weber", "affiliation": [], "contributorType": "ContactPerson", "nameIdentifiers": []}
+      ],
+      "dates": [{"date": "2023-05-04", "dateType": "Issued"}],
+      "language": "en",
+      "types": {"ris": "DATA", "bibtex": "misc", "citeproc": "dataset", "schemaOrg": "Dataset", "resourceTypeGeneral": "Dataset"},
+      "relatedIdentifiers": [{"relationType": "IsVersionOf", "relatedIdentifier": "10.5281/zenodo.7898764", "relatedIdentifierType": "DOI"}],
+      "sizes": ["128 MB"],
+      "formats": ["text/csv"],
+      "version": "1.2.0",
+      "rightsList": [{"rights": "Creative Commons Attribution 4.0 International", "rightsUri": "https://creativecommons.org/licenses/by/4.0/legalcode", "schemeUri": "https://spdx.org/licenses/", "rightsIdentifier": "cc-by-4.0", "rightsIdentifierScheme": "SPDX"}],
+      "descriptions": [
+        {"description": "<p>Measured scour depths of 60 flume tests.</p>", "descriptionType": "Abstract"},
+        {"description": "Funded by the BMDV.", "descriptionType": "Other"}
+      ],
+      "geoLocations": [],
+      "fundingReferences": [],
+      "url": "https://zenodo.org/record/7898765",
+      "contentUrl": null,
+      "metadataVersion": 2,
+      "schemaVersion": "http://datacite.org/schema/kernel-4",
+      "source": "api",
+      "isActive": true,
+      "state": "findable",
+      "reason": null,
+      "registered": "2023-05-04T09:12:45Z",
+      "published": "2023",
+      "updated": "2023-05-05T10:01:11Z"
+    },
+    "relationships": {"client": {"data": {"id": "cern.zenodo", "type": "clients"}}}
+  }
+}

@@ -66,6 +66,8 @@ ALLOWED_KEYS = {
     # Which blocks the Item detail view shows and where (#230): compact JSON,
     # normalized by detail_layout on write and on read.
     "DETAIL_LAYOUT",
+    # Dialect of every BibTeX export: "biblatex" (default) or "bibtex".
+    "BIB_DIALECT",
 }
 
 # Keys that never reach the SPA in plain text (SET-B9, "keys never reach the
@@ -81,6 +83,9 @@ BOOLEAN_KEYS = {"DARK_MODE", "THESIS_MODE"}
 # tolerant besides, as a second line of defence for a value that got in some
 # other way.
 NUMERIC_KEYS = {"WATCH_INTERVAL": 1, "MAX_OCR_PAGES": 1}
+
+# Keys holding one of a fixed set of values (Config owns the sets).
+CHOICE_KEYS = {"LINK_MODE": Config.LINK_MODES, "BIB_DIALECT": Config.BIB_DIALECTS}
 
 # Plugin-router reconcile hook — lives in settings_store now; re-exported so
 # webapp.py's wiring reads the same as before.
@@ -104,6 +109,7 @@ class SettingsUpdate(BaseModel):
     DARK_MODE: Optional[str] = None
     THESIS_MODE: Optional[str] = None
     DETAIL_LAYOUT: Optional[str] = None
+    BIB_DIALECT: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +123,7 @@ async def get_settings():
     defaults = {
         "UNLOCK_PDFS": "true",
         "LINK_MODE": Config.LINK_MODE,
+        "BIB_DIALECT": Config.BIB_DIALECT,
     }
     settings = dict(defaults)
     settings.update(settings_store.read_env(_ENV_PATH, ALLOWED_KEYS))
@@ -221,8 +228,8 @@ async def update_settings(data: SettingsUpdate):
                     status_code=422,
                     detail={"code": "error.settings.invalidLayout", "params": {"key": key}},
                 )
-        elif key == "LINK_MODE":
-            if value not in Config.LINK_MODES:
+        elif key in CHOICE_KEYS:
+            if value not in CHOICE_KEYS[key]:
                 raise HTTPException(
                     status_code=422,
                     detail={"code": "error.settings.invalidChoice", "params": {"key": key}},

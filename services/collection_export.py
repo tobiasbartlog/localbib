@@ -26,7 +26,9 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
+import bib_fields
 import bibtex_builder
+from author_names import display_people, split_people
 from cite_key_generator import base_key as _legacy_cite_key_base
 
 BOM = "﻿"
@@ -34,8 +36,11 @@ MISSING_PDFS_NAME = "fehlende_pdfs.txt"
 DEFAULT_BASENAME = "literatur_export"
 
 CSV_CORE_COLUMNS = (
-    "id", "cite_key", "title", "authors", "year", "journal", "publisher",
-    "doi", "isbn", "categories", "has_pdf", "abstract",
+    "id", "cite_key", "item_type", "title", "authors", "editors", "year", "pub_date",
+    "journal", "booktitle", "event", "volume", "issue", "pages", "edition", "series",
+    "publisher", "place", "institution", "thesis_type", "number", "doi", "isbn", "issn",
+    "eprint", "version", "url", "accessed", "language", "note_bib",
+    "categories", "has_pdf", "abstract",
 )
 NOTE_COLUMN = "collection_note"
 
@@ -75,8 +80,12 @@ def _pdf_stem(paper: dict) -> str:
 # BibTeX / RIS
 # ---------------------------------------------------------------------------
 
-def bibtex_text(papers: Iterable[dict]) -> str:
-    entries = [bibtex_builder.format_entry(p, cite_key(p)) for p in papers]
+def bibtex_text(papers: Iterable[dict], *, dialect: str = bib_fields.DEFAULT_DIALECT,
+                labels: Optional[dict] = None) -> str:
+    """The .bib text; ``dialect``/``labels`` as the caller's settings say
+    (``bib_export.options()``) — this module reads no setting itself."""
+    entries = [bibtex_builder.format_entry(p, cite_key(p), dialect=dialect, labels=labels)
+               for p in papers]
     return "\n\n".join(entries) + "\n"
 
 
@@ -88,8 +97,9 @@ def ris_text(papers: Iterable[dict], all_dir: str) -> str:
         if p.get("title"):
             lines.append(f"T1  - {p['title']}")
         if p.get("authors"):
-            for author in re.split(r"[;]", p["authors"]):
-                author = author.strip()
+            # RIS has no brace syntax: an organization's braces stay home.
+            for author in split_people(p["authors"]):
+                author = display_people(author).strip()
                 if author:
                     lines.append(f"AU  - {author}")
         if p.get("year"):
@@ -147,20 +157,17 @@ def csv_bytes(
     writer.writerow(header)
     for p in papers:
         pid = p.get("id")
-        row = [
-            pid,
-            cite_key(p),
-            p.get("title"),
-            p.get("authors"),
-            p.get("year"),
-            p.get("journal"),
-            p.get("publisher"),
-            p.get("doi"),
-            p.get("isbn"),
-            "; ".join(categories.get(pid, [])),
-            "yes" if p.get("filename") else "no",
-            p.get("abstract"),
-        ]
+        computed = {
+            "cite_key": cite_key(p),
+            # The type the .bib says too: stored, else the guess.
+            "item_type": bib_fields.effective_type(p),
+            # People as a reader sees them: no organization braces.
+            "authors": display_people(p.get("authors")),
+            "editors": display_people(p.get("editors")),
+            "categories": "; ".join(categories.get(pid, [])),
+            "has_pdf": "yes" if p.get("filename") else "no",
+        }
+        row = [computed[c] if c in computed else p.get(c) for c in CSV_CORE_COLUMNS]
         values = custom_values.get(pid, {})
         row += [values.get(f["id"], "") for f in fields]
         if notes is not None:

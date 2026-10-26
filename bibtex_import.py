@@ -13,6 +13,12 @@ import re
 import bibtexparser
 from bibtexparser.bparser import BibTexParser
 from bibtexparser.customization import convert_to_unicode
+from bibtexparser.latexenc import latex_to_unicode
+
+from author_names import is_braced, split_outside
+
+# Where ``parse_bib``'s customization parks the author field as written.
+_VERBATIM_AUTHOR = "_localbib_author_verbatim"
 
 # \cite-family commands: \cite, \citep, \citet, \parencite, \textcite,
 # \autocite, \footcite, \nocite, \citeauthor, starred and capitalised
@@ -33,11 +39,12 @@ def parse_bib(text: str) -> list[dict]:
     """
     parser = BibTexParser(common_strings=True)
     parser.ignore_nonstandard_types = False
-    parser.customization = convert_to_unicode
+    parser.customization = _keep_verbatim_author
     database = bibtexparser.loads(text, parser=parser)
 
     entries = []
     for record in database.entries:
+        verbatim_author = record.pop(_VERBATIM_AUTHOR, None)
         key = (record.get("ID") or "").strip()
         if not key:
             continue
@@ -45,7 +52,7 @@ def parse_bib(text: str) -> list[dict]:
             "key": key,
             "entry_type": (record.get("ENTRYTYPE") or "misc").lower(),
             "title": _clean(record.get("title")),
-            "authors": format_authors(record.get("author", "")),
+            "authors": format_authors(verbatim_author or record.get("author", "")),
             "year": _year(record.get("year") or record.get("date")),
             "doi": normalize_doi(record.get("doi", "")),
             "isbn": _clean(record.get("isbn")),
@@ -92,15 +99,22 @@ def extract_cited_keys(tex: str) -> set[str]:
 
 
 def format_authors(author_field: str) -> str:
-    """BibTeX author field -> the library's "Last, First; Last, First" form."""
+    """BibTeX author field -> the library's "Last, First; Last, First" form.
+
+    Give it the field **as written** (``parse_bib`` does): a name wrapped in
+    braces whole — ``{United Nations Environment Programme}`` — is an
+    organization and keeps its braces (the library's mark for one, see
+    ``author_names``), so the entry exports as it came in; an " and " inside
+    braces separates nobody. The LaTeX→Unicode pass happens here, per name,
+    because it drops exactly those braces."""
     names = []
-    for name in re.split(r"\s+and\s+", author_field.strip()):
-        literal = name.strip().startswith("{") and name.strip().endswith("}")
-        name = _clean(name)
+    for name in split_outside(author_field.strip(), r"\s+and\s+"):
+        literal = is_braced(name.strip())
+        name = _clean(latex_to_unicode(name))
         if not name:
             continue
         if literal:  # braced org name, e.g. {Deutsche Bahn AG} — never flipped
-            names.append(name)
+            names.append("{" + name + "}")
         elif "," in name:
             names.append(re.sub(r"\s*,\s*", ", ", name))
         else:
@@ -121,6 +135,16 @@ _DOI_PREFIX_RE = re.compile(r"^(?:doi:\s*|(?:https?://)?(?:[a-z0-9-]+\.)*doi\.or
 
 def normalize_doi(doi: str) -> str:
     return _DOI_PREFIX_RE.sub("", (doi or "").strip()).rstrip(".")
+
+
+def _keep_verbatim_author(record: dict) -> dict:
+    """``convert_to_unicode`` with the author field kept as written, too
+    (it strips the braces that mark an organization)."""
+    verbatim = record.get("author")
+    record = convert_to_unicode(record)
+    if verbatim is not None:
+        record[_VERBATIM_AUTHOR] = verbatim
+    return record
 
 
 def _clean(value) -> str:

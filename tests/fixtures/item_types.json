@@ -1,0 +1,455 @@
+{
+ "types": [
+  {
+   "id": "article",
+   "fields": [
+    "title",
+    "authors",
+    "journal",
+    "year",
+    "pub_date",
+    "volume",
+    "issue",
+    "pages",
+    "doi",
+    "issn",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors",
+    "title",
+    "journal",
+    "year",
+    "volume",
+    "pages"
+   ],
+   "entry_types": {
+    "biblatex": "article",
+    "bibtex": "article"
+   },
+   "labels": {}
+  },
+  {
+   "id": "book",
+   "fields": [
+    "title",
+    "authors",
+    "editors",
+    "edition",
+    "place",
+    "publisher",
+    "year",
+    "pub_date",
+    "series",
+    "volume",
+    "isbn",
+    "doi",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors|editors",
+    "title",
+    "publisher",
+    "year"
+   ],
+   "entry_types": {
+    "biblatex": "book",
+    "bibtex": "book"
+   },
+   "labels": {}
+  },
+  {
+   "id": "chapter",
+   "fields": [
+    "title",
+    "authors",
+    "booktitle",
+    "editors",
+    "edition",
+    "place",
+    "publisher",
+    "year",
+    "pub_date",
+    "pages",
+    "series",
+    "volume",
+    "isbn",
+    "doi",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors",
+    "title",
+    "booktitle",
+    "publisher",
+    "year",
+    "pages"
+   ],
+   "entry_types": {
+    "biblatex": "incollection",
+    "bibtex": "incollection"
+   },
+   "labels": {}
+  },
+  {
+   "id": "conference",
+   "fields": [
+    "title",
+    "authors",
+    "booktitle",
+    "event",
+    "editors",
+    "place",
+    "publisher",
+    "year",
+    "pub_date",
+    "pages",
+    "series",
+    "volume",
+    "isbn",
+    "doi",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors",
+    "title",
+    "booktitle",
+    "year"
+   ],
+   "entry_types": {
+    "biblatex": "inproceedings",
+    "bibtex": "inproceedings"
+   },
+   "labels": {
+    "booktitle": "proceedings"
+   }
+  },
+  {
+   "id": "thesis",
+   "fields": [
+    "title",
+    "authors",
+    "thesis_type",
+    "institution",
+    "place",
+    "year",
+    "pub_date",
+    "doi",
+    "isbn",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors",
+    "title",
+    "thesis_type",
+    "institution",
+    "year"
+   ],
+   "entry_types": {
+    "biblatex": "thesis",
+    "bibtex": "phdthesis"
+   },
+   "labels": {
+    "institution": "university"
+   }
+  },
+  {
+   "id": "report",
+   "fields": [
+    "title",
+    "authors",
+    "institution",
+    "thesis_type",
+    "number",
+    "place",
+    "year",
+    "pub_date",
+    "doi",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors|institution",
+    "title",
+    "institution",
+    "year"
+   ],
+   "entry_types": {
+    "biblatex": "report",
+    "bibtex": "techreport"
+   },
+   "labels": {
+    "thesis_type": "reportType",
+    "number": "reportNumber"
+   }
+  },
+  {
+   "id": "preprint",
+   "fields": [
+    "title",
+    "authors",
+    "year",
+    "pub_date",
+    "eprint",
+    "version",
+    "publisher",
+    "doi",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors",
+    "title",
+    "year",
+    "eprint|doi|url"
+   ],
+   "entry_types": {
+    "biblatex": "online",
+    "bibtex": "misc"
+   },
+   "labels": {
+    "publisher": "preprintServer"
+   }
+  },
+  {
+   "id": "webpage",
+   "fields": [
+    "title",
+    "authors",
+    "institution",
+    "url",
+    "accessed",
+    "year",
+    "pub_date",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "title",
+    "url",
+    "accessed"
+   ],
+   "entry_types": {
+    "biblatex": "online",
+    "bibtex": "misc"
+   },
+   "labels": {
+    "institution": "website"
+   }
+  },
+  {
+   "id": "standard",
+   "fields": [
+    "title",
+    "number",
+    "institution",
+    "year",
+    "pub_date",
+    "publisher",
+    "place",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "title",
+    "number",
+    "institution",
+    "year"
+   ],
+   "entry_types": {
+    "biblatex": "techreport",
+    "bibtex": "techreport"
+   },
+   "labels": {
+    "institution": "standardsBody",
+    "number": "standardNumber"
+   }
+  },
+  {
+   "id": "patent",
+   "fields": [
+    "title",
+    "authors",
+    "number",
+    "institution",
+    "place",
+    "year",
+    "pub_date",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors",
+    "title",
+    "number",
+    "year"
+   ],
+   "entry_types": {
+    "biblatex": "patent",
+    "bibtex": "misc"
+   },
+   "labels": {
+    "authors": "inventors",
+    "institution": "holder",
+    "number": "patentNumber"
+   }
+  },
+  {
+   "id": "dataset",
+   "fields": [
+    "title",
+    "authors",
+    "publisher",
+    "year",
+    "pub_date",
+    "version",
+    "doi",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors",
+    "title",
+    "publisher",
+    "year",
+    "doi|url"
+   ],
+   "entry_types": {
+    "biblatex": "dataset",
+    "bibtex": "misc"
+   },
+   "labels": {
+    "publisher": "repository"
+   }
+  },
+  {
+   "id": "software",
+   "fields": [
+    "title",
+    "authors",
+    "version",
+    "publisher",
+    "year",
+    "pub_date",
+    "doi",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "authors",
+    "title",
+    "year",
+    "doi|url"
+   ],
+   "entry_types": {
+    "biblatex": "software",
+    "bibtex": "misc"
+   },
+   "labels": {}
+  },
+  {
+   "id": "misc",
+   "fields": [
+    "title",
+    "authors",
+    "year",
+    "pub_date",
+    "publisher",
+    "place",
+    "doi",
+    "url",
+    "accessed",
+    "language",
+    "abstract",
+    "note_bib"
+   ],
+   "required": [
+    "title"
+   ],
+   "entry_types": {
+    "biblatex": "misc",
+    "bibtex": "misc"
+   },
+   "labels": {}
+  }
+ ],
+ "fields": [
+  "title",
+  "authors",
+  "year",
+  "doi",
+  "isbn",
+  "abstract",
+  "journal",
+  "publisher",
+  "item_type",
+  "volume",
+  "issue",
+  "pages",
+  "pub_date",
+  "editors",
+  "booktitle",
+  "edition",
+  "place",
+  "series",
+  "issn",
+  "url",
+  "accessed",
+  "institution",
+  "thesis_type",
+  "number",
+  "event",
+  "version",
+  "language",
+  "eprint",
+  "note_bib"
+ ],
+ "date_fields": [
+  "pub_date",
+  "accessed"
+ ],
+ "dialects": [
+  "biblatex",
+  "bibtex"
+ ],
+ "dialect": "biblatex"
+}

@@ -54,33 +54,40 @@ def test_no_kiconnect_default_provider(clean_env):
 class TestPoliteMailto:
     """The polite ``mailto`` identifies the *user*, so it is sent only when set."""
 
-    def test_crossref_sends_no_mailto_when_unset(self, clean_env, monkeypatch):
-        captured = {}
-
-        def fake_get(url, headers=None, timeout=None, **kwargs):
-            captured["headers"] = headers or {}
-            raise RuntimeError("stop after the request was built")
-
-        monkeypatch.setattr("crossref.requests.get", fake_get)
+    @respx.mock
+    def test_crossref_sends_no_mailto_when_unset(self, clean_env):
+        route = respx.get("https://api.crossref.org/works/10.1000/x").mock(
+            return_value=httpx.Response(404))
         import crossref
 
         crossref.fetch_crossref_metadata("10.1000/x")
-        assert "mailto" not in captured["headers"].get("User-Agent", "").lower()
+        assert "mailto" not in route.calls[0].request.headers.get("User-Agent", "").lower()
 
+    @respx.mock
     def test_crossref_sends_the_configured_mailto(self, clean_env, monkeypatch):
-        captured = {}
-
-        def fake_get(url, headers=None, timeout=None, **kwargs):
-            captured["headers"] = headers or {}
-            raise RuntimeError("stop after the request was built")
-
         monkeypatch.setenv("CROSSREF_MAILTO", "user@uni.example")
         clean_env.reload_from_env()
-        monkeypatch.setattr("crossref.requests.get", fake_get)
+        route = respx.get("https://api.crossref.org/works/10.1000/x").mock(
+            return_value=httpx.Response(404))
         import crossref
 
         crossref.fetch_crossref_metadata("10.1000/x")
-        assert "mailto:user@uni.example" in captured["headers"]["User-Agent"]
+        assert "mailto:user@uni.example" in route.calls[0].request.headers["User-Agent"]
+
+    @respx.mock
+    @pytest.mark.real_bib_sources
+    def test_datacite_and_open_library_follow_the_same_rule(self, clean_env):
+        import datacite
+        import openlibrary_client
+
+        dc = respx.get("https://api.datacite.org/dois/10.5281/zenodo.1").mock(
+            return_value=httpx.Response(404))
+        ol = respx.get("https://openlibrary.org/api/books").mock(
+            return_value=httpx.Response(200, json={}))
+        datacite.fetch_datacite_metadata("10.5281/zenodo.1")
+        openlibrary_client.fetch_openlibrary_metadata("9780262033848")
+        for route in (dc, ol):
+            assert "mailto" not in route.calls[0].request.headers.get("User-Agent", "").lower()
 
     @respx.mock
     def test_openalex_omits_the_param_when_unset(self, clean_env):

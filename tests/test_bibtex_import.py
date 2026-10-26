@@ -63,7 +63,20 @@ def test_parse_bib_book_isbn():
 
 
 def test_format_authors_org_name_single_token():
-    assert format_authors("{Deutsche Bahn AG} and Doe, Jane") == "Deutsche Bahn AG; Doe, Jane"
+    assert format_authors("{Deutsche Bahn AG} and Doe, Jane") == "{Deutsche Bahn AG}; Doe, Jane"
+
+
+def test_parse_bib_keeps_a_braced_organization_whole():
+    """The LaTeX→Unicode pass drops the braces that mark an organization; the
+    author field is read as written, so it is never flipped to "Programme,
+    United Nations Environment", and the organization keeps its braces (the
+    library's mark for one) so it exports as it came in."""
+    bib = (r"@online{unep, author = {{United Nations Environment Programme} and "
+           r"M{\"u}ller, Hans and {Barnes and Noble}}, title = {R}, year = {2025}}")
+    entry = parse_bib(bib)[0]
+    assert entry["authors"] == "{United Nations Environment Programme}; Müller, Hans; {Barnes and Noble}"
+    assert entry["raw"]["author"].startswith("United Nations")   # raw stays the converted field
+    assert "_localbib_author_verbatim" not in entry["raw"]
 
 
 def test_normalize_doi():

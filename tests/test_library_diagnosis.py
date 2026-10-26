@@ -163,7 +163,7 @@ def test_arxiv_doi_has_no_version_and_skips_crossref():
     assert canonical_arxiv_doi("10.48550/arXiv.2501.03575v1") == "10.48550/arXiv.2501.03575"
     assert canonical_arxiv_doi("10.48550/arXiv.2501.03575") is None
     assert canonical_arxiv_doi("10.1000/v2") is None
-    with patch("crossref.requests.get") as get:
+    with patch("crossref.httpx.get") as get:
         assert fetch_crossref_metadata("10.48550/arXiv.2108.08090") is None
     get.assert_not_called()
 

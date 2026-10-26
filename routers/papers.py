@@ -2,6 +2,7 @@
 
 Serves:
   GET    /api/papers
+  GET    /api/papers/item-types
   GET    /api/papers/lookup
   POST   /api/papers/bulk-delete
   POST   /api/papers/categories
@@ -20,7 +21,9 @@ Serves:
 
 ``GET /api/papers`` takes ``collection_id`` (#201) as one more filter, and
 ``GET /api/papers/{id}`` lists the Item's Collections with its note there,
-and its PDF's Stand as ``pdf_modified`` (#229).
+and its PDF's Stand as ``pdf_modified`` (#229), its ``effective_type`` and
+``missing_fields`` (``bib_fields``). ``PUT`` writes the bibliographic columns
+too (validated type and dates; ``year`` follows ``pub_date``).
 
 Moved from webapp.py (Backend-Modularisierung #85) without a behaviour change;
 the additions above came later.
@@ -42,6 +45,8 @@ import re
 import subprocess
 from typing import List, Optional
 
+import bib_export
+import bib_fields
 import bibtex_builder
 from cite_key_generator import base_key as _legacy_cite_key_base
 import collection_membership as membership
@@ -87,6 +92,28 @@ class PaperUpdate(BaseModel):
     abstract: Optional[str] = None
     journal: Optional[str] = None
     publisher: Optional[str] = None
+    # Bibliographic columns (bib_fields.BIB_COLUMNS) — "" clears one.
+    item_type: Optional[str] = None
+    volume: Optional[str] = None
+    issue: Optional[str] = None
+    pages: Optional[str] = None
+    pub_date: Optional[str] = None
+    editors: Optional[str] = None
+    booktitle: Optional[str] = None
+    edition: Optional[str] = None
+    place: Optional[str] = None
+    series: Optional[str] = None
+    issn: Optional[str] = None
+    url: Optional[str] = None
+    accessed: Optional[str] = None
+    institution: Optional[str] = None
+    thesis_type: Optional[str] = None
+    number: Optional[str] = None
+    event: Optional[str] = None
+    version: Optional[str] = None
+    language: Optional[str] = None
+    eprint: Optional[str] = None
+    note_bib: Optional[str] = None
 
 
 class CiteKeyUpdate(BaseModel):
@@ -119,6 +146,35 @@ def _cite_key(paper: dict) -> str:
     return paper.get("cite_key") or _legacy_cite_key_base(
         paper.get("authors") or "", paper.get("year")
     )
+
+
+def _bib_updates(data: PaperUpdate, stored: dict) -> tuple[dict, Optional[int]]:
+    """``(bibliographic columns, year)`` the update sets, by the rules every
+    metadata write follows (``bib_fields.checked_changes``): a type from
+    ``bib_fields.ITEM_TYPES`` (or "" for the guess), ISO dates as precise as
+    given, ``year`` following ``pub_date``."""
+    given = {f: getattr(data, f, None) for f in bib_fields.BIB_COLUMNS}
+    given["year"] = data.year
+    try:
+        checked = bib_fields.checked_changes(given, stored)
+    except bib_fields.InvalidValue as exc:
+        raise HTTPException(status_code=422, detail={"code": exc.code, "params": exc.params})
+    return {f: checked[f] for f in bib_fields.BIB_COLUMNS if f in checked}, checked.get("year")
+
+
+def _name_fields_changed(written: dict, stored: dict) -> bool:
+    """Whether a write changes what the PDF's file name is made of — title,
+    authors or year — against the stored values; ``None``/"" and a year of
+    0 are all "nothing"."""
+    for field in ("title", "authors", "year"):
+        if field not in written:
+            continue
+        if field == "year":
+            if bib_fields.year_value(written[field]) != bib_fields.year_value(stored.get(field)):
+                return True
+        elif str(written[field] or "").strip() != str(stored.get(field) or "").strip():
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +247,13 @@ async def list_papers(
         conn.close()
 
     return papers
+
+
+@router.get("/api/papers/item-types")
+async def item_types():
+    """The Item types with their fields, required fields and entry types per
+    dialect (``bib_fields``) — the SPA's form reads this, it keeps no copy."""
+    return {**bib_fields.wire_table(), "dialect": Config.BIB_DIALECT}
 
 
 LOOKUP_MAX = 50
@@ -371,6 +434,10 @@ async def get_paper(paper_id: int):
     # The file's Stand (#229), the one the annotation reading reports: the
     # preview URL carries it from the first load on.
     paper["pdf_modified"] = _pdf_stand(paper.get("filename"))
+    # The type the export uses (stored, else guessed) and what the
+    # bibliography still lacks (bib_fields).
+    paper["effective_type"] = bib_fields.effective_type(paper)
+    paper["missing_fields"] = bib_fields.missing_fields(paper)
     return paper
 
 
@@ -394,20 +461,28 @@ async def update_paper(paper_id: int, data: PaperUpdate):
         if not row:
             raise HTTPException(status_code=404, detail="error.item_not_found")
         paper = dict(row)
+        bib, year = _bib_updates(data, paper)
 
         update_fields = []
         update_values = []
+        written: dict = {}
         doi_changed = False
-        for field in ["title", "authors", "year", "doi", "isbn", "abstract", "journal", "publisher"]:
-            val = getattr(data, field, None)
+        for field in bib_fields.CORE_FIELDS:
+            val = year if field == "year" else getattr(data, field, None)
             if val is not None:
-                # Leere Strings -> NULL (Feld loeschen)
+                # Leere Strings -> NULL (Feld loeschen); a cleared date
+                # clears the year the same way (checked_changes gives "").
                 if isinstance(val, str) and val.strip() == '':
                     val = None
                 update_fields.append(f"{field} = ?")
                 update_values.append(val)
+                written[field] = val
                 if field == "doi":
                     doi_changed = True
+        # Bibliographic columns are TEXT DEFAULT '': an emptied one stays "".
+        for field, val in bib.items():
+            update_fields.append(f"{field} = ?")
+            update_values.append(val)
 
         # DOI manuell geaendert -> als verifiziert markieren
         if doi_changed:
@@ -424,12 +499,14 @@ async def update_paper(paper_id: int, data: PaperUpdate):
     finally:
         conn.close()
 
-    # Dateiname aktualisieren wenn sich Titel/Autor/Jahr aendert
-    if data.title or data.authors or data.year:
+    # Dateiname aktualisieren — only when title, authors or year really
+    # changed against the stored values (a date of the stored year, which
+    # brings that year along, renames nothing).
+    if _name_fields_changed(written, paper) and paper.get("filename"):
         merged = {
-            "title": data.title or paper["title"],
-            "authors": data.authors or paper["authors"],
-            "year": data.year or paper["year"],
+            "title": written.get("title") or paper["title"],
+            "authors": written.get("authors") or paper["authors"],
+            "year": written.get("year") or paper["year"],
         }
         candidate = generate_filename(merged)
         old_filepath = os.path.join(Config.ALL_DIR, os.path.basename(paper["filename"]))
@@ -601,7 +678,7 @@ async def get_paper_bibtex(paper_id: int):
         conn.close()
 
     key = _cite_key(paper)
-    bibtex = bibtex_builder.format_entry(paper, key)
+    bibtex = bibtex_builder.format_entry(paper, key, **bib_export.options())
     return {"bibtex": bibtex, "key": key}
 
 

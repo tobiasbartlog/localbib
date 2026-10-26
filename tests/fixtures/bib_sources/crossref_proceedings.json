@@ -1,0 +1,42 @@
+{
+  "status": "ok",
+  "message-type": "work",
+  "message-version": "1.0.0",
+  "message": {
+    "indexed": {"date-parts": [[2026, 1, 7]], "date-time": "2026-01-07T19:44:12Z", "timestamp": 1767815052000},
+    "reference-count": 41,
+    "publisher": "IEEE",
+    "content-domain": {"domain": [], "crossmark-restriction": false},
+    "published-print": {"date-parts": [[2016, 6]]},
+    "DOI": "10.1109/cvpr.2016.90",
+    "type": "proceedings-article",
+    "created": {"date-parts": [[2016, 12, 13]], "date-time": "2016-12-13T03:01:21Z", "timestamp": 1481598081000},
+    "page": "770-778",
+    "source": "Crossref",
+    "is-referenced-by-count": 160000,
+    "title": ["Deep Residual Learning for Image Recognition"],
+    "prefix": "10.1109",
+    "author": [
+      {"given": "Kaiming", "family": "He", "sequence": "first", "affiliation": []},
+      {"given": "Xiangyu", "family": "Zhang", "sequence": "additional", "affiliation": []},
+      {"given": "Shaoqing", "family": "Ren", "sequence": "additional", "affiliation": []},
+      {"given": "Jian", "family": "Sun", "sequence": "additional", "affiliation": []}
+    ],
+    "member": "263",
+    "event": {"name": "2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR)", "location": "Las Vegas, NV, USA", "start": {"date-parts": [[2016, 6, 27]]}, "end": {"date-parts": [[2016, 6, 30]]}},
+    "container-title": ["2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR)"],
+    "original-title": [],
+    "link": [{"URL": "http://xplorestaging.ieee.org/ielx7/7776647/7780329/07780459.pdf?arnumber=7780459", "content-type": "unspecified", "content-version": "vor", "intended-application": "similarity-checking"}],
+    "deposited": {"date-parts": [[2017, 6, 24]], "date-time": "2017-06-24T19:23:35Z", "timestamp": 1498332215000},
+    "score": 1,
+    "resource": {"primary": {"URL": "http://ieeexplore.ieee.org/document/7780459/"}},
+    "subtitle": [],
+    "short-title": [],
+    "issued": {"date-parts": [[2016, 6]]},
+    "references-count": 41,
+    "URL": "http://dx.doi.org/10.1109/cvpr.2016.90",
+    "relation": {},
+    "subject": [],
+    "published": {"date-parts": [[2016, 6]]}
+  }
+}

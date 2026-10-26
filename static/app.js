@@ -44,6 +44,9 @@ function t(key, vars) {
 // -Views oder -Slots liest, rendert dadurch neu.
 const addonTick = ref(0);
 const _addons = {};   // id -> { entry, state, error, registration, catalogs }
+// The Add-on nav items the sidebar last read (GET /api/plugins/nav); the
+// detail view's back key names its target after them (contract 2.6).
+const pluginNavItemsSeen = ref([]);
 
 // Text eines aktiven Add-ons fuer `key`. Die UI-Sprache, wenn das Add-on sie
 // mitbringt, sonst seine `default_language`; fehlt der Schluessel innerhalb
@@ -1108,6 +1111,7 @@ const Sidebar = {
             } catch (e) {
                 this.pluginNavItems = [];
             }
+            pluginNavItemsSeen.value = this.pluginNavItems;
         },
         isCollectionActive(c) {
             return this.$route.name === 'collection' && parseInt(this.$route.params.id) === c.id;
@@ -1229,11 +1233,14 @@ const RefreshReview = {
                 <template v-if="paperIds">{{ $t('refreshReview.forSelection', { count: paperIds.length }) }}</template>
                 {{ $t('refreshReview.hint') }}
             </p>
-            <div class="flex flex-col gap-1.5 mb-3">
-                <label v-for="s in scopeList" :key="s" class="inline-flex items-center gap-2 text-sm text-gray-700">
+            <div class="flex flex-col gap-2 mb-3">
+                <label v-for="s in scopeList" :key="s" class="lb-rr-scope text-sm text-gray-700" :data-scope-row="s">
                     <input type="checkbox" v-model="scopes[s]" :disabled="running" :data-scope="s"
                            class="w-4 h-4 rounded border-gray-300 text-accent focus:ring-accent" />
-                    {{ $t('refreshReview.scope.' + s) }}
+                    <span class="lb-rr-scope-text">
+                        <span>{{ $t('refreshReview.scope.' + s) }}</span>
+                        <span class="lb-rr-scope-help" :data-testid="'refresh-review-help-' + s">{{ $t('refreshReview.scopeHelp.' + s) }}</span>
+                    </span>
                 </label>
             </div>
             <div class="mb-3">
@@ -1242,11 +1249,17 @@ const RefreshReview = {
                            class="w-4 h-4 rounded border-gray-300 text-accent focus:ring-accent" />
                     {{ $t('refreshReview.onlyGaps') }}
                 </label>
-                <p class="text-xs text-gray-400 mt-1" data-testid="refresh-review-gaps-help">
+                <p v-if="!onlyBibliographic" class="text-xs text-gray-400 mt-1" data-testid="refresh-review-gaps-help">
                     {{ $t(onlyGaps ? 'refreshReview.onlyGapsOn' : 'refreshReview.onlyGapsOff') }}
                 </p>
+                <!-- The bibliographic scope's own rule (missing_fields, not a missing DOI). -->
+                <p v-if="scopes.bibliographic" class="text-xs text-gray-400 mt-1" data-testid="refresh-review-gaps-help-bib">
+                    {{ $t(onlyGaps ? 'refreshReview.bibGapsOn' : 'refreshReview.bibGapsOff') }}
+                </p>
                 <p v-if="anyScope && affected !== null" class="lb-set-affects mt-1" data-testid="refresh-review-affected">
-                    {{ $tn('refreshReview.affected', affected) }}
+                    {{ $tn('refreshReview.affected', affected, { n: count(affected) }) }}<template v-if="scopes.bibliographic && noIdentifier !== null"> · {{ noIdentifier
+                        ? $t('refreshReview.skippedNoIdentifier', { n: count(noIdentifier) })
+                        : $t('refreshReview.allWithIdentifier') }}</template>
                 </p>
             </div>
             <div class="flex items-center gap-3 flex-wrap">
@@ -1279,7 +1292,11 @@ const RefreshReview = {
                 <p v-for="w in warnings" :key="w" class="text-red-600">{{ $t('refreshReview.warn.' + w) }}</p>
                 <p v-if="stats && stats.errors" class="text-red-600">{{ $t('refreshReview.errors', { count: stats.errors }) }}</p>
                 <p v-if="stats && stats.no_text" class="text-gray-500">{{ $t('refreshReview.noText', { count: stats.no_text }) }}</p>
-                <p v-if="noChanges" class="text-sm text-accent">{{ $t('refreshReview.noChanges') }}</p>
+                <!-- The bibliographic scope wrote its gap fills during the run. -->
+                <p v-if="stats && stats.filled" class="text-sm text-accent" data-testid="refresh-review-filled">
+                    {{ $tn('refreshReview.filled', stats.filled, { n: count(stats.filled), items: count(stats.filled_items) }) }}
+                </p>
+                <p v-if="noChanges && !(stats && stats.filled)" class="text-sm text-accent">{{ $t('refreshReview.noChanges') }}</p>
                 <p v-if="result" class="text-sm text-accent" data-testid="refresh-review-result">
                     {{ $t('refreshReview.applied', { count: result.applied }) }}
                     <span v-if="result.skipped.length">{{ $t('refreshReview.skipped', { count: result.skipped.length }) }}</span>
@@ -1336,7 +1353,7 @@ const RefreshReview = {
                                 <span class="w-28 shrink-0 text-gray-500">{{ rowLabel(r) }}</span>
                                 <span class="flex-1 min-w-0 grid grid-cols-2 gap-3">
                                     <span class="min-w-0 break-words" :class="isDestructive(r) ? 'text-red-700 line-through' : 'text-gray-500'">
-                                        {{ shown(r.before) }}
+                                        {{ shown(r.before, r.field) }}
                                     </span>
                                     <span class="min-w-0 break-words">
                                         <template v-if="r.kind === 'category_remove'">
@@ -1345,7 +1362,7 @@ const RefreshReview = {
                                         </template>
                                         <span v-else-if="r.clears" class="text-xs font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">{{ $t('refreshReview.cleared') }}</span>
                                         <template v-else>
-                                            <span class="text-gray-900" :class="r.field === 'abstract' ? 'line-clamp-3' : ''">{{ shown(r.after) }}</span>
+                                            <span class="text-gray-900" :class="r.field === 'abstract' ? 'line-clamp-3' : ''">{{ shown(r.after, r.field) }}</span>
                                             <span v-if="r.kind === 'category_add'" class="ml-1 text-xs text-gray-400">{{ Math.round((r.confidence || 0) * 100) }}%</span>
                                             <span v-if="r.source" class="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">{{ r.source }}</span>
                                         </template>
@@ -1375,11 +1392,12 @@ const RefreshReview = {
     data() {
         return {
             icons,
-            scopeList: ['categories', 'metadata', 'abstracts'],
-            scopes: { categories: true, metadata: false, abstracts: false },
+            scopeList: ['categories', 'metadata', 'bibliographic', 'abstracts'],
+            scopes: { categories: true, metadata: false, bibliographic: false, abstracts: false },
             // "Only fill gaps" is the safe default (#210): nothing that is
             // already there gets reassessed, and nothing is proposed for removal.
-            onlyGaps: true, affected: null,
+            // `noIdentifier`: items the bibliographic scope skips (no DOI/ISBN).
+            onlyGaps: true, affected: null, noIdentifier: null,
             filters: ['all', 'categories', 'metadata', 'removals'],
             filter: 'all',
             running: false, controller: null, percent: 0, progressText: '',
@@ -1390,6 +1408,10 @@ const RefreshReview = {
     computed: {
         anyScope() {
             return this.scopeList.some(s => this.scopes[s]);
+        },
+        // Only the bibliographic scope ticked: the general gaps rule says nothing.
+        onlyBibliographic() {
+            return !!this.scopes.bibliographic && this.scopeList.every(s => s === 'bibliographic' || !this.scopes[s]);
         },
         visibleRows() {
             const f = this.filter;
@@ -1457,7 +1479,7 @@ const RefreshReview = {
         // sent to the LLM. A stale answer never overwrites a newer one.
         async loadCount() {
             const chosen = this.scopeList.filter(s => this.scopes[s]);
-            if (!chosen.length) { this.affected = null; return; }
+            if (!chosen.length) { this.affected = null; this.noIdentifier = null; return; }
             const ticket = (this._countTicket = (this._countTicket || 0) + 1);
             try {
                 const res = await api('/api/maintenance/refresh-review/count', {
@@ -1467,25 +1489,28 @@ const RefreshReview = {
                         ...(this.paperIds ? { paper_ids: this.paperIds } : {}),
                     }),
                 });
-                if (ticket === this._countTicket) this.affected = res.count;
+                if (ticket === this._countTicket) {
+                    this.affected = res.count;
+                    this.noIdentifier = typeof res.no_identifier === 'number' ? res.no_identifier : null;
+                }
             } catch (e) {
-                if (ticket === this._countTicket) this.affected = null;
+                if (ticket === this._countTicket) { this.affected = null; this.noIdentifier = null; }
             }
+        },
+        count(n) {
+            return fmtCount(n);
         },
         isDestructive(r) {
             return r.kind === 'category_remove' || !!r.clears;
         },
+        // Field rows name their field as the edit form does (bib_fields).
         rowLabel(r) {
             if (r.kind !== 'field') return t('refreshReview.category');
-            const labels = {
-                title: t('common.title'), authors: t('common.authors'), year: t('common.year'),
-                doi: 'DOI', isbn: 'ISBN', abstract: t('common.abstract'),
-                journal: t('common.journal'), publisher: t('common.publisher'),
-            };
-            return labels[r.field] || r.field;
+            return r.field === 'year' ? t('bib.field.year') : bibFieldLabel(r.field, null);
         },
-        shown(v) {
-            return v === null || v === undefined || v === '' ? t('validate.empty') : String(v);
+        shown(v, field) {
+            if (v === null || v === undefined || v === '') return t('validate.empty');
+            return BIB_PEOPLE_FIELDS.includes(field) ? displayPeople(v) : String(v);
         },
         groupAll(g) {
             return g.rows.every(r => this.selected[r.id]);
@@ -1511,6 +1536,7 @@ const RefreshReview = {
             this.result = null;
             this.error = '';
             this.controller = new AbortController();
+            let filledSoFar = { filled: 0, filled_items: 0 };
             try {
                 const resp = await fetch('/api/maintenance/refresh-review/propose', {
                     method: 'POST',
@@ -1530,6 +1556,8 @@ const RefreshReview = {
                     if (evt.type === 'progress') {
                         this.percent = evt.percent || 0;
                         this.progressText = t('refreshReview.progress', { current: evt.current, total: evt.total, title: evt.title || '' });
+                        // What the run has written so far: a cancel still reports it.
+                        filledSoFar = { filled: evt.filled || 0, filled_items: evt.filled_items || 0 };
                     } else if (evt.type === 'done') {
                         // Nothing is pre-ticked: every change is an explicit decision.
                         this.rows = evt.rows || [];
@@ -1537,10 +1565,23 @@ const RefreshReview = {
                         this.stats = evt.stats || null;
                         this.noChanges = this.rows.length === 0;
                         this.open = this.rows.length > 0;
+                        // Gap fills are written by the run itself: the host
+                        // shows the Items as they are now.
+                        if (this.stats && this.stats.filled) {
+                            this.$emit('applied', { applied: this.stats.filled, skipped: [] });
+                            this.loadCount();
+                        }
                     }
                 });
             } catch (e) {
                 if (e.name !== 'AbortError') this.error = t('error.generic', { message: e.message });
+                // Cancelled (or broken off) after gap fills were written:
+                // they stay written, so say so and show the Items as they are.
+                if (!this.stats && filledSoFar.filled) {
+                    this.stats = { ...filledSoFar };
+                    this.$emit('applied', { applied: filledSoFar.filled, skipped: [] });
+                    this.loadCount();
+                }
             } finally {
                 this.running = false;
                 this.controller = null;
@@ -2022,8 +2063,15 @@ const CollectionPicker = {
 // lands there, created and already present alike. A re-import into a
 // Collection that has members reports the ones the manuscript no longer cites
 // as a suggestion; they are removed only when the user ticks them and clicks.
+//
+// `handover` ({text, filename}, contract 2.6) is BibTeX an Add-on handed over:
+// it becomes the .bib file, and with an available preselected Collection the
+// preview runs at once — it only reads; creating still waits for the click.
 const BibImportDialog = {
-    props: { collectionId: { type: [Number, String], default: null } },
+    props: {
+        collectionId: { type: [Number, String], default: null },
+        handover: { type: Object, default: null },
+    },
     emits: ['close', 'done'],
     template: `
         <div class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" @click.self="close">
@@ -2043,6 +2091,7 @@ const BibImportDialog = {
                     <select v-model="target" class="lb-input w-full" data-testid="bib-import-target">
                         <option v-for="c in collections" :key="c.id" :value="String(c.id)">{{ c.name }}</option>
                         <option value="new">{{ $t('import.target.new') }}</option>
+                        <option value="none">{{ $t('bibImport.noCollection') }}</option>
                     </select>
                     <input v-if="target === 'new'" v-model="newName" class="lb-input w-full mt-2"
                            data-testid="bib-import-new-name" :placeholder="$t('collections.namePlaceholder')" />
@@ -2064,7 +2113,7 @@ const BibImportDialog = {
                             <span class="lb-pill mr-1">{{ e.match ? $t('bibImport.inLibrary') : $t('bibImport.new') }}</span>{{ e.title || e.key }}
                         </li>
                     </ul>
-                    <p class="text-xs text-gray-500">{{ $t('bibImport.into', { name: targetName }) }}</p>
+                    <p class="text-xs text-gray-500">{{ target === 'none' ? $t('bibImport.intoNone') : $t('bibImport.into', { name: targetName }) }}</p>
                 </template>
 
                 <div v-else-if="phase === 'busy'" class="flex items-center gap-2 py-4 text-sm text-gray-600">
@@ -2073,7 +2122,9 @@ const BibImportDialog = {
 
                 <template v-else-if="phase === 'result'">
                     <p class="text-sm text-gray-700" data-testid="bib-import-result">
-                        {{ $t('bibImport.result', { created: result.created, matched: result.matched, name: result.collection.name }) }}
+                        {{ result.collection
+                            ? $t('bibImport.result', { created: result.created, matched: result.matched, name: result.collection.name })
+                            : $t('bibImport.resultNoCollection', { created: result.created, matched: result.matched }) }}
                     </p>
                     <p v-if="result.errors" class="text-xs mt-1" style="color: var(--lb-danger);">{{ $tn('bibImport.errors', result.errors) }}</p>
                     <p v-if="oaTried" class="text-xs text-gray-500 mt-1" data-testid="bib-import-oa-result">{{ $t('bibImport.oaResult', { n: oaFetched, total: oaTried }) }}</p>
@@ -2121,7 +2172,7 @@ const BibImportDialog = {
     computed: {
         canPreview() {
             if (!this.bibFile) return false;
-            return this.target === 'new' ? !!this.newName.trim() : !!this.target;
+            return this.target === 'new' ? !!this.newName.trim() : !!this.target;   // 'none' imports into no Collection
         },
         toImport() {
             if (!this.preview) return [];
@@ -2144,10 +2195,32 @@ const BibImportDialog = {
             this.collections = [];
         }
         const wanted = this.collectionId !== null && this.collectionId !== undefined ? String(this.collectionId) : '';
-        if (wanted && this.collections.some(c => String(c.id) === wanted)) this.target = wanted;
+        const preselected = !!wanted && this.collections.some(c => String(c.id) === wanted);
+        if (preselected) this.target = wanted;
+        // A handover that names no Collection (a whole library's .bib) means none.
+        else if (this.handover && !wanted) this.target = 'none';
         else this.target = this.collections.length ? String(this.collections[0].id) : 'new';
+        if (this.handover) this.takeHandover(preselected);
     },
     methods: {
+        takeHandover(preselected) {
+            const { text, filename } = this.handover;
+            this.bibFile = new File([text], filename || 'import.bib', { type: 'application/x-bibtex' });
+            if (preselected) {
+                this.runPreview();
+                return;
+            }
+            // No Collection to preselect: the user picks the target first. The
+            // file field shows the handed-over file where the browser allows it.
+            this.$nextTick(() => {
+                const input = this.$el && this.$el.querySelector && this.$el.querySelector('[data-testid="bib-import-bib"]');
+                try {
+                    const transfer = new DataTransfer();
+                    transfer.items.add(this.bibFile);
+                    if (input) input.files = transfer.files;
+                } catch (e) { /* no DataTransfer: the file is set all the same */ }
+            });
+        },
         close() {
             if (this.phase === 'result') this.$emit('done', this.result);
             this.$emit('close');
@@ -2186,7 +2259,7 @@ const BibImportDialog = {
                 })),
             };
             if (this.target === 'new') body.new_collection_name = this.newName;
-            else body.collection_id = Number(this.target);
+            else if (this.target !== 'none') body.collection_id = Number(this.target);
             try {
                 this.result = await api('/api/import/bibtex/commit', { method: 'POST', body: JSON.stringify(body) });
             } catch (e) {
@@ -2194,7 +2267,7 @@ const BibImportDialog = {
                 this.phase = 'preview';
                 return;
             }
-            this.notCited = this.result.collection.not_cited || [];
+            this.notCited = (this.result.collection && this.result.collection.not_cited) || [];
             this.removeIds = this.notCited.map(i => i.paper_id);
             if (this.fetchOa) await this.fetchOaPdfs();
             this.phase = 'result';
@@ -3066,7 +3139,7 @@ const PaperList = {
                                         </div>
                                         <div>
                                             <span class="block text-xs text-gray-400">{{ $t('common.authors') }}</span>
-                                            <span class="text-sm text-gray-900">{{ currentDoiCandidate.local.authors || '—' }}</span>
+                                            <span class="text-sm text-gray-900">{{ $people(currentDoiCandidate.local.authors) || '—' }}</span>
                                         </div>
                                         <div>
                                             <span class="block text-xs text-gray-400">{{ $t('common.year') }}</span>
@@ -3153,7 +3226,7 @@ const PaperList = {
                                                 {{ p.title || p.filename }}
                                             </router-link>
                                             <div class="text-xs text-gray-500 mt-0.5 flex items-center gap-3">
-                                                <span v-if="p.authors">{{ p.authors }}</span>
+                                                <span v-if="p.authors">{{ $people(p.authors) }}</span>
                                                 <span v-if="p.year">{{ p.year }}</span>
                                                 <span v-if="p.doi" class="text-accent">{{ p.doi }}</span>
                                                 <span class="text-gray-400">ID: {{ p.id }}</span>
@@ -4278,12 +4351,14 @@ const PaperList = {
             if (!authors) return t('common.unknown');
             if (Array.isArray(authors)) {
                 if (authors.length === 0) return t('common.unknown');
-                if (authors.length <= 3) return authors.join(', ');
-                return authors.slice(0, 2).join(', ') + ' et al.';
+                const shown = authors.map(displayPeople);
+                if (shown.length <= 3) return shown.join(', ');
+                return shown.slice(0, 2).join(', ') + ' et al.';
             }
-            const parts = String(authors).split(/[,;]\s*/).filter(Boolean);
+            const shown = displayPeople(authors);
+            const parts = shown.split(/[,;]\s*/).filter(Boolean);
             if (parts.length > 3) return parts.slice(0, 2).join(', ') + ' et al.';
-            return authors;
+            return shown;
         },
         sortPapers() {},
         openResearchChat() {
@@ -4824,6 +4899,106 @@ const PdfPreview = {
     },
 };
 
+// The PDF viewer for Add-ons (contract 2.6): `LocalBib.components.PdfPreview`
+// shows one Item's PDF on a page and, with `find`, frames the paragraph where
+// that passage starts - the detail view's own preview, ring and
+// GET /api/papers/{id}/locate, never a second PDF.js setup. No rect means the
+// page only, never a guessed spot. What it shows goes out as `state`:
+//   { status: 'loading' | 'ready' | 'nopdf' | 'failed', page, pages, found }
+// `found` is true (framed), false (page only) or null (nothing to look for).
+const ItemPdfPreview = {
+    components: { PdfPreview },
+    props: {
+        paperId: { type: [Number, String], required: true },
+        page: { type: Number, default: null },
+        find: { type: String, default: '' },
+    },
+    emits: ['state'],
+    template: `
+        <div class="lb-item-pdf" data-testid="item-pdf" :data-status="status">
+            <pdf-preview v-if="src" ref="preview" :key="src" :src="src" :page="page" @page="onPage" />
+            <p v-else class="lb-pdf-failed">{{ statusText }}</p>
+        </div>
+    `,
+    data() {
+        return { status: 'loading', src: '', itemId: null, current: null, pages: null, found: null };
+    },
+    computed: {
+        statusText() {
+            if (this.status === 'loading') return t('common.loading');
+            if (this.status === 'nopdf') return t('pdf.none');
+            return t('pdf.loadFailed');
+        },
+        spot() { return `${this.page || ''}|${this.find || ''}`; },
+    },
+    watch: {
+        paperId() { this.load(); },
+        spot() { this.locate(); },
+    },
+    mounted() { this.load(); },
+    unmounted() { this._gone = true; },
+    methods: {
+        report() {
+            if (this._gone) return;
+            this.$emit('state', { status: this.status, page: this.current, pages: this.pages, found: this.found });
+        },
+        async load() {
+            const ticket = (this._ticket = (this._ticket || 0) + 1);
+            Object.assign(this, { status: 'loading', src: '', itemId: null, current: null, pages: null, found: null });
+            this.report();
+            let paper = null;
+            try {
+                paper = await api(`/api/papers/${encodeURIComponent(this.paperId)}`);
+            } catch (e) {
+                console.error('pdf.item', e);
+            }
+            if (ticket !== this._ticket) return;
+            if (!paper) {
+                this.status = 'failed';
+            } else if (!paper.filename) {
+                this.status = 'nopdf';
+            } else {
+                this.itemId = paper.id;
+                this.src = `/api/papers/${paper.id}/pdf`
+                    + (paper.pdf_modified ? '?v=' + encodeURIComponent(paper.pdf_modified) : '');
+                this.status = 'ready';
+            }
+            this.report();
+            if (this.status === 'ready') this.locate();
+        },
+        onPage(state) {
+            this.current = state.page;
+            this.pages = state.pages;
+            this.report();
+        },
+        async locate() {
+            const ticket = (this._spotTicket = (this._spotTicket || 0) + 1);
+            const find = (this.find || '').trim();
+            const page = this.page;
+            const itemId = this.itemId;
+            if (!itemId || !page || !find) {
+                this.found = null;
+                this.report();
+                return;
+            }
+            let rect = null;
+            try {
+                const out = await api(`/api/papers/${itemId}/locate?page=${page}`
+                    + `&text=${encodeURIComponent(find.slice(0, 600))}`);
+                rect = (out && out.rect) || null;
+            } catch (e) {
+                console.error('pdf.locate', e);
+            }
+            if (ticket !== this._spotTicket || itemId !== this.itemId) return;
+            this.found = !!rect;
+            await this.$nextTick();
+            // Not found clears an earlier frame: the page alone, never a guess.
+            if (this.$refs.preview) this.$refs.preview.goTo(page, rect);
+            this.report();
+        },
+    },
+};
+
 // --- Annotations block (#229) -------------------------------------------------
 // What the reader marked in the PDF, read by GET /api/papers/{id}/annotations.
 // Presentational: the detail view owns the data and its refresh (so a tab can
@@ -5112,7 +5287,7 @@ async function hydrateMarkdownChips(root) {
             continue;
         }
         if (label) label.textContent = mdCiteLabel(p);
-        chip.title = `${p.title || ''}\n${p.authors || ''}${p.year ? ' · ' + p.year : ''}`;
+        chip.title = `${p.title || ''}\n${displayPeople(p.authors)}${p.year ? ' · ' + p.year : ''}`;
         const page = p.has_pdf ? (/^(?:S\.|p\.|pp\.|Seite|page)?\s*(\d+)/i.exec(chip.dataset.locator || '') || [])[1] : null;
         chip.dataset.href = `#/paper/${p.id}${page ? '?page=' + page : ''}`;
         chip.setAttribute('role', 'link');
@@ -5126,11 +5301,14 @@ async function hydrateMarkdownChips(root) {
     }
 }
 
-// Twin of shortAuthors/citeLabel in static/markdown/syntax.mjs.
+// Twin of shortAuthors/citeLabel in static/markdown/syntax.mjs. A name in
+// braces is an organization: named whole, without its braces.
 function mdCiteLabel(p) {
     const a = String(p.authors || '').trim();
+    const org = (x) => (/^\{.*\}$/.test(x.trim()) ? x.trim().slice(1, -1).trim() : null);
     let names = [];
-    if (a.includes(';')) names = a.split(';').map((x) => x.split(',')[0].trim()).filter(Boolean);
+    if (a.includes(';')) names = a.split(';').map((x) => org(x) ?? x.split(',')[0].trim()).filter(Boolean);
+    else if (org(a)) names = [org(a)];
     else if (a) {
         const segs = a.split(',').map((x) => x.trim()).filter(Boolean);
         names = segs.length && segs[0].includes(' ') ? segs.map((s) => s.split(/\s+/).pop()) : segs.filter((_, i) => i % 2 === 0);
@@ -5138,6 +5316,219 @@ function mdCiteLabel(p) {
     const who = names.length === 0 ? '' : names.length === 1 ? names[0]
         : names.length === 2 ? `${names[0]} & ${names[1]}` : `${names[0]} et al.`;
     return [who || p.cite_key, p.year].filter(Boolean).join(' ');
+}
+
+// =============================================================================
+// People in a bibliographic field (author_names.py)
+// =============================================================================
+// The library stores authors and editors as one string ("Family, Given;
+// Family, Given", older rows in CrossRef's comma form). A name in braces is an
+// organization: storage and the .bib keep the braces, every display drops
+// them (displayPeople). The edit form shows one person per line, read by
+// splitPeople - the JavaScript twin of author_names.split_people, pinned to it
+// by tests/fixtures/people_vectors.json - and saves them joined with "; ".
+
+const PEOPLE_PARTICLES = /^(van|von|der|den|de|del|della|di|da|du|la|le|zu|zum|zur|ter|ten|dos|das)$/i;
+const PEOPLE_ORG_MARKERS = /(?<![\p{L}\p{N}_])(consortium|organi[sz]ation|group|gruppe|arbeitsgruppe|arbeitskreis|institute?|universit(?:y|ät|aet|é|at)|universidad|association|society|gesellschaft|committee|komitee|collaboration|team|network|netzwerk|council|agency|foundation|stiftung|ministry|ministerium|department|centre|center|zentrum|laborator(?:y|ies)|company|corporation|inc|ltd|gmbh|verband|verein|commission|kommission|academy|akademie|alliance|federation|initiative|project|bundesamt)(?![\p{L}\p{N}_])/iu;
+const PEOPLE_ORG_MORE = /(?<![\p{L}\p{N}_])(programme|program|nations|office|authority|administration|bureau|board|bundes[\p{L}\p{N}_]+|[\p{L}\p{N}_]*(?:ministerium|amt|anstalt|verband|verwaltung|behörde|gesellschaft|institut|zentrum|stiftung|agentur))(?![\p{L}\p{N}_])/iu;
+const PEOPLE_LEGAL_FORMS = /(?<![\p{L}\p{N}_])(AG|SE|KG|GmbH|e\.\s?V\.|LLC|plc|Ltd\.?)(?![\p{L}\p{N}_])/u;
+const PEOPLE_MAX_NAME_WORDS = 4;
+
+function displayPeople(value) {
+    return String(value ?? '').replace(/[{}]/g, '');
+}
+
+function peopleWords(text) {
+    return text.split(/\s+/).filter((w) => w && !PEOPLE_PARTICLES.test(w));
+}
+
+function peopleHasMarker(text) {
+    return PEOPLE_ORG_MARKERS.test(text) || PEOPLE_ORG_MORE.test(text) || PEOPLE_LEGAL_FORMS.test(text);
+}
+
+function peopleBraced(value) {
+    const text = String(value || '').trim();
+    if (!(text.startsWith('{') && text.endsWith('}'))) return false;
+    let depth = 0;
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] === '{') depth++;
+        else if (text[i] === '}') depth--;
+        if (depth === 0 && i < text.length - 1) return false;
+    }
+    return true;
+}
+
+function peopleSplitOutside(text, separator) {
+    const parts = [];
+    const re = new RegExp('[{}]|' + separator, 'g');
+    let depth = 0;
+    let start = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        if (m[0] === '{') depth++;
+        else if (m[0] === '}') depth = Math.max(depth - 1, 0);
+        else if (depth === 0) {
+            parts.push(text.slice(start, m.index));
+            start = m.index + m[0].length;
+        }
+    }
+    parts.push(text.slice(start));
+    return parts;
+}
+
+function peopleIsOrganization(raw) {
+    const text = String(raw || '').replace(/\s+/g, ' ').trim();
+    if (peopleBraced(text)) return true;
+    if (!text || text.includes(',')) return false;
+    return peopleHasMarker(text) || peopleWords(text).length > PEOPLE_MAX_NAME_WORDS;
+}
+
+function peopleIsInitial(word) {
+    if (word.length === 1) return /^\p{L}$/u.test(word);
+    return /^\p{L}\.(?:-?\p{L}\.)*$/u.test(word);
+}
+
+function peopleLooksLikeGiven(part) {
+    const words = part.split(/\s+/).filter(Boolean);
+    if (!words.length || words.length > PEOPLE_MAX_NAME_WORDS || peopleHasMarker(part) || peopleBraced(part)) return false;
+    return words.every((w) => /^\p{Lu}/u.test(w));
+}
+
+function peopleCanBeFamily(part) {
+    if (peopleBraced(part)) return false;
+    return part.split(/\s+/).filter(Boolean).length === 1 || !peopleIsOrganization(part);
+}
+
+function peopleLooksLikeFullName(part) {
+    const words = part.split(/\s+/).filter(Boolean);
+    return words.length >= 2 && !peopleIsOrganization(part)
+        && !PEOPLE_PARTICLES.test(words[0]) && !peopleIsInitial(words[words.length - 1]);
+}
+
+const PEOPLE_AND = String.raw`\s+and\s+`;
+
+// One organization although an " and " stands in it ("Food and Agriculture
+// Organization"): no comma, no braces, an organization as a whole, and one
+// " and " part is one by itself ("John Smith and Jane Doe" are two people).
+function peopleOneOrganization(text) {
+    if (text.includes(',') || text.includes('{') || !peopleIsOrganization(text)) return false;
+    return peopleSplitOutside(text, PEOPLE_AND).some((p) => peopleIsOrganization(p));
+}
+
+function splitPeople(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return [];
+    for (const separator of [';', PEOPLE_AND]) {
+        if (separator === PEOPLE_AND && peopleOneOrganization(text.replace(/\s+/g, ' '))) return [text];
+        const parts = peopleSplitOutside(text, separator);
+        if (parts.length > 1) return parts.map((p) => p.trim()).filter(Boolean);
+    }
+    const parts = peopleSplitOutside(text, ',').map((p) => p.replace(/\s+/g, ' ').trim()).filter(Boolean);
+    if (parts.length <= 1) return parts;
+    const people = parts.filter((p) => !peopleIsOrganization(p));
+    if (people.length >= 3 && people.length % 2 && people.every(peopleLooksLikeFullName)) return parts;
+    const out = [];
+    let i = 0;
+    while (i < parts.length) {
+        const part = parts[i];
+        const next = i + 1 < parts.length ? parts[i + 1] : null;
+        if (next !== null && peopleCanBeFamily(part) && peopleLooksLikeGiven(next)) {
+            out.push(part + ', ' + next);
+            i += 2;
+        } else {
+            out.push(part);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+// One person per line (the form) -> the storage form.
+function joinPeopleLines(text) {
+    return String(text || '').split('\n').map((l) => l.trim()).filter(Boolean).join('; ');
+}
+
+// =============================================================================
+// Bibliographic fields (bib_fields.py): the server's type table
+// =============================================================================
+// GET /api/papers/item-types is the one table of Item types, their fields in
+// form order, the required ones ("a|b": either) and a label per type where the
+// general one does not fit. The SPA keeps no copy; what lives here is only how
+// a field looks (wide, monospace, a placeholder).
+
+let _bibTable = null;
+function loadBibTable() {
+    if (!_bibTable) {
+        _bibTable = api('/api/papers/item-types').catch((e) => { _bibTable = null; throw e; });
+    }
+    return _bibTable;
+}
+// A dialect change names other entry types: read the table again.
+function forgetBibTable() {
+    _bibTable = null;
+}
+
+const BIB_PEOPLE_FIELDS = ['authors', 'editors'];
+const BIB_MONO_FIELDS = new Set(['doi', 'isbn', 'issn', 'url', 'pub_date', 'accessed', 'pages', 'volume',
+    'issue', 'number', 'eprint', 'version']);
+const BIB_WIDE_FIELDS = new Set(['title', 'authors', 'editors', 'journal', 'booktitle', 'url', 'note_bib', 'abstract']);
+// Placeholders that read the same in every language; the others are catalog keys.
+const BIB_PLACEHOLDERS = { pages: '211–226', doi: '10.…', url: 'https://…', isbn: '978-…', issn: '0000-0000',
+    edition: '2', eprint: '2403.01234', version: '1.0', volume: '7', issue: '3' };
+const BIB_PLACEHOLDER_KEYS = new Set(['pub_date', 'accessed', 'thesis_type']);
+// Shown in the title block, not again in the metadata list (the year is in
+// the date row).
+const BIB_READ_SKIP = new Set(['title', 'authors', 'abstract', 'year']);
+const BIB_SOURCES = ['crossref', 'datacite', 'openlibrary'];
+
+function bibType(table, id) {
+    return ((table && table.types) || []).find((x) => x.id === id) || null;
+}
+
+// What a field is called for this type: its own label where the table names
+// one (a conference paper's booktitle is its proceedings), else the field's.
+// The form folds year into the date field, so a required year is the date.
+function bibFieldLabel(field, type) {
+    if (field === 'year') field = 'pub_date';
+    const id = type && type.labels ? type.labels[field] : null;
+    return id ? t('bib.label.' + id) : t('bib.field.' + field);
+}
+
+function bibPlaceholder(field) {
+    if (BIB_PEOPLE_FIELDS.includes(field)) return t('bib.placeholder.people');
+    if (BIB_PLACEHOLDER_KEYS.has(field)) return t('bib.placeholder.' + field);
+    return BIB_PLACEHOLDERS[field] || '';
+}
+
+// Whether a draft (form values) or an Item fills one field of a requirement;
+// the form keeps the year in its date field.
+function bibFilled(values, field, form) {
+    if (field === 'year') {
+        return form ? !!String(values.pub_date || '').trim()
+            : !!(values.year || String(values.pub_date || '').trim());
+    }
+    if (BIB_PEOPLE_FIELDS.includes(field)) return !!String(values[field] || '').replace(/[\s,;]+/g, '');
+    return !!String(values[field] ?? '').trim();
+}
+
+// The requirements of a type, each `{fields, label, ok}` - "a|b" is met by either.
+function bibRequirements(type, values, form) {
+    if (!type) return [];
+    return type.required.map((group) => {
+        const fields = group.split('|');
+        return {
+            fields,
+            label: fields.map((f) => bibFieldLabel(f, type)).join(' / '),
+            ok: fields.some((f) => bibFilled(values, f, form)),
+        };
+    });
+}
+
+// "@article (biblatex)": what the Item exports as in the dialect in force.
+function bibExportLabel(table, type) {
+    if (!table || !type) return '';
+    const dialect = table.dialect || 'biblatex';
+    return '@' + type.entry_types[dialect] + ' (' + t('bib.dialect.' + dialect) + ')';
 }
 
 const AnnotationsBlock = {
@@ -5413,7 +5804,13 @@ const PaperDetail = {
             <!-- Sticky header -->
             <header class="lb-modal-head">
                 <div class="lb-head-main">
-                <button class="lb-modal-back" @click="close">
+                <!-- ?back= (contract 2.6): a link from an Add-on page offers the way back there. -->
+                <button v-if="backTarget" type="button" class="lb-key lb-detail-backkey" data-testid="detail-back"
+                        :data-back="backTarget" @click="goBack">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+                    {{ backLabel }}
+                </button>
+                <button v-else class="lb-modal-back" @click="close">
                     <span v-html="icons.back"></span>
                     {{ $t('detail.backToList') }}
                 </button>
@@ -5438,6 +5835,12 @@ const PaperDetail = {
                             <button @click="startEditMetadata"
                                     class="w-full flex items-center gap-2 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">
                                 <span v-html="icons.edit"></span> {{ $t('common.edit') }}
+                            </button>
+                            <button @click="lookupFromView" :disabled="!(paper.doi || paper.isbn)" data-testid="detail-menu-lookup"
+                                    :title="paper.doi || paper.isbn ? '' : $t('bib.lookup.disabled')"
+                                    class="w-full flex items-center gap-2 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-40">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>
+                                {{ $t('bib.lookup.action') }}
                             </button>
                             <button @click="runOcr" :disabled="ocrRunning"
                                     class="w-full flex items-center gap-2 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-40">
@@ -5537,61 +5940,138 @@ const PaperDetail = {
                 </template>
 
                 <template v-if="zone.kind === 'main'">
-                <!-- Edit Metadata Form (replaces title block) -->
-                <div v-if="editingMeta" class="lb-detail-section">
-                    <h4 class="lb-detail-h">{{ $t('detail.editMetadata') }}</h4>
-                    <div class="space-y-3 mb-4">
-                        <div>
-                            <label class="block text-xs text-gray-500 mb-1" style="font-family: var(--lb-font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--lb-mute);">{{ $t('common.title') }}</label>
-                            <input v-model="editMeta.title" class="lb-input" />
-                        </div>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div>
-                                <label class="block text-xs mb-1" style="font-family: var(--lb-font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--lb-mute);">{{ $t('common.authors') }}</label>
-                                <input v-model="editMeta.authors" class="lb-input" />
-                            </div>
-                            <div>
-                                <label class="block text-xs mb-1" style="font-family: var(--lb-font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--lb-mute);">{{ $t('common.year') }}</label>
-                                <input v-model.number="editMeta.year" type="number" class="lb-input" />
-                            </div>
-                        </div>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div>
-                                <label class="block text-xs mb-1" style="font-family: var(--lb-font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--lb-mute);">DOI</label>
-                                <input v-model="editMeta.doi" class="lb-input lb-mono" />
-                            </div>
-                            <div>
-                                <label class="block text-xs mb-1" style="font-family: var(--lb-font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--lb-mute);">ISBN</label>
-                                <input v-model="editMeta.isbn" class="lb-input lb-mono" />
-                            </div>
-                        </div>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div>
-                                <label class="block text-xs mb-1" style="font-family: var(--lb-font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--lb-mute);">Journal</label>
-                                <input v-model="editMeta.journal" class="lb-input" />
-                            </div>
-                            <div>
-                                <label class="block text-xs mb-1" style="font-family: var(--lb-font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--lb-mute);">{{ $t('common.publisher') }}</label>
-                                <input v-model="editMeta.publisher" class="lb-input" />
-                            </div>
-                        </div>
-                        <div>
-                            <div class="flex items-center justify-between mb-1">
-                                <label class="block text-xs" style="font-family: var(--lb-font-mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--lb-mute);">Abstract</label>
-                                <button @click="generateAbstract" :disabled="generatingAbstract"
-                                        class="lb-btn lb-btn-ghost" style="font-size: 11px; padding: 4px 8px;">
-                                    <span v-if="generatingAbstract" class="spinner" style="width:10px;height:10px;border-width:1.5px;"></span>
-                                    {{ generatingAbstract ? $t('abstract.generating') : $t('abstract.generate') }}
-                                </button>
-                            </div>
-                            <textarea v-model="editMeta.abstract" rows="4" class="lb-input"></textarea>
-                        </div>
-                    </div>
-                    <div class="flex gap-2">
-                        <button @click="saveMetadata" class="lb-btn lb-btn-primary">
-                            <span v-html="icons.check"></span> {{ $t('common.save') }}
+                <!-- Edit Metadata Form (replaces title block). The type comes
+                     first; below it the type's fields from the server table
+                     (bib_fields), the remaining ones behind a switch. What
+                     a bibliography still needs is dashed. Only what changed
+                     is saved; a lookup writes the fields it fills at once. -->
+                <div v-if="editingMeta" class="lb-detail-section lb-bib-form" data-testid="bib-form">
+                    <div class="lb-bib-form-head">
+                        <h4 class="lb-detail-h">{{ $t('detail.editMetadata') }}</h4>
+                        <button type="button" class="lb-key" data-testid="bib-lookup" @click="runLookup"
+                                :disabled="lookupBusy || !canLookup" :title="canLookup ? '' : $t('bib.lookup.disabled')">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>
+                            {{ lookupBusy ? $t('bib.lookup.running') : $t('bib.lookup.action') }}
                         </button>
-                        <button @click="editingMeta = false" class="lb-btn lb-btn-ghost">{{ $t('common.cancel') }}</button>
+                    </div>
+
+                    <!-- The lookup's result: what it filled (saved already, with
+                         an undo), and what it names differently - nothing of
+                         that is taken until it is ticked. -->
+                    <section v-if="lookup" class="lb-bib-result" data-testid="bib-lookup-result" :aria-label="$t('bib.lookup.resultLabel')">
+                        <p v-if="lookup.error" class="lb-bib-result-msg lb-set-error" role="alert" data-testid="bib-lookup-error">{{ lookup.error }}</p>
+                        <template v-else>
+                            <div class="lb-bib-result-head">
+                                <div class="lb-bib-result-main">
+                                    <span v-if="lookup.filled.length" class="lb-bib-ok" aria-hidden="true">
+                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12l5 5 9-10"/></svg>
+                                    </span>
+                                    <div class="lb-bib-result-text">
+                                        <p v-if="lookup.filled.length" data-testid="bib-lookup-filled">
+                                            <b>{{ $tn('bib.lookup.filled', lookup.filled.length) }}</b>
+                                            <span class="lb-bib-mute">{{ $t('bib.lookup.from') }}</span>
+                                            <span class="lb-bib-src">{{ sourceName(lookup.source) }}</span>
+                                        </p>
+                                        <p v-else-if="lookup.undone" data-testid="bib-lookup-undone">{{ $t('bib.lookup.undone') }}</p>
+                                        <p v-else-if="!lookup.found" data-testid="bib-lookup-none">{{ $t('bib.lookup.notFound') }}</p>
+                                        <p v-else class="lb-bib-mute" data-testid="bib-lookup-nothing">{{ $t('bib.lookup.nothingFilled') }}</p>
+                                        <div v-if="lookup.filled.length" class="lb-bib-chips">
+                                            <span v-for="f in lookup.filled" :key="f.field" class="lb-bib-chip" :data-field="f.field">{{ filledChip(f) }}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button v-if="lookup.filled.length" type="button" class="lb-btn-text" data-testid="bib-lookup-undo"
+                                        :disabled="lookupBusy" @click="undoLookup">{{ $t('bib.lookup.undo') }}</button>
+                            </div>
+                            <div v-if="lookup.conflicts.length" class="lb-bib-conflicts" data-testid="bib-conflicts">
+                                <p class="lb-bib-conflicts-head">
+                                    <b>{{ $tn('bib.lookup.conflicts', lookup.conflicts.length) }}</b>
+                                    <span class="lb-bib-mute">{{ $t('bib.lookup.conflictsHint') }}</span>
+                                </p>
+                                <div class="lb-bib-cmp is-head" aria-hidden="true">
+                                    <span></span>
+                                    <span class="lb-field-label">{{ $t('bib.lookup.colField') }}</span>
+                                    <span class="lb-field-label">{{ $t('bib.lookup.colCurrent') }}</span>
+                                    <span class="lb-field-label lb-bib-cmp-new-h">{{ $t('bib.lookup.colNew') }} <span class="lb-bib-src">{{ sourceName(lookup.conflicts[0].source || lookup.source) }}</span></span>
+                                </div>
+                                <label v-for="c in lookup.conflicts" :key="c.field" class="lb-bib-cmp"
+                                       :class="{ 'is-picked': lookup.picked[c.field] }" :data-field="c.field">
+                                    <input type="checkbox" v-model="lookup.picked[c.field]"
+                                           :aria-label="$t('bib.lookup.takeAria', { field: conflictLabel(c.field) })" />
+                                    <span class="lb-field-label">{{ conflictLabel(c.field) }}</span>
+                                    <span class="lb-bib-old">{{ conflictValue(c.field, c.current) }}</span>
+                                    <span class="lb-bib-new">{{ conflictValue(c.field, c.found) }}</span>
+                                </label>
+                                <div class="lb-bib-cmp-actions">
+                                    <button type="button" class="lb-key lb-key-primary" data-testid="bib-conflicts-apply"
+                                            :disabled="!pickedCount || lookupBusy" @click="applyConflicts">
+                                        {{ pickedCount ? $tn('bib.lookup.apply', pickedCount) : $t('bib.lookup.applyNone') }}
+                                    </button>
+                                    <button type="button" class="lb-key" data-testid="bib-conflicts-keep" @click="keepConflicts">
+                                        {{ $t('bib.lookup.keepAll') }}
+                                    </button>
+                                </div>
+                            </div>
+                        </template>
+                    </section>
+
+                    <div class="lb-bib-type">
+                        <div class="lb-field">
+                            <label class="lb-field-label" for="bib-f-item_type">{{ $t('bib.field.item_type') }}</label>
+                            <select id="bib-f-item_type" v-model="editMeta.item_type" class="lb-input lb-bib-type-select" data-testid="bib-type">
+                                <option v-for="ty in bibTypes" :key="ty.id" :value="ty.id">{{ $t('bib.type.' + ty.id) }}</option>
+                            </select>
+                        </div>
+                        <p class="lb-bib-type-hint">{{ $t('bib.form.typeHint') }} <span class="lb-mono" data-testid="bib-export-as">{{ formExportLabel }}</span></p>
+                    </div>
+
+                    <template v-for="group in bibGroups" :key="group.key">
+                        <h5 v-if="group.key === 'more'" class="lb-aside-h lb-bib-more-h">{{ $t('bib.form.moreHeading') }}</h5>
+                        <div class="lb-bib-grid" :class="{ 'is-three': group.key === 'more' }"
+                             :data-testid="group.key === 'main' ? 'bib-fields' : 'bib-more-fields'">
+                            <div v-for="f in group.fields" :key="f.id" class="lb-field lb-bib-field"
+                                 :class="{ 'is-wide': f.wide && group.key === 'main' }" :data-field="f.id">
+                                <div class="lb-bib-label-row">
+                                    <label class="lb-field-label" :for="'bib-f-' + f.id">{{ f.label }}</label>
+                                    <span v-if="f.missing" :id="'bib-m-' + f.id" class="lb-bib-missing">{{ $t('bib.form.missing') }}</span>
+                                    <span v-if="f.source" class="lb-bib-src" data-testid="bib-provenance">{{ f.source }}</span>
+                                    <button v-if="f.id === 'abstract'" type="button" @click="generateAbstract" :disabled="generatingAbstract"
+                                            class="lb-btn-text lb-bib-label-action">
+                                        {{ generatingAbstract ? $t('abstract.generating') : $t('abstract.generate') }}
+                                    </button>
+                                </div>
+                                <template v-if="f.people">
+                                    <textarea :id="'bib-f-' + f.id" v-model="editMeta[f.id]" rows="3" class="lb-input lb-bib-area"
+                                              :class="{ 'is-missing': f.missing }" :placeholder="f.placeholder"
+                                              :aria-describedby="f.describedBy"></textarea>
+                                    <p :id="'bib-h-' + f.id" class="lb-bib-hint">{{ $t('bib.form.peopleHint') }}</p>
+                                </template>
+                                <textarea v-else-if="f.id === 'abstract' || f.id === 'note_bib'" :id="'bib-f-' + f.id" v-model="editMeta[f.id]"
+                                          :rows="f.id === 'abstract' ? 4 : 2" class="lb-input lb-bib-area" :class="{ 'is-missing': f.missing }"
+                                          :aria-describedby="f.describedBy"></textarea>
+                                <input v-else :id="'bib-f-' + f.id" v-model="editMeta[f.id]" class="lb-input"
+                                       :class="{ 'lb-mono': f.mono, 'is-missing': f.missing }" :placeholder="f.placeholder"
+                                       :aria-describedby="f.describedBy" />
+                            </div>
+                        </div>
+                        <div v-if="group.key === 'main'" class="lb-bib-all">
+                            <button type="button" role="switch" class="lb-set-switch" :class="{ 'is-on': editAllFields }"
+                                    :aria-checked="editAllFields ? 'true' : 'false'" aria-labelledby="bib-all-label"
+                                    data-testid="bib-all-fields" @click="editAllFields = !editAllFields"><span></span></button>
+                            <span id="bib-all-label" class="lb-bib-all-label">{{ $t('bib.form.allFields') }}</span>
+                            <span class="lb-mono lb-bib-mute">{{ $t('bib.form.moreCount', { n: extraFieldCount }) }}</span>
+                        </div>
+                    </template>
+
+                    <p v-if="editError" class="lb-set-error" role="alert" data-testid="bib-save-error">{{ editError }}</p>
+                    <div class="lb-bib-actions">
+                        <button type="button" @click="saveMetadata" class="lb-key lb-key-primary" data-testid="bib-save" :disabled="savingMeta">
+                            {{ $t('common.save') }}
+                        </button>
+                        <button type="button" @click="closeEdit" class="lb-key" data-testid="bib-cancel">
+                            {{ lookup && lookup.filled.length ? $t('common.close') : $t('common.cancel') }}
+                        </button>
+                        <span class="lb-mono lb-bib-mute">{{ lookup && lookup.filled.length ? $t('bib.form.filledSaved') : $t('bib.form.onlyChanged') }}</span>
                     </div>
                 </div>
 
@@ -5607,7 +6087,7 @@ const PaperDetail = {
                         </template>
                     </div>
                     <h1 class="lb-detail-title">{{ paper.title || $t('papers.untitled') }}</h1>
-                    <p class="lb-detail-authors" v-if="paper.authors">{{ paper.authors }}</p>
+                    <p class="lb-detail-authors" v-if="paper.authors">{{ $people(paper.authors) }}</p>
                 </template>
                 </template>
 
@@ -5750,15 +6230,53 @@ const PaperDetail = {
                         </p>
                     </section>
 
-                        <div v-if="b === 'metadata'" class="lb-aside-block" data-testid="block-metadata">
+                        <!-- While the form is open: what the bibliography needs,
+                             live from the form's values, and the sources the
+                             last lookup asked. -->
+                        <div v-if="b === 'metadata' && editingMeta" class="lb-aside-block" data-testid="bib-check">
+                            <h5 class="lb-aside-h">{{ $t('bib.check.heading') }}</h5>
+                            <template v-if="checkComplete">
+                                <p class="lb-bib-complete" data-testid="bib-check-complete">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>
+                                    {{ $t('bib.check.complete') }}
+                                </p>
+                                <p class="lb-bib-aside-note">{{ $t('bib.check.allThere', { fields: checkLabels }) }}</p>
+                            </template>
+                            <template v-else>
+                                <p class="lb-bib-aside-note">{{ $t('bib.check.intro', { type: $t('bib.type.' + (editMeta.item_type || 'misc')) }) }}</p>
+                                <ul class="lb-bib-checklist" data-testid="bib-checklist">
+                                    <li v-for="r in checkList" :key="r.label" :class="r.ok ? 'is-ok' : 'is-missing'" :data-ok="r.ok ? 'true' : 'false'">
+                                        <svg v-if="r.ok" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" role="img" :aria-label="$t('bib.check.present')"><path d="M5 12l5 5 9-10"/></svg>
+                                        <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 3" role="img" :aria-label="$t('bib.form.missing')"><circle cx="12" cy="12" r="8"/></svg>
+                                        <span>{{ r.label }}</span>
+                                    </li>
+                                </ul>
+                            </template>
+                            <div class="lb-bib-divider"></div>
+                            <p class="lb-mono lb-bib-aside-note">{{ $t('bib.check.export', { entry: formExportLabel }) }}</p>
+                            <template v-if="lookup && lookup.status">
+                                <div class="lb-bib-divider"></div>
+                                <h5 class="lb-aside-h">{{ $t('bib.lookup.sources') }}</h5>
+                                <dl class="lb-aside-dl" data-testid="bib-lookup-sources">
+                                    <template v-for="s in lookupSourceRows" :key="s.id">
+                                        <dt>{{ s.name }}</dt><dd :class="{ 'lb-bib-mute': !s.found }" :data-source="s.id">{{ s.text }}</dd>
+                                    </template>
+                                </dl>
+                            </template>
+                        </div>
+
+                        <div v-if="b === 'metadata' && !editingMeta" class="lb-aside-block" data-testid="block-metadata">
                             <h5 class="lb-aside-h">{{ $t('detail.metadata') }}</h5>
                             <dl class="lb-aside-dl">
-                                <dt>{{ $t('common.year') }}</dt><dd>{{ paper.year || '&mdash;' }}</dd>
-                                <dt>Journal</dt><dd>{{ paper.journal || '&mdash;' }}</dd>
-                                <dt>{{ $t('common.publisher') }}</dt><dd>{{ paper.publisher || '&mdash;' }}</dd>
-                                <dt>DOI</dt><dd class="lb-mono lb-truncate" :title="paper.doi">{{ paper.doi || '&mdash;' }}</dd>
-                                <dt>ISBN</dt><dd class="lb-mono lb-truncate" :title="paper.isbn">{{ paper.isbn || '&mdash;' }}</dd>
-                                <dt>{{ $t('common.citations') }}</dt><dd>{{ paper.cited_by_count != null ? paper.cited_by_count : '&mdash;' }}</dd>
+                                <dt>{{ $t('bib.field.item_type') }}</dt><dd data-testid="meta-type">{{ $t('bib.type.' + readTypeId) }}</dd>
+                                <template v-for="row in readRows" :key="row.field">
+                                    <dt>{{ row.label }}</dt>
+                                    <dd class="lb-truncate" :class="row.cls" :title="row.value" :data-field="row.field">
+                                        <a v-if="row.field === 'url' && row.web" :href="row.value" target="_blank" rel="noopener">{{ row.value }}</a>
+                                        <template v-else>{{ row.value }}</template>
+                                    </dd>
+                                </template>
+                                <dt>{{ $t('common.citations') }}</dt><dd class="lb-mono">{{ paper.cited_by_count != null ? paper.cited_by_count : '—' }}</dd>
                                 <dt>{{ $t('detail.citeKey') }}</dt>
                                 <dd v-if="!editingCiteKey" class="lb-mono lb-truncate" :title="paper.cite_key">
                                     {{ paper.cite_key || '&mdash;' }}
@@ -5775,6 +6293,16 @@ const PaperDetail = {
                                     <p v-if="citeKeyError" class="text-xs mt-1" style="color: var(--lb-danger);">{{ citeKeyError }}</p>
                                 </dd>
                             </dl>
+                            <!-- Completeness (bib_fields.missing_fields): dashed, as
+                                 everything missing is (DESIGN.md). -->
+                            <div v-if="readMissing.length" class="lb-bib-gap" data-testid="bib-missing-hint">
+                                <p>{{ $t('bib.hint.missing') }} <b>{{ readMissing.join(', ') }}</b></p>
+                                <div class="lb-bib-gap-actions">
+                                    <button v-if="paper.doi || paper.isbn" type="button" class="lb-key lb-bib-key-sm" data-testid="bib-hint-lookup"
+                                            @click="lookupFromView">{{ paper.doi ? $t('bib.hint.byDoi') : $t('bib.hint.byIsbn') }}</button>
+                                    <button type="button" class="lb-btn-text" data-testid="bib-hint-edit" @click="startEditMetadata">{{ $t('bib.hint.byHand') }}</button>
+                                </div>
+                            </div>
                         </div>
 
                         <div v-if="b === 'categories'" class="lb-aside-block" data-testid="block-categories">
@@ -6122,7 +6650,23 @@ const PaperDetail = {
             ocrRunning: false,
             ocrResult: null,
             editingMeta: false,
+            // The edit form (bib_fields): the draft, the values it opened
+            // with (only what differs is saved), the server's type table.
             editMeta: {},
+            editBase: {},
+            editAllFields: false,
+            // The side panel shows the metadata tab while the form is open,
+            // until the user picks a tab of their own.
+            editShowsCheck: false,
+            editError: '',
+            savingMeta: false,
+            bibTable: null,
+            // Lookup by DOI/ISBN: { found, filled: [{field, value}], previous,
+            // source, conflicts, picked, status, error, undone }, and the
+            // source per field it filled (the tag beside the label).
+            lookup: null,
+            lookupBusy: false,
+            lookupSources: {},
             customValues: {},
             savingCustom: false,
             // Notizen (#160): Ansicht/Bearbeiten + Autosave-Status
@@ -6201,6 +6745,13 @@ const PaperDetail = {
         activeTab() {
             const tabs = this.layout.tabs;
             if (!tabs.length) return -1;
+            // While the form is open its completeness check is on screen: the
+            // tab holding Metadata, without changing the remembered choice -
+            // until the user picks another tab (pickTab drops the override).
+            if (this.editingMeta && this.editShowsCheck) {
+                const meta = tabs.findIndex((tab) => tab.blocks.includes('metadata'));
+                if (meta >= 0) return meta;
+            }
             const picked = tabs.findIndex((tab) => tab.blocks[0] === this.sideTabChoice);
             if (picked >= 0) return picked;
             const withNotes = tabs.findIndex((tab) => tab.blocks.includes('notes'));
@@ -6238,10 +6789,114 @@ const PaperDetail = {
         assignedCategoryIds() {
             return ((this.paper && this.paper.categories) || []).map((c) => c.id);
         },
+        // --- Bibliographic fields (bib_fields via GET /api/papers/item-types) --
+        bibTypes() {
+            return (this.bibTable && this.bibTable.types) || [];
+        },
+        formType() {
+            return bibType(this.bibTable, this.editMeta.item_type) || bibType(this.bibTable, 'misc');
+        },
+        formExportLabel() {
+            return bibExportLabel(this.bibTable, this.formType);
+        },
+        // Requirements of the chosen type, met by the form's values.
+        checkList() {
+            return bibRequirements(this.formType, this.editMeta, true);
+        },
+        checkComplete() {
+            return this.checkList.length > 0 && this.checkList.every((r) => r.ok);
+        },
+        checkLabels() {
+            const labels = this.checkList.map((r) => r.label);
+            try {
+                return new Intl.ListFormat(uiLocale(), { style: 'long', type: 'conjunction' }).format(labels);
+            } catch (e) {
+                return labels.join(', ');
+            }
+        },
+        // The type's fields in table order (its year lives in the date field),
+        // a required one that is empty dashed; then every other field.
+        bibGroups() {
+            const type = this.formType;
+            if (!type) return [];
+            const missing = new Set();
+            for (const r of this.checkList) {
+                if (!r.ok) r.fields.forEach((f) => missing.add(f === 'year' ? 'pub_date' : f));
+            }
+            const own = type.fields.filter((f) => f !== 'year');
+            const groups = [{ key: 'main', fields: own.map((f) => this.bibFieldView(f, type, missing.has(f))) }];
+            if (this.editAllFields) {
+                groups.push({ key: 'more', fields: this.extraFieldIds.map((f) => this.bibFieldView(f, type, false)) });
+            }
+            return groups;
+        },
+        extraFieldIds() {
+            const type = this.formType;
+            if (!type || !this.bibTable) return [];
+            const own = new Set(type.fields);
+            return this.bibTable.fields.filter((f) => !own.has(f) && f !== 'year' && f !== 'item_type');
+        },
+        extraFieldCount() {
+            return this.extraFieldIds.length;
+        },
+        canLookup() {
+            const m = this.editingMeta ? this.editMeta : (this.paper || {});
+            return !!(String(m.doi || '').trim() || String(m.isbn || '').trim());
+        },
+        pickedCount() {
+            if (!this.lookup) return 0;
+            return this.lookup.conflicts.filter((c) => this.lookup.picked[c.field]).length;
+        },
+        // "Sources of this lookup": each source and what it said.
+        lookupSourceRows() {
+            const status = (this.lookup && this.lookup.status) || {};
+            return BIB_SOURCES.filter((id) => status[id]).map((id) => {
+                const said = status[id];
+                const via = id === 'openlibrary' ? 'isbn' : 'doi';
+                const key = said === 'found' || said === 'no_identifier' ? said + '.' + via : said;
+                return { id, name: t('bib.source.' + id), found: said === 'found', text: t('bib.lookup.status.' + key) };
+            });
+        },
+        // --- The read view of the metadata block ---------------------------
+        readTypeId() {
+            return (this.paper && this.paper.effective_type) || 'misc';
+        },
+        readType() {
+            return bibType(this.bibTable, this.readTypeId);
+        },
+        // Every filled bibliographic field of the Item's type, in table order;
+        // title, people and abstract stand in the title block already.
+        readRows() {
+            const p = this.paper;
+            if (!p) return [];
+            const type = this.readType;
+            const fields = type ? type.fields : ['journal', 'pub_date', 'publisher', 'doi', 'isbn'];
+            const rows = [];
+            for (const f of fields) {
+                if (BIB_READ_SKIP.has(f)) continue;
+                let value = f === 'pub_date' ? (p.pub_date || (p.year ? String(p.year) : '')) : p[f];
+                if (BIB_PEOPLE_FIELDS.includes(f)) value = displayPeople(value);
+                value = String(value ?? '').trim();
+                if (!value) continue;
+                const cls = f === 'journal' || f === 'booktitle' ? 'lb-bib-serif' : (BIB_MONO_FIELDS.has(f) ? 'lb-mono' : '');
+                // Only a web address becomes a link (an imported url may be anything).
+                rows.push({ field: f, label: bibFieldLabel(f, type), value, cls, web: /^https?:\/\//i.test(value) });
+            }
+            return rows;
+        },
+        readMissing() {
+            const type = this.readType;
+            return ((this.paper && this.paper.missing_fields) || []).map((f) => bibFieldLabel(f, type));
+        },
         scholarUrl() {
             if (!this.paper) return '';
             const q = (this.paper.title || this.paper.doi || '').trim();
             return 'https://scholar.google.com/scholar?q=' + encodeURIComponent(q);
+        },
+        backTarget() { return safeBackPath(this.$route.query.back); },
+        backLabel() {
+            const label = backNavLabel(this.backTarget);
+            return label ? t('detail.backTo', { label }) : t('detail.back');
         },
         previewUrl() {
             if (!this.paper) return '';
@@ -6278,6 +6933,11 @@ const PaperDetail = {
             if (e.key !== 'Escape') return;
             // Don't swallow Esc when a nested overlay is open — let it dismiss that first.
             if (this.validateProposal || this.editingRef || this.addingRef || this.extractingRefs || this.editingCiteKey) return;
+            // The edit form first: Esc cancels it like its Cancel button.
+            if (this.editingMeta) {
+                this.closeEdit();
+                return;
+            }
             this.close();
         };
         window.addEventListener('keydown', this._escHandler);
@@ -6305,7 +6965,10 @@ const PaperDetail = {
         window.dispatchEvent(new CustomEvent('lb-focus-mode', { detail: { on: false } }));
     },
     watch: {
-        '$route'() { this.load(); },
+        '$route'() {
+            this._foundFor = null;   // a new navigation may frame its `?find=` again
+            this.load();
+        },
         // Das Metadaten-Formular ersetzt den Notiz-Block im DOM: vorher die
         // offene Notiz sichern.
         editingMeta(on) {
@@ -6313,6 +6976,9 @@ const PaperDetail = {
         },
     },
     methods: {
+        goBack() {
+            if (this.backTarget) this.$router.push(this.backTarget);
+        },
         close() {
             // Slide-in modal close: return to the list. Fallback to '/' if history is empty.
             if (window.history.length > 1) {
@@ -6335,6 +7001,7 @@ const PaperDetail = {
                 this.sideOpen = false;
                 return;
             }
+            this.editShowsCheck = false;
             this.sideTabChoice = tab.blocks[0];
             lsSet(DETAIL_TAB_KEY, this.sideTabChoice);
             this.sideOpen = true;
@@ -6444,7 +7111,9 @@ const PaperDetail = {
             this.loading = true;
             this.validateResult = null;
             this.validateProposal = null;
-            this.editingMeta = false;
+            this.closeEdit();
+            // The type table for the metadata block and the form (read once).
+            loadBibTable().then((table) => { this.bibTable = table; }).catch(() => { /* the block falls back */ });
             this.pdfPage = this.$route.query.page ? parseInt(this.$route.query.page) : null;
             const switching = !this.paper || String(this.paper.id) !== String(this.$route.params.id);
             if (switching) {
@@ -6487,6 +7156,7 @@ const PaperDetail = {
             this.loadReferences();
             // ... and the annotations: the view never waits for a long PDF.
             this.loadAnnotations();
+            this.locateFind();
         },
         // --- Annotations + preview (#229) -----------------------------------
         // `quiet`: a refresh on return from the reader keeps the list on
@@ -6538,8 +7208,38 @@ const PaperDetail = {
         },
         jumpToAnnotation(entry) {
             this.activeAnnotationId = entry.id;
+            this.jumpToSpot(entry.page, entry.rect);
+        },
+        // `?find=` (contract 2.6): a link names a passage on its `?page=` -
+        // the preview frames where it starts. No answer (not found, not
+        // unambiguous, a failure) leaves the bare page jump: never a guess.
+        // Once per navigation: a reload of the same route (a category added,
+        // a PDF attached) never pulls the preview back to the passage.
+        async locateFind() {
+            const query = this.$route.query;
+            const find = typeof query.find === 'string' ? query.find.trim() : '';
+            const paper = this.paper;
+            const page = this.pdfPage;
+            if (!find || !page || !paper || !paper.filename) return;
+            const route = this.$route.fullPath;
+            if (this._foundFor === route) return;
+            this._foundFor = route;
+            let rect = null;
+            try {
+                const out = await api(`/api/papers/${paper.id}/locate?page=${page}`
+                    + `&text=${encodeURIComponent(find.slice(0, 600))}`);
+                rect = out && out.rect;
+            } catch (e) {
+                console.error('pdf.locate', e);
+                return;
+            }
+            if (!rect || this.$route.fullPath !== route || !this.paper || this.paper.id !== paper.id) return;
+            await this.$nextTick();
+            this.jumpToSpot(page, rect);
+        },
+        jumpToSpot(page, rect) {
             const go = () => {
-                if (this.$refs.pdfPreview) this.$refs.pdfPreview.goTo(entry.page, entry.rect);
+                if (this.$refs.pdfPreview) this.$refs.pdfPreview.goTo(page, rect);
             };
             // Stacked layout (< 1100 px): first up to the preview, then the
             // jump, so it never happens out of sight.
@@ -6815,18 +7515,216 @@ const PaperDetail = {
             }
             this.ocrRunning = false;
         },
-        startEditMetadata() {
-            this.editMeta = {
-                title: this.paper.title || '',
-                authors: this.paper.authors || '',
-                year: this.paper.year || null,
-                doi: this.paper.doi || '',
-                isbn: this.paper.isbn || '',
-                abstract: this.paper.abstract || '',
-                journal: this.paper.journal || '',
-                publisher: this.paper.publisher || '',
-            };
+        // --- The edit form (bib_fields) ------------------------------------
+        // The draft holds every field as text: people one per line, the year
+        // folded into the date field. `editBase` is the draft it opened with.
+        async startEditMetadata() {
+            let table;
+            try {
+                table = await loadBibTable();
+            } catch (e) {
+                alert(t('error.generic', { message: e.message }));
+                return;
+            }
+            if (!this.paper) return;
+            this.bibTable = table;
+            this.editMeta = this.draftFromPaper(this.paper);
+            this.editBase = { ...this.editMeta };
+            this.editAllFields = false;
+            this.editError = '';
+            this.lookup = null;
+            this.lookupSources = {};
+            this.editShowsCheck = true;
+            this.sideOpen = true;
             this.editingMeta = true;
+        },
+        draftFromPaper(p) {
+            const draft = {};
+            for (const f of (this.bibTable && this.bibTable.fields) || []) {
+                if (f === 'year') continue;
+                let v = p[f];
+                if (f === 'pub_date') v = p.pub_date || (p.year ? String(p.year) : '');
+                else if (BIB_PEOPLE_FIELDS.includes(f)) v = splitPeople(v).join('\n');
+                draft[f] = v == null ? '' : String(v);
+            }
+            draft.item_type = bibType(this.bibTable, p.item_type) ? p.item_type : (p.effective_type || 'misc');
+            return draft;
+        },
+        bibFieldView(f, type, missing) {
+            return {
+                id: f,
+                label: bibFieldLabel(f, type),
+                people: BIB_PEOPLE_FIELDS.includes(f),
+                mono: BIB_MONO_FIELDS.has(f),
+                wide: BIB_WIDE_FIELDS.has(f),
+                placeholder: bibPlaceholder(f),
+                missing,
+                // "missing" and the one-person-per-line hint, read with the field.
+                describedBy: [missing ? 'bib-m-' + f : '', BIB_PEOPLE_FIELDS.includes(f) ? 'bib-h-' + f : '']
+                    .filter(Boolean).join(' ') || null,
+                source: this.lookupSources[f] ? this.sourceName(this.lookupSources[f]) : '',
+            };
+        },
+        // Only what differs from the opened form; people in the storage form.
+        metaPayload() {
+            const out = {};
+            for (const [k, v] of Object.entries(this.editMeta)) {
+                if (v === this.editBase[k]) continue;
+                out[k] = BIB_PEOPLE_FIELDS.includes(k) ? joinPeopleLines(v) : String(v ?? '').trim();
+            }
+            return out;
+        },
+        // After a write: the saved values of these fields into the form, as
+        // unchanged (a lookup's fills are saved, so they are no edit).
+        takeSaved(fields) {
+            const saved = this.draftFromPaper(this.paper);
+            for (const f of fields) {
+                const k = f === 'year' ? 'pub_date' : f;
+                if (!(k in saved)) continue;
+                this.editMeta[k] = saved[k];
+                this.editBase[k] = saved[k];
+            }
+        },
+        closeEdit() {
+            this.editingMeta = false;
+            this.editAllFields = false;
+            this.editError = '';
+            this.lookup = null;
+            this.lookupSources = {};
+        },
+        sourceName(id) {
+            return id ? t('bib.source.' + id) : '';
+        },
+        // --- Lookup by DOI/ISBN (POST /api/papers/{id}/metadata/lookup) ------
+        // Empty fields fill at once (user decision) and are saved; a value
+        // the Item has differently waits, unticked, for the user's choice.
+        async lookupFromView() {
+            if (!this.editingMeta) await this.startEditMetadata();
+            if (this.editingMeta) await this.runLookup();
+        },
+        async runLookup() {
+            if (this.lookupBusy || !this.paper) return;
+            const paperId = this.paper.id;
+            this.lookupBusy = true;
+            try {
+                let res;
+                try {
+                    res = await api(`/api/papers/${paperId}/metadata/lookup`, {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            doi: String(this.editMeta.doi || '').trim(),
+                            isbn: String(this.editMeta.isbn || '').trim(),
+                        }),
+                    });
+                } catch (e) {
+                    this.lookup = { error: e.message, filled: [], conflicts: [], picked: {}, status: null };
+                    return;
+                }
+                if (!this.editingMeta || !this.paper || this.paper.id !== paperId) return;
+                // A field typed into but not saved yet is the user's: no fill over it.
+                const fills = {};
+                for (const [f, v] of Object.entries(res.fills || {})) {
+                    const k = f === 'year' ? 'pub_date' : f;
+                    if (k in this.editBase && this.editMeta[k] !== this.editBase[k]) continue;
+                    fills[f] = v;
+                }
+                const previous = {};
+                for (const f of Object.keys(fills)) previous[f] = this.paper[f];
+                let filled = [];
+                if (Object.keys(fills).length) {
+                    try {
+                        this.paper = await api(`/api/papers/${paperId}`, { method: 'PUT', body: JSON.stringify(fills) });
+                    } catch (e) {
+                        this.lookup = { error: e.message, filled: [], conflicts: [], picked: {}, status: null };
+                        return;
+                    }
+                    this.takeSaved(Object.keys(fills));
+                    const sources = { ...this.lookupSources };
+                    for (const f of Object.keys(fills)) sources[f === 'year' ? 'pub_date' : f] = (res.sources || {})[f] || '';
+                    this.lookupSources = sources;
+                    // The year comes with its date: one chip for the two.
+                    filled = Object.keys(fills).filter((f) => f !== 'year' || !('pub_date' in fills))
+                        .map((f) => ({ field: f, value: fills[f] }));
+                    window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+                }
+                const sources = Object.values(res.sources || {});
+                this.lookup = {
+                    found: !!res.found, filled, previous, source: sources[0] || '',
+                    conflicts: res.conflicts || [], picked: {}, status: res.source_status || null, undone: false,
+                };
+            } finally {
+                this.lookupBusy = false;
+            }
+        },
+        // Takes the filled fields back to what they were (empty). A filled
+        // year goes with a cleared date: the server clears the year with the
+        // date field that shows it (bib_fields.checked_changes).
+        async undoLookup() {
+            if (!this.lookup || this.lookupBusy) return;
+            const body = {};
+            for (const [f, v] of Object.entries(this.lookup.previous || {})) {
+                if (f === 'year') continue;
+                body[f] = v == null ? '' : v;
+            }
+            if ('year' in (this.lookup.previous || {}) && !('pub_date' in body)) body.pub_date = '';
+            this.lookupBusy = true;
+            try {
+                if (Object.keys(body).length) {
+                    this.paper = await api(`/api/papers/${this.paper.id}`, { method: 'PUT', body: JSON.stringify(body) });
+                    this.takeSaved(Object.keys(body));
+                }
+                const sources = { ...this.lookupSources };
+                for (const f of Object.keys(this.lookup.previous || {})) delete sources[f === 'year' ? 'pub_date' : f];
+                this.lookupSources = sources;
+                this.lookup = { ...this.lookup, filled: [], previous: {}, undone: true };
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            } catch (e) {
+                this.editError = t('error.saveFailed', { message: e.message });
+            } finally {
+                this.lookupBusy = false;
+            }
+        },
+        async applyConflicts() {
+            if (!this.lookup || this.lookupBusy) return;
+            const chosen = this.lookup.conflicts.filter((c) => this.lookup.picked[c.field]);
+            if (!chosen.length) return;
+            const body = Object.fromEntries(chosen.map((c) => [c.field, c.found]));
+            this.lookupBusy = true;
+            try {
+                this.paper = await api(`/api/papers/${this.paper.id}`, { method: 'PUT', body: JSON.stringify(body) });
+                this.takeSaved(Object.keys(body));
+                const sources = { ...this.lookupSources };
+                for (const c of chosen) sources[c.field === 'year' ? 'pub_date' : c.field] = c.source || this.lookup.source;
+                this.lookupSources = sources;
+                const done = new Set(chosen.map((c) => c.field));
+                this.lookup = { ...this.lookup, conflicts: this.lookup.conflicts.filter((c) => !done.has(c.field)), picked: {} };
+                window.dispatchEvent(new CustomEvent('refresh-sidebar'));
+            } catch (e) {
+                this.editError = t('error.saveFailed', { message: e.message });
+            } finally {
+                this.lookupBusy = false;
+            }
+        },
+        keepConflicts() {
+            if (this.lookup) this.lookup = { ...this.lookup, conflicts: [], picked: {} };
+        },
+        conflictLabel(field) {
+            return field === 'year' ? t('bib.field.year') : bibFieldLabel(field, this.formType);
+        },
+        conflictValue(field, value) {
+            if (value == null || value === '') return t('validate.empty');
+            if (field === 'item_type') return t('bib.type.' + value);
+            if (BIB_PEOPLE_FIELDS.includes(field)) return splitPeople(value).map(displayPeople).join('; ');
+            return String(value);
+        },
+        // "Volume 7", "Pages 211–226" - a short code-like value with its label;
+        // text (a publisher, a title) and a URL by the label alone.
+        filledChip(f) {
+            const label = f.field === 'item_type' ? t('bib.field.item_type') : bibFieldLabel(f.field, this.formType);
+            if (f.field === 'item_type') return label + ' ' + t('bib.type.' + f.value);
+            const value = String(f.value ?? '');
+            const short = BIB_MONO_FIELDS.has(f.field) && f.field !== 'url' && value.length <= 24;
+            return short ? label + ' ' + value : label;
         },
         async generateAbstract() {
             this.generatingAbstract = true;
@@ -6849,28 +7747,28 @@ const PaperDetail = {
                 this.generatingAbstract = false;
             }
         },
+        // Sends only the changed fields (a cleared one as ""); a refusal
+        // (an unknown type, a date it cannot read) stays in the form.
         async saveMetadata() {
+            if (this.savingMeta || !this.paper) return;
+            const payload = this.metaPayload();
+            if (Object.keys(payload).length === 0) {
+                this.closeEdit();
+                return;
+            }
+            this.savingMeta = true;
+            this.editError = '';
             try {
-                // Send only changed fields (including cleared fields)
-                const payload = {};
-                for (const [key, val] of Object.entries(this.editMeta)) {
-                    const original = this.paper[key] ?? '';
-                    if (String(val) !== String(original)) {
-                        payload[key] = val;
-                    }
-                }
-                if (Object.keys(payload).length === 0) {
-                    this.editingMeta = false;
-                    return;
-                }
                 this.paper = await api(`/api/papers/${this.paper.id}`, {
                     method: 'PUT',
                     body: JSON.stringify(payload),
                 });
-                this.editingMeta = false;
+                this.closeEdit();
                 window.dispatchEvent(new CustomEvent('refresh-sidebar'));
             } catch (e) {
-                alert(t('error.saveFailed', { message: e.message }));
+                this.editError = t('error.saveFailed', { message: e.message });
+            } finally {
+                this.savingMeta = false;
             }
         },
         async assignPickedCategory(id) {
@@ -8078,6 +8976,41 @@ const DoiImportSection = {
 
 
 // =============================================================================
+// BibTeX handover (contract 2.6): `LocalBib.importBibtex(text, {collection,
+// filename})` hands an Add-on's BibTeX text to the import page. The text stays
+// in memory only (never on disk, never in the address); the page's BibTeX
+// dialog turns it into a File and runs the existing preview — which only reads —
+// with the target Collection preselected. Nothing is created until the user
+// confirms in the dialog, exactly like a .bib they picked themselves.
+// =============================================================================
+
+const BIBTEX_HANDOVER_EVENT = 'lb-bibtex-handover';
+let _bibtexHandover = null;
+
+// Returns false (and hands nothing over) for an empty text.
+function importBibtex(text, options = {}) {
+    if (typeof text !== 'string' || !text.trim()) return false;
+    const opts = options || {};
+    const collection = opts.collection === null || opts.collection === undefined || opts.collection === ''
+        ? null : String(opts.collection);
+    let filename = typeof opts.filename === 'string' ? opts.filename.trim().replace(/^.*[\\/]/, '') : '';
+    if (!filename) filename = 'import.bib';
+    if (!/\.(bib|bibtex)$/i.test(filename)) filename += '.bib';
+    _bibtexHandover = { text, collection, filename };
+    // An open import page takes it at once; otherwise the page takes it when it opens.
+    window.dispatchEvent(new CustomEvent(BIBTEX_HANDOVER_EVENT));
+    if (router.currentRoute.value.name !== 'import') router.push({ name: 'import' });
+    return true;
+}
+
+function takeBibtexHandover() {
+    const handover = _bibtexHandover;
+    _bibtexHandover = null;
+    return handover;
+}
+
+
+// =============================================================================
 // ImportPage Component
 // =============================================================================
 
@@ -8122,8 +9055,9 @@ const ImportPage = {
                     {{ $t('bibImport.open') }}
                 </button>
             </div>
-            <bib-import-dialog v-if="showBibImport" :collection-id="$route.query.collection || null"
-                               @close="showBibImport = false" />
+            <bib-import-dialog v-if="showBibImport" :key="bibDialogKey"
+                               :collection-id="bibHandover ? bibHandover.collection : ($route.query.collection || null)"
+                               :handover="bibHandover" @close="showBibImport = false; bibHandover = null" />
 
             <!-- DOI list (#227); a link may prefill it: ?dois=…&collection=… -->
             <doi-import-section />
@@ -8334,7 +9268,7 @@ const ImportPage = {
                                     </div>
                                     <div class="flex-1 min-w-0">
                                         <p class="font-semibold text-gray-900 text-sm leading-snug">{{ res.title || res.filename }}</p>
-                                        <p v-if="res.authors" class="text-xs text-gray-500 mt-0.5">{{ res.authors }}</p>
+                                        <p v-if="res.authors" class="text-xs text-gray-500 mt-0.5">{{ $people(res.authors) }}</p>
                                     </div>
                                 </div>
 
@@ -8446,6 +9380,9 @@ const ImportPage = {
             uploadNewCollectionName: '',
             uploadTargetError: '',
             showBibImport: false,
+            // BibTeX an Add-on handed over (contract 2.6); a new one remounts the dialog.
+            bibHandover: null,
+            bibDialogKey: 0,
         };
     },
     created() {
@@ -8456,11 +9393,25 @@ const ImportPage = {
             }
         };
         window.addEventListener('global-pdf-drop', this._globalDropHandler);
+        this._bibHandoverHandler = () => this.takeBibHandover();
+        window.addEventListener(BIBTEX_HANDOVER_EVENT, this._bibHandoverHandler);
+        this.takeBibHandover();
+        // `/import?bibtex=1` (contract 2.6) opens the BibTeX dialog at once;
+        // `?collection=` preselects its target as usual.
+        if (!this.showBibImport && this.$route.query.bibtex) this.showBibImport = true;
     },
     beforeUnmount() {
         window.removeEventListener('global-pdf-drop', this._globalDropHandler);
+        window.removeEventListener(BIBTEX_HANDOVER_EVENT, this._bibHandoverHandler);
     },
     methods: {
+        takeBibHandover() {
+            const handover = takeBibtexHandover();
+            if (!handover) return;
+            this.bibHandover = handover;
+            this.bibDialogKey++;
+            this.showBibImport = true;
+        },
         handleDrop(event) {
             this.dragging = false;
             const files = Array.from(event.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.pdf'));
@@ -10352,6 +11303,7 @@ const SettingsFolders = {
 
 // --- Settings → Library -------------------------------------------------------
 const SETTINGS_LINK_MODES = ['symlink', 'hardlink', 'copy'];
+const SETTINGS_BIB_DIALECTS = ['biblatex', 'bibtex'];
 const SETTINGS_ADVANCED_KEY = 'lbSettingsLibraryAdvanced';
 
 const SettingsLibrarySection = {
@@ -10400,6 +11352,35 @@ const SettingsLibrarySection = {
                             <button type="button" role="switch" class="lb-set-switch" :class="{ 'is-on': unlockPdfs }"
                                     :aria-checked="unlockPdfs ? 'true' : 'false'" :aria-label="$t('settings.unlockPdfs')"
                                     data-testid="settings-unlock-pdfs" @click="toggleUnlockPdfs"><span></span></button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- The .bib dialect (BIB_DIALECT): every .bib LocalBib writes. -->
+            <section class="lb-set-block" data-testid="settings-bib-format">
+                <div>
+                    <h2 class="lb-set-h">{{ $t('settings.library.bibFormat.heading') }}</h2>
+                    <p class="lb-set-sub">{{ $t('settings.library.bibFormat.hint') }}</p>
+                </div>
+                <div class="lb-set-card lb-set-pad">
+                    <div class="lb-set-row-text lb-bib-format">
+                        <div class="flex items-center gap-3 flex-wrap">
+                            <div class="lb-segmented lb-bib-format-seg" role="radiogroup" :aria-label="$t('settings.library.bibFormat.heading')">
+                                <button v-for="d in bibDialects" :key="d" type="button" role="radio"
+                                        class="lb-seg" :class="{ 'is-on': bibDialect === d }"
+                                        :aria-checked="bibDialect === d ? 'true' : 'false'"
+                                        :data-testid="'settings-bib-dialect-' + d" @click="setBibDialect(d)">
+                                    {{ $t('settings.library.bibFormat.' + d) }}
+                                    <span v-if="d === 'biblatex'" class="lb-mono">{{ $t('settings.library.bibFormat.recommended') }}</span>
+                                </button>
+                            </div>
+                            <settings-field-status :state="fieldState('BIB_DIALECT')" data-field-status="BIB_DIALECT" />
+                        </div>
+                        <p class="lb-set-hint" data-testid="settings-bib-format-help">{{ $t('settings.library.bibFormat.help.' + bibDialect) }}</p>
+                        <div class="flex flex-col gap-1.5">
+                            <span class="lb-field-label">{{ $t('settings.library.bibFormat.example') }}</span>
+                            <pre class="lb-bib-example" data-testid="settings-bib-example">{{ bibExample }}</pre>
                         </div>
                     </div>
                 </div>
@@ -10505,6 +11486,7 @@ const SettingsLibrarySection = {
         try { open = localStorage.getItem(SETTINGS_ADVANCED_KEY) === '1'; } catch (e) { /* closed without storage */ }
         return {
             env: {}, advancedOpen: open, dialog: null, linkModes: SETTINGS_LINK_MODES,
+            bibDialects: SETTINGS_BIB_DIALECTS,
             // '' | 'offer' | 'done' — the context hint after a link-mode change
             linkHint: '', linkHintError: '', linkDone: { items: 0, errors: 0 },
             run: recomputeRun, recomputeIcons: RECOMPUTE_ICONS,
@@ -10524,6 +11506,37 @@ const SettingsLibrarySection = {
         linkMode() {
             return this.env.LINK_MODE || 'symlink';
         },
+        bibDialect() {
+            return SETTINGS_BIB_DIALECTS.includes(this.env.BIB_DIALECT) ? this.env.BIB_DIALECT : 'biblatex';
+        },
+        // A web page as the chosen dialect writes it (bibtex_builder): biblatex
+        // has @online with date and urldate, classic BibTeX a @misc with the
+        // URL in howpublished and the access date in a note.
+        bibExample() {
+            const title = t('settings.library.bibFormat.exampleTitle');
+            const accessed = '2026-10-22';
+            if (this.bibDialect === 'bibtex') {
+                return [
+                    '@misc{DEGES.2023,',
+                    '  author = {{DEGES GmbH}},',
+                    `  title = {${title}},`,
+                    '  year = {2023},',
+                    '  month = may,',
+                    '  howpublished = {\\url{https://example.org/bruecken}},',
+                    `  note = {${t('bibExport.accessed', { date: accessed })}},`,
+                    '}',
+                ].join('\n');
+            }
+            return [
+                '@online{DEGES.2023,',
+                '  author = {{DEGES GmbH}},',
+                `  title = {${title}},`,
+                '  date = {2023-05},',
+                '  url = {https://example.org/bruecken},',
+                `  urldate = {${accessed}},`,
+                '}',
+            ].join('\n');
+        },
         recomputeBusy() {
             return this.run.state === 'running';
         },
@@ -10539,6 +11552,14 @@ const SettingsLibrarySection = {
         toggleAdvanced() {
             this.advancedOpen = !this.advancedOpen;
             try { localStorage.setItem(SETTINGS_ADVANCED_KEY, this.advancedOpen ? '1' : '0'); } catch (e) { /* not remembered */ }
+        },
+        async setBibDialect(dialect) {
+            if (dialect === this.bibDialect) return;
+            const before = this.env.BIB_DIALECT;
+            this.env.BIB_DIALECT = dialect;
+            const saved = await this.saveSetting('BIB_DIALECT', { BIB_DIALECT: dialect }, () => { this.env.BIB_DIALECT = before; });
+            if (saved) forgetBibTable();   // the form's "exports as" names the new entry types
+            return saved;
         },
         toggleUnlockPdfs() {
             const before = this.env.UNLOCK_PDFS;
@@ -10607,6 +11628,10 @@ const SettingsLibrarySection = {
 const SETTINGS_SOURCES = [
     { id: 'crossref', short: 'CR', mail: true, key: false },
     { id: 'openalex', short: 'OA', mail: true, key: true },
+    // Bibliographic lookup (bib_lookup): DOIs outside CrossRef, books by ISBN.
+    // Both are asked with the polite User-Agent, the address only when set.
+    { id: 'datacite', short: 'DC', mail: true, key: false },
+    { id: 'openlibrary', short: 'OL', mail: true, key: false },
     { id: 'arxiv', short: 'aX', mail: false, key: false },
 ];
 
@@ -13893,7 +14918,7 @@ const ResearchChatPage = {
                                     :class="msg.role === 'user' ? 'text-accent-soft' : 'text-accent'">
                                     [{{ si + 1 }}] {{ s.title || $t('chat.itemFallback', { id: s.paper_id }) }}
                                 </span>
-                                <span v-if="s.authors" class="opacity-70"> &mdash; {{ s.authors }}</span>
+                                <span v-if="s.authors" class="opacity-70"> &mdash; {{ $people(s.authors) }}</span>
                                 <span v-if="s.pages_referenced && s.pages_referenced.length">, {{ $t('papers.pagesAbbr') }} {{ s.pages_referenced.join(', ') }}</span>
                                 <!-- Hover Preview -->
                                 <div v-if="s.previews && s.previews.length"
@@ -13936,7 +14961,7 @@ const ResearchChatPage = {
                     <div class="flex items-center gap-3 px-5 py-3.5 border-b border-gray-200 bg-gray-50 rounded-t-2xl flex-shrink-0">
                         <div class="flex-1 min-w-0">
                             <p class="text-sm font-semibold text-gray-900 truncate">{{ pdfModal.paperTitle }}</p>
-                            <p class="text-xs text-gray-500 mt-0.5">{{ pdfModal.authors }} &middot; {{ $t('chat.page', { page: pdfModal.page }) }}</p>
+                            <p class="text-xs text-gray-500 mt-0.5">{{ $people(pdfModal.authors) }} &middot; {{ $t('chat.page', { page: pdfModal.page }) }}</p>
                         </div>
                         <button @click="openInPaperDetail"
                                 class="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-accent-ink bg-accent-soft border border-accent-soft rounded-lg hover:bg-accent-soft transition-colors">
@@ -14002,7 +15027,7 @@ const ResearchChatPage = {
                                    class="rounded border-gray-300 text-accent focus:ring-accent" />
                             <div class="flex-1 min-w-0">
                                 <p class="text-sm font-medium text-gray-900 truncate">{{ p.title || p.filename }}</p>
-                                <p class="text-xs text-gray-500">{{ p.authors || '' }}<span v-if="p.year"> &middot; {{ p.year }}</span></p>
+                                <p class="text-xs text-gray-500">{{ $people(p.authors) }}<span v-if="p.year"> &middot; {{ p.year }}</span></p>
                             </div>
                         </div>
                         <div v-if="filteredAvailablePapers.length === 0" class="text-center py-8 text-sm text-gray-400">
@@ -14082,7 +15107,7 @@ const ResearchChatPage = {
                 this.badgeTooltip = {
                     visible: true,
                     pinned: false,
-                    title: (src.title || t('chat.source')) + (src.authors ? ' — ' + src.authors : ''),
+                    title: (src.title || t('chat.source')) + (src.authors ? ' — ' + displayPeople(src.authors) : ''),
                     previews: src.previews,
                     style: showAbove
                         ? { position: 'fixed', left: left + 'px', bottom: (window.innerHeight - rect.top + 6) + 'px', width: tooltipW + 'px' }
@@ -14337,7 +15362,7 @@ const ResearchChatPage = {
                 const paperId = src && /^\d+$/.test(String(src.paper_id)) ? String(src.paper_id) : '';
                 const pagesRef = src && Array.isArray(src.pages_referenced) ? src.pages_referenced : [];
                 const title = src ? String(src.title || '').substring(0, 80) : '';
-                const authors = src && src.authors ? ' — ' + String(src.authors).substring(0, 60) : '';
+                const authors = src && src.authors ? ' — ' + displayPeople(src.authors).substring(0, 60) : '';
                 const pages = pagesRef.length ? ', ' + t('papers.pagesAbbr') + ' ' + pagesRef.join(', ') : '';
                 const tooltip = esc(title + authors + pages);
                 const pageParam = pagesRef.length ? '?page=' + encodeURIComponent(pagesRef[0]) : '';
@@ -15100,7 +16125,7 @@ const AnalysePage = {
                                 <div v-if="hoverNode && !viewOpen" class="lb-hover-card" aria-hidden="true">
                                     <div class="lb-hover-year">{{ hoverNode.year || '—' }}</div>
                                     <div class="lb-hover-title">{{ hoverNode.title || hoverNode.id }}</div>
-                                    <div class="lb-hover-meta" v-if="hoverNode.authors">{{ hoverNode.authors }}</div>
+                                    <div class="lb-hover-meta" v-if="hoverNode.authors">{{ $people(hoverNode.authors) }}</div>
                                     <div class="lb-hover-foot">
                                         <span v-if="hoverNode.cited_by_count != null">{{ hoverNode.cited_by_count.toLocaleString($locale()) }} {{ $t('papers.citAbbr') }}</span>
                                         <span v-if="hoverNode.cited_by_count != null" class="lb-meta-dot">·</span>
@@ -15292,7 +16317,7 @@ const AnalysePage = {
                                         <span class="lb-an-label lb-an-card-kind" :class="{ 'is-shared': cardKind === 'shared' }" data-testid="analysis-card-kind">{{ cardKind === 'shared' ? $t('analysis.sharedReference') : $t('analysis.citedWork') }}</span>
                                     </p>
                                     <h2 id="lb-an-card-title" ref="cardTitle" tabindex="-1" class="lb-an-card-title" data-testid="analysis-card-title">{{ selectedNode.title || $t('papers.untitled') }}</h2>
-                                    <p v-if="selectedNode.authors" class="lb-an-card-authors">{{ selectedNode.authors }}</p>
+                                    <p v-if="selectedNode.authors" class="lb-an-card-authors">{{ $people(selectedNode.authors) }}</p>
                                     <p v-if="selectedNode.cited_by_count != null" class="lb-an-card-note" data-testid="analysis-card-citations"><span v-for="(p, i) in cardCitationParts" :key="i" :class="{ 'lb-an-n': p.num }">{{ p.text }}</span></p>
                                 </template>
 
@@ -15409,7 +16434,7 @@ const AnalysePage = {
                             <tbody>
                                 <tr v-for="p in sortedOwnPapers" :key="p.paper_id">
                                     <td class="lb-td-title"><router-link :to="'/paper/' + p.paper_id">{{ p.title }}</router-link></td>
-                                    <td class="lb-td-authors lb-truncate">{{ p.authors }}</td>
+                                    <td class="lb-td-authors lb-truncate">{{ $people(p.authors) }}</td>
                                     <td class="lb-td-num" style="text-align:center">{{ p.year || '—' }}</td>
                                     <td class="lb-td-num"><span class="lb-num-pill is-accent">{{ (p.cited_by_count || 0).toLocaleString($locale()) }}</span></td>
                                     <td class="lb-td-num">{{ p.reference_count || 0 }}</td>
@@ -17848,6 +18873,43 @@ function navItemLabel(item) {
     return _addons[item.id] && inNamespace(item.label, item.id) ? t(item.label) : item.label;
 }
 
+// `?back=` on the Item detail route (contract 2.6): where its back key leads.
+// Only an internal route counts - it starts with "/", not "//", and carries
+// no backslash, whitespace or scheme; anything else is ignored (null).
+function safeBackPath(value) {
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (typeof raw !== 'string' || !raw || raw.length > 1000) return null;
+    if (!raw.startsWith('/') || raw.startsWith('//')) return null;
+    if (/[\\\s]/.test(raw)) return null;
+    if (raw.split(/[?#]/)[0].includes(':')) return null;
+    return raw;
+}
+
+// The sidebar's labels for a back target: the registered nav item whose route
+// holds it (the longest one wins), else the core's own area, else '' - the key
+// then just says "Back".
+const BACK_CORE_AREAS = [
+    ['/import', 'nav.import'], ['/migrate', 'nav.migrate'], ['/analyse', 'nav.analysis'],
+    ['/research-chat', 'nav.researchChat'], ['/thesis', 'nav.thesis'],
+    ['/marketplace', 'nav.marketplace'], ['/settings', 'nav.settings'],
+];
+
+function backNavLabel(path) {
+    if (!path) return '';
+    const bare = path.split(/[?#]/)[0].replace(/\/+$/, '') || '/';
+    const under = (route) => !!route && (bare === route || bare.startsWith(route + '/'));
+    let best = null;
+    for (const item of pluginNavItemsSeen.value) {
+        if (!navItemVisible(item) || !under(item.route)) continue;
+        if (!best || item.route.length > best.route.length) best = item;
+    }
+    if (best) return navItemLabel(best);
+    const core = BACK_CORE_AREAS.find(([route]) => under(route));
+    if (core) return t(core[1]);
+    if (bare === '/') return t('nav.items');
+    return '';
+}
+
 window.LocalBib = Object.freeze({
     Vue,
     registerPlugin,
@@ -17859,9 +18921,13 @@ window.LocalBib = Object.freeze({
     api: (url, options) => api(url, options),
     events: Object.freeze({ changed: ADDON_EVENT }),
     // Contract 2.4 (ADR-0026): the core's Markdown editor and read renderer.
-    components: Object.freeze({ MarkdownEditor }),
+    // Contract 2.6: the PDF viewer of one Item (page + framed passage).
+    components: Object.freeze({ MarkdownEditor, PdfPreview: ItemPdfPreview }),
     renderMarkdown: (text, opts) => renderMarkdownChips(text, opts),
     hydrateMarkdown: (el) => hydrateMarkdownChips(el),
+    // Contract 2.6: BibTeX text into the core's import (preview first, the
+    // user creates). An Add-on checks `typeof LocalBib.importBibtex`.
+    importBibtex: (text, options) => importBibtex(text, options),
 });
 
 
@@ -18809,6 +19875,8 @@ const app = createApp(App);
 app.config.globalProperties.$t = t;
 app.config.globalProperties.$tn = tn;
 app.config.globalProperties.$locale = uiLocale;
+// Authors/editors as people read them: an organization's braces left out.
+app.config.globalProperties.$people = displayPeople;
 app.config.globalProperties.$permissionBadge = permissionLabelKey;
 app.config.globalProperties.$lang = () => uiLang.value;
 

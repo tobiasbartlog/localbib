@@ -1446,6 +1446,11 @@ main:has(> .lb-papers) { overflow-x: clip; overflow-y: visible; }
   100% { box-shadow: 0 0 0 14px color-mix(in srgb, var(--lb-accent) 0%, transparent); }
 }
 .lb-pdf-ring.is-settled { animation: none; }
+/* The same preview as an Add-on component (contract 2.6): fills its host. */
+.lb-item-pdf {
+  position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; height: 100%;
+  background: var(--lb-bg-soft);
+}
 @media (prefers-reduced-motion: reduce) { .lb-pdf-ring { animation: none; } }
 
 /* ── Annotations block (#229): read from the PDF, never written ── */
@@ -1611,6 +1616,9 @@ main:has(> .lb-papers) { overflow-x: clip; overflow-y: visible; }
   cursor: pointer;
 }
 .lb-modal-back:hover { color: var(--lb-ink); }
+/* ?back= (contract 2.6): the way back to the page a link came from */
+.lb-key.lb-detail-backkey { flex: none; gap: 6px; }
+.lb-key.lb-detail-backkey svg { flex: none; }
 .lb-modal-actions { display: flex; gap: 8px; align-items: center; }
 .lb-modal-close {
   appearance: none; border: 0; background: transparent;
@@ -3633,3 +3641,150 @@ main:has(> .lb-papers) { overflow-x: clip; overflow-y: visible; }
   color: var(--lb-ink-2);
 }
 .lb-migrate-chip:hover { border-color: var(--lb-accent); color: var(--lb-accent-ink); }
+
+/* ─────────────────────────────────────────────────────────── */
+/*      BIBLIOGRAPHIC FIELDS: FORM, LOOKUP, COMPLETENESS        */
+/* ─────────────────────────────────────────────────────────── */
+/* The edit form of an Item (bib_fields): type first, the type's fields in
+   two columns, the rest behind a switch. Dashed means missing (DESIGN.md):
+   a required field the form still lacks, the read view's completeness hint
+   and the check's open circles. Tokens only, both themes from the palette. */
+.lb-bib-form { display: flex; flex-direction: column; gap: 20px; }
+.lb-bib-form-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.lb-bib-form-head .lb-detail-h { margin: 0; }
+.lb-bib-mute { color: var(--lb-ink-3); }
+.lb-bib-src {
+  font-family: var(--lb-font-mono); font-size: 9.5px; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--lb-ink-3);
+  border: 1px solid var(--lb-hairline); border-radius: 3px; padding: 1px 5px;
+  white-space: nowrap;
+}
+
+.lb-bib-type {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px; align-items: end;
+  padding-bottom: 20px; border-bottom: 1px solid var(--lb-hairline);
+}
+.lb-bib-type-select { height: 38px; font-size: 14px; font-weight: 500; }
+.lb-bib-type-hint { margin: 0 0 9px; font-size: 12.5px; color: var(--lb-ink-3); }
+.lb-bib-type-hint .lb-mono { color: var(--lb-ink); font-size: 11.5px; }
+
+.lb-bib-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 16px;
+}
+.lb-bib-grid.is-three { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; }
+.lb-bib-field { gap: 5px; min-width: 0; }
+.lb-bib-field.is-wide { grid-column: span 2; }
+.lb-bib-label-row { display: flex; align-items: center; gap: 8px; min-height: 18px; }
+.lb-bib-missing { font-family: var(--lb-font-mono); font-size: 10px; color: var(--lb-warn); }
+.lb-bib-label-action { margin-left: auto; font-size: 11.5px; padding: 0 4px; }
+.lb-bib-area { min-height: 62px; resize: vertical; line-height: 1.5; }
+.lb-input.is-missing { border-style: dashed; border-color: var(--lb-hairline-2); background: transparent; }
+.lb-bib-hint {
+  margin: 4px 0 0; font-family: var(--lb-font-mono); font-size: 10.5px; color: var(--lb-ink-3);
+}
+
+.lb-bib-all {
+  display: flex; align-items: center; gap: 10px;
+  border-top: 1px solid var(--lb-hairline); padding-top: 16px;
+}
+.lb-bib-all-label { font-size: 13px; color: var(--lb-ink-2); }
+.lb-bib-all .lb-mono { font-size: 11.5px; }
+.lb-bib-more-h { margin: 0 0 -8px; }
+.lb-bib-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.lb-bib-actions .lb-mono { font-size: 11.5px; margin-left: 6px; }
+
+/* The lookup's result: filled fields (saved), then the differing values as
+   Field | Current | New rows, none ticked. */
+.lb-bib-result {
+  background: var(--lb-bg-elev); border: 1px solid var(--lb-hairline);
+  border-radius: 12px; overflow: hidden;
+}
+.lb-bib-result-msg { margin: 0; padding: 14px 16px; }
+.lb-bib-result-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 14px 16px;
+}
+.lb-bib-result-main { display: flex; gap: 10px; align-items: flex-start; min-width: 0; }
+.lb-bib-ok { color: var(--lb-ok); flex: none; margin-top: 2px; display: inline-flex; }
+.lb-bib-result-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.lb-bib-result-text p { margin: 0; font-size: 13.5px; }
+.lb-bib-result-text b, .lb-bib-conflicts-head b { font-weight: 500; }
+.lb-bib-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.lb-bib-chip {
+  font-family: var(--lb-font-mono); font-size: 11px; color: var(--lb-ink-2);
+  background: var(--lb-bg-soft); border-radius: 3px; padding: 2px 7px;
+}
+.lb-bib-conflicts { border-top: 1px solid var(--lb-hairline); background: var(--lb-bg); }
+.lb-bib-conflicts-head { margin: 0; padding: 12px 16px 4px; font-size: 13.5px; }
+.lb-bib-cmp {
+  display: grid; grid-template-columns: 28px 120px minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px; align-items: start; padding: 10px 16px;
+  border-top: 1px solid var(--lb-hairline); cursor: pointer; font-size: 13px;
+}
+.lb-bib-cmp.is-head { border-top: 0; padding-top: 8px; padding-bottom: 4px; cursor: default; }
+.lb-bib-cmp input { width: 16px; height: 16px; margin: 3px 0 0; accent-color: var(--lb-accent); cursor: pointer; }
+.lb-bib-cmp .lb-field-label { padding-top: 2px; }
+.lb-bib-cmp-new-h { display: flex; gap: 6px; align-items: center; }
+.lb-bib-old, .lb-bib-new { min-width: 0; overflow-wrap: anywhere; }
+.lb-bib-old { color: var(--lb-ink); }
+.lb-bib-new { color: var(--lb-ink-2); }
+.lb-bib-cmp.is-picked .lb-bib-old {
+  color: var(--lb-ink-3); text-decoration: line-through; text-decoration-color: var(--lb-mute-2);
+}
+.lb-bib-cmp.is-picked .lb-bib-new {
+  color: var(--lb-ink); background: var(--lb-accent-soft); border-radius: 4px; padding: 0 4px; margin-left: -4px;
+}
+.lb-bib-cmp-actions {
+  display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+  border-top: 1px solid var(--lb-hairline); background: var(--lb-bg-elev);
+}
+
+/* Side panel while editing: what the bibliography needs. */
+.lb-bib-aside-note { margin: 0; font-size: 12.5px; color: var(--lb-ink-3); }
+.lb-bib-aside-note.lb-mono { font-size: 11px; }
+.lb-bib-complete {
+  margin: 0; display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--lb-ok);
+}
+.lb-bib-checklist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.lb-bib-checklist li { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--lb-ink-2); }
+.lb-bib-checklist li svg { flex: none; }
+.lb-bib-checklist li.is-ok svg { color: var(--lb-ok); }
+.lb-bib-checklist li.is-missing svg { color: var(--lb-mute); }
+.lb-bib-checklist li.is-missing span { color: var(--lb-ink); font-weight: 500; }
+.lb-bib-divider { height: 1px; background: var(--lb-hairline); margin: 6px 0; }
+
+/* Read view: the metadata block's values and the completeness hint. */
+.lb-aside-dl dd.lb-bib-serif { font-family: var(--lb-font-serif); font-style: italic; font-size: 14px; color: var(--lb-ink); }
+.lb-aside-dl dd.lb-mono { font-size: 12px; }
+.lb-bib-gap {
+  border: 1px dashed var(--lb-hairline-2); border-radius: 10px; padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.lb-bib-gap p { margin: 0; font-size: 13px; color: var(--lb-ink-2); }
+.lb-bib-gap b { font-weight: 500; color: var(--lb-ink); }
+.lb-bib-gap-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.lb-key.lb-bib-key-sm { height: 30px; }
+
+/* Settings → Library: the bibliography format and its live example. */
+.lb-set-row-text.lb-bib-format { display: flex; flex-direction: column; gap: 14px; }
+.lb-bib-format-seg .lb-seg { padding: 6px 14px; font-size: 12.5px; font-weight: 500; }
+.lb-bib-format-seg .lb-mono { font-size: 10.5px; opacity: .75; }
+.lb-bib-example {
+  margin: 0; font-family: var(--lb-font-mono); font-size: 12px; line-height: 1.7;
+  background: var(--lb-bg-soft); border: 1px solid var(--lb-hairline); border-radius: 7px;
+  padding: 12px 14px; color: var(--lb-ink); white-space: pre; overflow-x: auto;
+}
+
+/* Refresh Review: a scope's help line under its label. */
+.lb-rr-scope { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 8px; align-items: start; }
+.lb-rr-scope input { margin-top: 3px; }
+.lb-rr-scope-text { display: flex; flex-direction: column; gap: 2px; }
+.lb-rr-scope-help { font-size: 12.5px; color: var(--lb-ink-3); max-width: 62ch; }
+
+@media (max-width: 1099px) {
+  .lb-bib-type { grid-template-columns: minmax(0, 1fr); }
+  .lb-bib-grid.is-three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lb-bib-cmp { grid-template-columns: 24px 96px minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+}

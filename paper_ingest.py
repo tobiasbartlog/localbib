@@ -5,8 +5,10 @@ Three steps every "Paper ohne PDF anlegen" path shares — the BibTeX import
 (``routers/paper_by_doi.py``, ADR-0016) since PRD #137:
 
 1. ``enrich_imported_papers`` — non-destructive enrichment of fresh rows:
-   abstract via CrossRef (OpenAlex fallback), missing year/authors via
-   OpenAlex. Only empty fields are filled.
+   title/year/authors via OpenAlex, then every still empty field — the
+   bibliographic columns included — from the DOI's or ISBN's record
+   (``bib_lookup``), abstract with an OpenAlex fallback. Only empty fields
+   are filled.
 2. ``attach_pdf_to_paper`` — PDF bytes onto a paper without a file: real
    SHA256, file in ``ALL_DIR``, text extraction, symlinks, the post-import
    index hook (#153). Curated metadata stays untouched (CONTEXT.md "PDF
@@ -34,10 +36,11 @@ import hashlib
 import json
 import logging
 import os
-import re
 
 from fastapi import HTTPException
 
+import bib_fields
+import bib_lookup
 import bibtex_import as bibtex_import_core
 import ca_trust
 import cite_key_generator
@@ -85,16 +88,18 @@ def fetch_openalex_works(dois: list[str]) -> dict:
         return {}
 
 
-def _crossref_record(doi: str) -> dict:
-    """The CrossRef record of a DOI (title, authors, year, journal, abstract
-    …) or ``{}`` — one request per Item, and it never raises."""
-    if not doi:
-        return {}
+def _bib_record(doi: str, isbn: str) -> dict:
+    """The bibliographic record of a DOI or ISBN (``bib_lookup``: CrossRef,
+    DataCite, Open Library) as ``{"fields", "sources"}`` — one lookup per
+    Item, and it never raises. CrossRef goes through this module's name, so
+    a patch here reaches it."""
+    if not (doi or isbn):
+        return {"fields": {}, "sources": {}}
     try:
-        return fetch_crossref_metadata(doi) or {}
+        return bib_lookup.fetch(doi=doi, isbn=isbn, crossref_fetch=fetch_crossref_metadata)
     except Exception as e:
-        logging.warning("CrossRef-Abruf fuer %s fehlgeschlagen: %s", doi, e)
-        return {}
+        logging.warning("Bibliografische Abfrage fuer %s fehlgeschlagen: %s", doi or isbn, e)
+        return {"fields": {}, "sources": {}}
 
 
 def _text(value) -> str:
@@ -105,7 +110,7 @@ def _names(value) -> str:
     """An author string that names someone, else "": one made of commas,
     semicolons and spaces only is no author list (#227)."""
     text = _text(value)
-    return text if re.sub(r"[\s,;]+", "", text) else ""
+    return "" if bib_fields.is_empty("authors", text) else text
 
 
 def enrich_imported_papers(created: list[dict], works: dict | None = None) -> int:
@@ -113,13 +118,19 @@ def enrich_imported_papers(created: list[dict], works: dict | None = None) -> in
     Felder werden gefuellt, ein mitgegebener Wert nie ueberschrieben:
 
     - Titel, Jahr, Autoren zuerst aus dem OpenAlex-Batch (schon geholt),
-    - Abstract zuerst aus CrossRef, sonst OpenAlex,
-    - was OpenAlex nicht kennt (DataCite-/Zenodo-DOIs, OpenAlex nicht
-      erreichbar) samt Venue aus demselben CrossRef-Datensatz — so bekommt
-      ein Paper aus einer reinen DOI-Liste (#227) seinen Titel.
+    - dann jedes noch leere Feld aus dem bibliografischen Datensatz der DOI
+      bzw. ISBN (``bib_lookup``: CrossRef, sonst DataCite, ohne DOI-Treffer
+      Open Library) — Typ, Band, Heft, Seiten, Herausgeber:innen, Ort …;
+      so bekommt auch ein Paper aus einer reinen DOI-Liste (#227) oder eine
+      arXiv-/Zenodo-DOI ihren Titel,
+    - Abstract zuerst aus diesem Datensatz, sonst OpenAlex.
 
-    CrossRef wird hoechstens einmal je Paper gefragt, und nur, wenn noch ein
-    Feld fehlt. Gibt die Zahl angereicherter Papers.
+    Die Quelle wird hoechstens einmal je Paper gefragt, und nur, wenn noch
+    ein Pflichtfeld des Typs (``bib_fields.missing_fields``) oder der
+    Abstract fehlt. Ein Jahr wird nie gegen ein vorhandenes geschrieben
+    (``bib_lookup.compare``); jeder Wert geht durch die Regeln jedes
+    Metadaten-Schreibens (``bib_fields.checked_changes``). Gibt die Zahl
+    angereicherter Papers.
 
     ``created`` rows carry ``paper_id`` and ``doi``. ``works`` is an optional
     pre-fetched OpenAlex batch (``fetch_openalex_works``) so a caller that
@@ -138,9 +149,7 @@ def enrich_imported_papers(created: list[dict], works: dict | None = None) -> in
         work = works.get(normalize_doi(doi)) if doi else None
         conn = get_conn()
         try:
-            row = conn.execute(
-                "SELECT title, abstract, year, authors, journal FROM papers WHERE id = ?", (pid,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM papers WHERE id = ?", (pid,)).fetchone()
         finally:
             conn.close()
         if not row:
@@ -155,23 +164,15 @@ def enrich_imported_papers(created: list[dict], works: dict | None = None) -> in
             if not _names(have["authors"]) and _names("; ".join(work.authors)):
                 updates["authors"] = _names("; ".join(work.authors))
         known = {**have, **updates}
-        missing = [f for f in ("abstract", "title", "journal") if not _text(known[f])]
-        if not _names(known["authors"]):
-            missing.append("authors")
-        record = _crossref_record(doi) if missing or not known["year"] else {}
-        if not _text(have["abstract"]):
-            abstract = _text(record.get("abstract")) or (_text(work.abstract) if work else "")
-            if abstract:
-                updates["abstract"] = abstract[:5000]
-        for field in ("title", "journal"):
-            if not _text(known[field]) and _text(record.get(field)):
-                updates[field] = _text(record.get(field))
-        # CrossRef's authors come in the core's one CrossRef format
-        # (crossref.format_crossref_authors); a list without a name writes nothing.
-        if "authors" in missing and _names(record.get("authors")):
-            updates["authors"] = _names(record.get("authors"))
-        if not known["year"] and record.get("year"):
-            updates["year"] = record["year"]
+        # Only an Item that still lacks something asks the source: a field
+        # its type requires, or the abstract. A complete one costs nothing.
+        if bib_fields.missing_fields(known) or bib_fields.is_empty("abstract", known.get("abstract")):
+            record = _bib_record(doi or _text(have.get("doi")), _text(have.get("isbn")))
+            updates.update(bib_lookup.compare(known, record["fields"], record["sources"])["fills"])
+        if "abstract" not in updates and not _text(have["abstract"]) and work and _text(work.abstract):
+            updates["abstract"] = _text(work.abstract)[:5000]
+        # The rules of every metadata write; a refused value is dropped.
+        updates = bib_fields.valid_changes(updates, have)
         if updates:
             sets = ", ".join(f"{k} = ?" for k in updates)
             conn = get_conn()
@@ -453,8 +454,11 @@ def _rekey_placeholder(result: dict, item: dict) -> None:
 def create_or_find_by_doi(item: dict) -> dict:
     """Dedup + ``add_paper`` for one item; no network. ``item`` holds ``doi``
     and optionally ``title``, ``authors`` (list or "; "-joined string),
-    ``year``, ``journal``, ``abstract``, ``source``. Raises ``ValueError`` on
-    an empty DOI so a batch can report it per item."""
+    ``year``, ``journal``, ``abstract``, ``isbn``, ``publisher``, any
+    bibliographic column (``bib_fields.BIB_COLUMNS``) and ``source``. What
+    the caller leaves empty, ``enrich_imported_papers`` looks up (DOI → CrossRef
+    / DataCite). Raises ``ValueError`` on an empty DOI so a batch can report
+    it per item."""
     doi = normalize_doi(item.get("doi") or "")
     if not doi:
         raise ValueError("DOI darf nicht leer sein.")
@@ -474,14 +478,15 @@ def create_or_find_by_doi(item: dict) -> dict:
         "authors": _join_authors(item.get("authors")),
         "year": item.get("year"),
         "doi": doi,
-        "isbn": "",
+        "isbn": _text(item.get("isbn")),
         "abstract": (item.get("abstract") or "")[:5000],
         "journal": (item.get("journal") or "").strip(),
-        "publisher": "",
+        "publisher": _text(item.get("publisher")),
         "raw_metadata": json.dumps({"source": source, "doi": doi}, ensure_ascii=False),
         "ocr_text": "",
         "cite_key": "",  # generated in add_paper
         "import_source": source,
+        **bib_lookup.bib_columns(item),
     }
     paper_id = _get_db().add_paper(paper_data)
     return {"doi": doi, "created": True, "paper_id": paper_id,

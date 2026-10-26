@@ -1,0 +1,50 @@
+{
+  "status": "ok",
+  "message-type": "work",
+  "message-version": "1.0.0",
+  "message": {
+    "indexed": {"date-parts": [[2025, 9, 14]], "date-time": "2025-09-14T06:02:10Z", "timestamp": 1757829730000},
+    "publisher-location": "Cham",
+    "reference-count": 21,
+    "publisher": "Springer International Publishing",
+    "isbn-type": [{"value": "9783030913199", "type": "print"}, {"value": "9783030913205", "type": "electronic"}],
+    "license": [{"start": {"date-parts": [[2022, 1, 1]], "date-time": "2022-01-01T00:00:00Z", "timestamp": 1640995200000}, "content-version": "tdm", "delay-in-days": 0, "URL": "https://www.springernature.com/gp/researchers/text-and-data-mining"}],
+    "content-domain": {"domain": ["link.springer.com"], "crossmark-restriction": false},
+    "published-print": {"date-parts": [[2022]]},
+    "DOI": "10.1007/978-3-030-91320-5_7",
+    "type": "book-chapter",
+    "created": {"date-parts": [[2021, 12, 9]], "date-time": "2021-12-09T13:02:49Z", "timestamp": 1639054969000},
+    "page": "101-118",
+    "source": "Crossref",
+    "is-referenced-by-count": 3,
+    "title": ["Life-Cycle Cost Analysis of Bridge Superstructures"],
+    "prefix": "10.1007",
+    "author": [
+      {"given": "Lena", "family": "Hoffmann", "sequence": "first", "affiliation": []},
+      {"given": "Tom", "family": "Becker", "sequence": "additional", "affiliation": []}
+    ],
+    "member": "297",
+    "published-online": {"date-parts": [[2021, 12, 10]]},
+    "container-title": ["Lecture Notes in Civil Engineering", "Life-Cycle of Structures and Infrastructure Systems"],
+    "original-title": [],
+    "link": [{"URL": "https://link.springer.com/content/pdf/10.1007/978-3-030-91320-5_7", "content-type": "unspecified", "content-version": "vor", "intended-application": "similarity-checking"}],
+    "deposited": {"date-parts": [[2021, 12, 10]], "date-time": "2021-12-10T08:13:40Z", "timestamp": 1639123020000},
+    "score": 1,
+    "resource": {"primary": {"URL": "https://link.springer.com/10.1007/978-3-030-91320-5_7"}},
+    "subtitle": [],
+    "editor": [
+      {"given": "Fabio", "family": "Biondini", "sequence": "first", "affiliation": []},
+      {"given": "Dan M.", "family": "Frangopol", "sequence": "additional", "affiliation": []}
+    ],
+    "short-title": [],
+    "issued": {"date-parts": [[2022]]},
+    "ISBN": ["9783030913199", "9783030913205"],
+    "references-count": 21,
+    "URL": "http://dx.doi.org/10.1007/978-3-030-91320-5_7",
+    "relation": {},
+    "ISSN": ["2366-2557", "2366-2565"],
+    "issn-type": [{"value": "2366-2557", "type": "print"}, {"value": "2366-2565", "type": "electronic"}],
+    "subject": [],
+    "published": {"date-parts": [[2022]]}
+  }
+}

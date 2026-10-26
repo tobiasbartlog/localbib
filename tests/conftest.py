@@ -70,6 +70,11 @@ def pytest_configure(config):
         "real_enrichment: run the real BibTeX-import enrichment (network) instead "
         "of the offline stub",
     )
+    config.addinivalue_line(
+        "markers",
+        "real_bib_sources: let bib_lookup reach the DataCite and Open Library "
+        "clients (mock them with respx) instead of the offline stub",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -85,6 +90,21 @@ def _stub_import_enrichment(request, monkeypatch):
     monkeypatch.setattr(paper_ingest, "enrich_imported_papers",
                         lambda created, works=None: 0)
     monkeypatch.setattr(paper_ingest, "fetch_openalex_works", lambda dois: {})
+
+
+@pytest.fixture(autouse=True)
+def _offline_bib_sources(request, monkeypatch):
+    """``bib_lookup`` falls back from CrossRef to DataCite and asks Open
+    Library for an ISBN. Every test that patches CrossRef to "unknown" would
+    otherwise reach those two for real — so they answer "unknown" by default.
+    Tests of the clients themselves (respx) mark ``real_bib_sources``."""
+    if request.node.get_closest_marker("real_bib_sources"):
+        return
+    import datacite
+    import openlibrary_client
+
+    monkeypatch.setattr(datacite, "fetch_datacite_metadata", lambda doi: None)
+    monkeypatch.setattr(openlibrary_client, "fetch_openlibrary_metadata", lambda isbn: None)
 
 
 @pytest.fixture(autouse=True)

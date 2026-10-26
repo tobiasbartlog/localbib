@@ -6,6 +6,7 @@ import sqlite3
 import logging
 from typing import Optional, Dict, List
 
+from bib_fields import BIB_COLUMNS, columns_from_raw
 from cite_key_generator import dedupe as dedupe_cite_key, generate as generate_cite_key
 
 
@@ -16,6 +17,10 @@ NOTES_FIELD_NAMES = frozenset({"notiz", "notizen", "note", "notes"})
 
 # app_settings-Schluessel, der die Notiz-Migration als erledigt vermerkt.
 NOTES_MIGRATION_KEY = "notes_field_migration_done"
+
+# app_settings-Schluessel des einmaligen Backfills der bibliografischen
+# Spalten aus raw_metadata.
+BIB_BACKFILL_KEY = "bib_fields_backfill_done"
 
 
 def normalize_tags(value) -> str:
@@ -186,6 +191,9 @@ class Database:
             # When the entry entered the *old* library. ``created_at`` stays the
             # row time, so "imported yesterday, collected in 2014" is sayable.
             ("date_added", "TEXT DEFAULT ''"),
+            # Bibliografische Felder (Typ, Band, Heft, Seitenbereich, ...): eine
+            # Spalte je Feld, die Liste steht in bib_fields.BIB_COLUMNS.
+            *((col, "TEXT DEFAULT ''") for col in BIB_COLUMNS),
         ]:
             try:
                 cursor.execute(f"ALTER TABLE papers ADD COLUMN {col} {coldef}")
@@ -283,6 +291,10 @@ class Database:
         # sowohl die notes-Spalte als auch app_settings braucht (dort steht der
         # Erledigt-Vermerk, der den Lauf wirklich einmalig macht).
         self._migrate_notes_field(cursor)
+
+        # Bibliografische Spalten aus dem, was ein Import in raw_metadata
+        # abgelegt hat (einmalig, nur leere Felder).
+        self._backfill_bib_fields(cursor)
 
         # Semantische Suche Phase 1 (#98): ein Vektor pro Paper (Titel+Abstract).
         # paper_id ist Primary Key -> genau ein aktiver Vektor je Paper; model/dim
@@ -468,6 +480,53 @@ class Database:
         )
 
     @staticmethod
+    def _backfill_bib_fields(cursor: sqlite3.Cursor):
+        """Fuellt die bibliografischen Spalten einmalig aus ``raw_metadata``.
+
+        BibTeX-, RIS- und Zotero-Importe haben Typ, Band, Heft, Seiten & Co.
+        dort abgelegt, als es noch keine Spalten gab
+        (``bib_fields.columns_from_raw`` liest alle drei Formen). Geschrieben
+        wird nur in leere Spalten — ein Wert, den es schon gibt, bleibt. Der
+        Vermerk in ``app_settings`` macht den Lauf einmalig: ``init_db()``
+        laeuft bei jeder ``Database(...)``-Konstruktion. Eine Zeile, deren
+        ``raw_metadata`` kein JSON-Objekt ist, wird uebersprungen.
+        """
+        done = cursor.execute(
+            "SELECT value FROM app_settings WHERE key = ?", (BIB_BACKFILL_KEY,)
+        ).fetchone()
+        if done and done["value"]:
+            return
+        columns = ", ".join(BIB_COLUMNS)
+        rows = cursor.execute(
+            f"SELECT id, raw_metadata, {columns} FROM papers "
+            "WHERE raw_metadata IS NOT NULL AND raw_metadata != ''"
+        ).fetchall()
+        filled = 0
+        for row in rows:
+            try:
+                raw = json.loads(row["raw_metadata"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            values = {
+                col: value for col, value in columns_from_raw(raw).items()
+                if col in BIB_COLUMNS and not (row[col] or "").strip()
+            }
+            if not values:
+                continue
+            assignments = ", ".join(f"{col} = ?" for col in values)
+            cursor.execute(
+                f"UPDATE papers SET {assignments} WHERE id = ?", (*values.values(), row["id"])
+            )
+            filled += 1
+        cursor.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, '1')", (BIB_BACKFILL_KEY,)
+        )
+        if filled:
+            logging.info(f"📚 Bibliografische Felder aus Importdaten ergaenzt: {filled} Eintrag/Eintraege")
+
+    @staticmethod
     def _mark_notes_migration_done(cursor: sqlite3.Cursor):
         cursor.execute(
             "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, '1')",
@@ -629,7 +688,8 @@ class Database:
         ``tags`` darf als Liste oder als fertiger JSON-Text kommen — gespeichert
         wird immer ein JSON-Array, damit Leser der Spalte nie raten muessen
         (PRD #173). ``notes`` und ``date_added`` sind optional und leer, wenn
-        die Quelle nichts mitbringt.
+        die Quelle nichts mitbringt; ebenso die bibliografischen Spalten
+        (``bib_fields.BIB_COLUMNS``).
         """
         conn = self._connect()
         existing_keys = {
@@ -642,6 +702,8 @@ class Database:
         paper_data.setdefault("import_source", "")
         paper_data.setdefault("notes", "")
         paper_data.setdefault("date_added", "")
+        for col in BIB_COLUMNS:
+            paper_data[col] = paper_data.get(col) or ""
         paper_data["tags"] = normalize_tags(paper_data.get("tags"))
         # Caller-supplied key (e.g. BibTeX import keeps the .bib entry key,
         # "Bestand gewinnt" / ADR-0003) — de-duplicated, never overwriting.
@@ -652,13 +714,15 @@ class Database:
             paper_data["cite_key"] = generate_cite_key(
                 paper_data.get("authors") or "", paper_data.get("year"), existing_keys
             )
-        cursor = conn.execute("""
+        bib_names = ", ".join(BIB_COLUMNS)
+        bib_params = ", ".join(f":{col}" for col in BIB_COLUMNS)
+        cursor = conn.execute(f"""
             INSERT INTO papers (file_hash, filename, original_filename, title, authors,
                                 year, doi, isbn, abstract, journal, publisher, raw_metadata, ocr_text, page_count,
-                                cite_key, import_source, notes, tags, date_added)
+                                cite_key, import_source, notes, tags, date_added, {bib_names})
             VALUES (:file_hash, :filename, :original_filename, :title, :authors,
                     :year, :doi, :isbn, :abstract, :journal, :publisher, :raw_metadata, :ocr_text,
-                    :page_count, :cite_key, :import_source, :notes, :tags, :date_added)
+                    :page_count, :cite_key, :import_source, :notes, :tags, :date_added, {bib_params})
         """, paper_data)
         conn.commit()
         paper_id = cursor.lastrowid

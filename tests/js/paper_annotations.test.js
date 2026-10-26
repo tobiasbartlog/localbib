@@ -46,8 +46,11 @@ let release = null;   // resolves the pending read of Item 86
 let releaseItem = null;   // resolves the pending GET of Item 89
 const PAPERS = {
     81: paper(81), 82: paper(82), 83: paper(83), 84: paper(84, { filename: '' }),
-    85: paper(85), 86: paper(86), 87: paper(87),
+    85: paper(85), 86: paper(86), 87: paper(87), 90: paper(90), 91: paper(91),
 };
+// What GET /api/papers/{id}/locate answers for a found passage (contract 2.6).
+const SPOT = { x: 0.119, y: 0.3117, w: 0.6464, h: 0.0717 };
+const locateCalls = (id) => calls.filter((c) => c.url.startsWith(`/api/papers/${id}/locate?`));
 const LISTS = {
     82: [],
     85: [entry({ id: 'p3', page: 3, quote: 'A line on page three.' }), entry({ id: 'p5', page: 5, quote: 'A line on page five.' })],
@@ -79,6 +82,8 @@ beforeAll(async () => {
     calls = installFetchMock([
         { method: 'GET', url: '/api/papers/89', reply: () => new Promise((resolve) => { releaseItem = resolve; }) },
         { method: 'GET', url: /^\/api\/papers\/\d+$/, reply: ({ url }) => ({ ...PAPERS[url.split('/').pop()] }) },
+        { method: 'GET', url: /^\/api\/papers\/90\/locate\?/, reply: { page: 4, rect: SPOT } },
+        { method: 'GET', url: /^\/api\/papers\/91\/locate\?/, reply: { page: 4, rect: null } },
         { method: 'GET', url: '/api/papers/83/annotations', status: 409, reply: { detail: 'error.annotations.unreadable' } },
         { method: 'GET', url: '/api/papers/86/annotations', reply: () => new Promise((resolve) => { release = resolve; }) },
         {
@@ -306,5 +311,30 @@ describe('annotations from the PDF', () => {
             if (!viewerLog().opened.some((o) => o.url === '/api/papers/87/pdf')) throw new Error('preview not opened');
         });
         expect(viewerLog().opened.filter((o) => o.url === '/api/papers/87/pdf').at(-1).page).toBe(5);
+        expect(locateCalls(87)).toEqual([]);   // no ?find=: nothing to locate
+    });
+
+    it('frames the passage a ?find= link names on its page', async () => {
+        const jumps = viewerLog().jumps.length;
+        const find = 'Lifecycle costs of bridges are dominated by maintenance';
+        await open('#/paper/90?page=4&find=' + encodeURIComponent(find));
+        await vi.waitFor(() => {
+            if (viewerLog().jumps.length === jumps) throw new Error('no jump to the passage');
+        });
+        expect(viewerLog().jumps.at(-1)).toEqual({ page: 4, rect: SPOT });
+        expect(locateCalls(90).map((c) => c.url))
+            .toEqual([`/api/papers/90/locate?page=4&text=${encodeURIComponent(find)}`]);
+        expect(viewerLog().opened.filter((o) => o.url === '/api/papers/90/pdf').at(-1).page).toBe(4);
+    });
+
+    it('only goes to the page when the passage is not found there', async () => {
+        const jumps = viewerLog().jumps.length;
+        await open('#/paper/91?page=4&find=' + encodeURIComponent('Not on this page at all'));
+        await vi.waitFor(() => {
+            if (!locateCalls(91).length) throw new Error('not located');
+        });
+        await flush(); await flush();
+        expect(viewerLog().jumps.length).toBe(jumps);   // no frame, never a guess
+        expect(viewerLog().opened.filter((o) => o.url === '/api/papers/91/pdf').at(-1).page).toBe(4);
     });
 });

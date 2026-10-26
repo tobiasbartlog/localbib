@@ -45,6 +45,7 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+import bib_lookup
 import collection_membership as membership
 import library_events as events
 import services.smart_import_pipeline as smart_import_pipeline
@@ -404,6 +405,8 @@ def _smart_import_response(target_path: str, original_filename: str, *,
             "raw_metadata": json.dumps(metadata, ensure_ascii=False),
             "ocr_text": text[:10000],
             "page_count": _page_count,
+            # The DOI record's bibliographic columns (type, volume, pages …).
+            **bib_lookup.bib_columns(metadata),
         }
         # File first, then the DB row (same order as pipeline.process_paper):
         # a row without its file would make the next run treat the inbox PDF

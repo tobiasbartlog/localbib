@@ -162,8 +162,13 @@ export function installFetchMock(routes) {
 
 // Default API responses for everything the app touches between mount and a
 // rendered (empty) plugin page. Tests prepend their own, more specific routes.
+// The Item types table (bib_fields) as GET /api/papers/item-types serves it;
+// tests/test_bib_write_rules.py keeps the fixture equal to the server's table.
+export const ITEM_TYPES = JSON.parse(readFileSync(resolve(__dirname, '../fixtures/item_types.json'), 'utf-8'));
+
 export function defaultRoutes() {
     return [
+        { method: 'GET', url: '/api/papers/item-types', reply: ITEM_TYPES },
         { method: 'GET', url: '/api/categories/tree', reply: [] },
         { method: 'GET', url: '/api/stats', reply: {} },
         // Settings' nav counter (#210): the cheap pass, nothing to report by default.

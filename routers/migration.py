@@ -52,6 +52,7 @@ from starlette.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+import bib_fields
 import bibtex_migration
 import collection_membership as membership
 import library_events as events
@@ -670,6 +671,9 @@ def _paper_data(item: MigrationItem, options: MigrationOptions, source_name: str
         "notes": item.notes if options.import_notes else "",
         "tags": item.tags if options.import_tags else [],
         "date_added": (item.date_added or "") if options.import_date_added else "",
+        # Typ, Band, Heft, Seiten & Co. aus dem Rohsatz der Quelle (BibTeX,
+        # RIS, Zotero); ein Buchtitel wandert von journal nach booktitle.
+        **bib_fields.import_columns(item.entry_type, item.raw, item.journal),
     }
 
 
